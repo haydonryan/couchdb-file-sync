@@ -171,10 +171,26 @@ impl SyncEngine {
             }
         }
 
-        // Add remote-only changes
+        // Add remote-only changes (only if remote is newer than local)
         for remote_change in remote_changes {
             if !local_map.contains_key(&remote_change.path) {
-                clean_remote.push(remote_change.clone());
+                // Check if we have local state for this file
+                let should_download = match self.local_db.get_file_state(&remote_change.path)? {
+                    Some(local_state) => {
+                        // Only download if remote mtime is newer than our last sync
+                        match remote_change.mtime {
+                            Some(remote_mtime) => remote_mtime > local_state.last_sync_at,
+                            None => true, // No mtime info, download to be safe
+                        }
+                    }
+                    None => true, // No local state, this is a new file
+                };
+
+                if should_download {
+                    clean_remote.push(remote_change.clone());
+                } else {
+                    debug!("Skipping {} - local is up to date", remote_change.path);
+                }
             }
         }
 
@@ -209,29 +225,33 @@ impl SyncEngine {
         match change.change_type {
             ChangeType::Created | ChangeType::Modified => {
                 let file_path = self.root_dir.join(&change.path);
-                let hash = compute_file_hash(&file_path)?;
                 let metadata = std::fs::metadata(&file_path)?;
-                let modified_at = metadata.modified()?.into();
-                
-                // Create FileDoc with current file info
+                let mtime = metadata
+                    .modified()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+
+                // Create FileDoc with current file info (Obsidian LiveSync format)
                 let mut doc = crate::models::FileDoc {
                     id: change.path.clone(),
-                    rev: None,  // Will be set by CouchDB
-                    content_type: mime_guess::from_path(&change.path)
-                        .first_or_octet_stream()
-                        .to_string(),
+                    rev: None, // Will be set by CouchDB
+                    children: Vec::new(), // TODO: implement chunking for uploads
+                    path: change.path.clone(),
+                    ctime: mtime, // Use mtime as ctime for now
+                    mtime,
                     size: metadata.len(),
-                    modified_at,
-                    hash,
+                    doc_type: "plain".to_string(),
                     deleted: false,
-                    synced_at: Utc::now(),
                 };
-                
-                // Check if document exists to get its revision
+
+                // Check if document exists to get its revision and children
                 if let Some(existing) = self.couchdb.get_file(&change.path).await? {
                     doc.rev = existing.rev;
+                    doc.children = existing.children;
+                    doc.ctime = existing.ctime;
                 }
-                
+
                 self.couchdb.save_file(&mut doc).await?;
                 info!("Uploaded to CouchDB: {}", change.path);
             }
@@ -258,22 +278,23 @@ impl SyncEngine {
                         return Ok(());
                     }
                 };
-                
-                // Note: In a full implementation, this is where we'd download
-                // the actual file content. For now, we just create an empty file
-                // or touch the file to indicate it was synced.
-                // A production version would use CouchDB attachments or
-                // a separate file storage backend.
-                
+
                 // Ensure parent directory exists
                 if let Some(parent) = file_path.parent() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
-                
-                // Create or update local file (empty for now)
-                if !file_path.exists() {
-                    tokio::fs::write(&file_path, &[]).await?;
-                }
+
+                // Download file content from CouchDB attachment
+                let content = match self.couchdb.get_file_content(&change.path).await {
+                    Ok(data) => data,
+                    Err(e) => {
+                        // If attachment doesn't exist, create empty file
+                        debug!("No content attachment for {}: {}", change.path, e);
+                        Vec::new()
+                    }
+                };
+
+                tokio::fs::write(&file_path, &content).await?;
                 
                 // Update local state
                 let hash = compute_file_hash(&file_path)?;
@@ -323,28 +344,33 @@ impl SyncEngine {
             ResolutionStrategy::KeepLocal => {
                 // Force upload local version
                 let file_path = self.root_dir.join(path);
-                let hash = compute_file_hash(&file_path)?;
+                let _hash = compute_file_hash(&file_path)?;
                 let metadata = std::fs::metadata(&file_path)?;
-                let modified_at = metadata.modified()?.into();
-                
+                let mtime = metadata
+                    .modified()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+
                 let mut doc = crate::models::FileDoc {
                     id: path.to_string(),
                     rev: None,
-                    content_type: mime_guess::from_path(path)
-                        .first_or_octet_stream()
-                        .to_string(),
+                    children: Vec::new(),
+                    path: path.to_string(),
+                    ctime: mtime,
+                    mtime,
                     size: metadata.len(),
-                    modified_at,
-                    hash,
+                    doc_type: "plain".to_string(),
                     deleted: false,
-                    synced_at: Utc::now(),
                 };
-                
+
                 // Get existing revision if available
                 if let Some(existing) = self.couchdb.get_file(path).await? {
                     doc.rev = existing.rev;
+                    doc.children = existing.children;
+                    doc.ctime = existing.ctime;
                 }
-                
+
                 self.couchdb.save_file(&mut doc).await?;
                 info!("Resolved conflict (keep-local): {}", path);
             }
@@ -354,14 +380,15 @@ impl SyncEngine {
                     Some(d) => d,
                     None => anyhow::bail!("Document not found: {}", path),
                 };
-                
+
                 let file_path = self.root_dir.join(path);
                 if let Some(parent) = file_path.parent() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
-                
-                // Create/update local file (empty for now - see note in apply_to_filesystem)
-                tokio::fs::write(&file_path, &[]).await?;
+
+                // Download file content from CouchDB attachment
+                let content = self.couchdb.get_file_content(path).await.unwrap_or_default();
+                tokio::fs::write(&file_path, &content).await?;
                 
                 // Update local state
                 let hash = compute_file_hash(&file_path)?;
@@ -384,15 +411,16 @@ impl SyncEngine {
                     Some(d) => d,
                     None => anyhow::bail!("Document not found: {}", path),
                 };
-                
+
                 let remote_path = format!("{}.remote", path);
                 let file_path = self.root_dir.join(&remote_path);
                 if let Some(parent) = file_path.parent() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
-                
-                // Create remote file (empty for now)
-                tokio::fs::write(&file_path, &[]).await?;
+
+                // Download file content from CouchDB attachment
+                let content = self.couchdb.get_file_content(path).await.unwrap_or_default();
+                tokio::fs::write(&file_path, &content).await?;
                 info!("Saved remote version as: {}", remote_path);
                 
                 // Local file stays as-is

@@ -1,16 +1,19 @@
-use crate::models::{Change, FileDoc, RemoteState};
+use crate::models::{Change, ChunkDoc, FileDoc, RemoteState};
 use anyhow::Result;
 use couch_rs::database::Database;
 use couch_rs::Client;
-use tracing::debug;
+use reqwest::Client as HttpClient;
+use tracing::{debug, warn};
 
 /// CouchDB client wrapper
 pub struct CouchDb {
     #[allow(dead_code)]
     client: Client,
     db: Database,
-    #[allow(dead_code)]
     db_name: String,
+    http_client: HttpClient,
+    base_url: String,
+    auth: Option<(String, String)>,
 }
 
 impl CouchDb {
@@ -29,10 +32,18 @@ impl CouchDb {
         // Get or create database
         let db = client.db(db_name).await?;
 
+        let auth = match (username, password) {
+            (Some(u), Some(p)) => Some((u.to_string(), p.to_string())),
+            _ => None,
+        };
+
         Ok(Self {
             client,
             db,
             db_name: db_name.to_string(),
+            http_client: HttpClient::new(),
+            base_url: url.to_string(),
+            auth,
         })
     }
 
@@ -69,22 +80,28 @@ impl CouchDb {
         Ok(())
     }
 
-    /// Get all documents (non-deleted)
+    /// Get all documents (non-deleted, files only - not chunks)
     pub async fn get_all_files(&self) -> Result<Vec<FileDoc>> {
         let collection = self.db.get_all::<FileDoc>().await?;
-        Ok(collection.rows.into_iter().filter(|d| !d.deleted).collect())
+        Ok(collection
+            .rows
+            .into_iter()
+            .filter(|d| !d.deleted && d.is_file())
+            .collect())
     }
 
     /// Get changes by comparing local state with remote
-    /// For simplicity, this just returns all remote files as "modified"
-    /// In production, you'd use the _changes feed with proper sequence tracking
+    /// Returns all remote files with their mtime for comparison
     pub async fn get_changes(&self, _since: Option<&str>) -> Result<(Vec<Change>, String)> {
         let files = self.get_all_files().await?;
         let changes: Vec<Change> = files
             .into_iter()
-            .map(|doc| crate::models::Change::remote_modified(doc.id, doc.hash, doc.size))
+            .map(|doc| {
+                let mtime = doc.modified_at();
+                crate::models::Change::remote_modified(doc.id, String::new(), doc.size, mtime)
+            })
             .collect();
-        
+
         // Return a simple sequence number (timestamp)
         let seq = chrono::Utc::now().timestamp().to_string();
         Ok((changes, seq))
@@ -105,6 +122,87 @@ impl CouchDb {
             Ok(_) => Ok(true),
             Err(_) => Ok(false),
         }
+    }
+
+    /// Get attachment content from a document
+    /// Attachments are stored at /{db}/{docid}/{attname}
+    #[allow(dead_code)]
+    pub async fn get_attachment(&self, doc_id: &str, attachment_name: &str) -> Result<Vec<u8>> {
+        // Note: base_url may already include the database path
+        let url = format!("{}/{}/{}", self.base_url, doc_id, attachment_name);
+
+        let mut request = self.http_client.get(&url);
+
+        if let Some((username, password)) = &self.auth {
+            request = request.basic_auth(username, Some(password));
+        }
+
+        let response = request.send().await?;
+
+        if !response.status().is_success() {
+            anyhow::bail!(
+                "Failed to fetch attachment {}/{}: {}",
+                doc_id,
+                attachment_name,
+                response.status()
+            );
+        }
+
+        Ok(response.bytes().await?.to_vec())
+    }
+
+    /// Get a chunk document by ID
+    async fn get_chunk(&self, chunk_id: &str) -> Result<Option<ChunkDoc>> {
+        // Note: base_url may already include the database path (e.g., /obsidian)
+        // so we try without db_name first
+        let url = format!("{}/{}", self.base_url, chunk_id);
+
+        let mut request = self.http_client.get(&url);
+        if let Some((username, password)) = &self.auth {
+            request = request.basic_auth(username, Some(password));
+        }
+
+        let response = request.send().await?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        if !response.status().is_success() {
+            anyhow::bail!("Failed to fetch chunk {}: {}", chunk_id, response.status());
+        }
+
+        let chunk: ChunkDoc = response.json().await?;
+        Ok(Some(chunk))
+    }
+
+    /// Get file content by fetching and combining all chunks
+    pub async fn get_file_content(&self, path: &str) -> Result<Vec<u8>> {
+        // First get the file document to find chunk IDs
+        let doc = match self.get_file(path).await? {
+            Some(d) => d,
+            None => anyhow::bail!("File not found: {}", path),
+        };
+
+        if doc.children.is_empty() {
+            debug!("File {} has no chunks, returning empty content", path);
+            return Ok(Vec::new());
+        }
+
+        // Fetch each chunk and combine the data
+        let mut content = String::new();
+        for chunk_id in &doc.children {
+            match self.get_chunk(chunk_id).await? {
+                Some(chunk) => {
+                    content.push_str(&chunk.data);
+                }
+                None => {
+                    warn!("Chunk {} not found for file {}", chunk_id, path);
+                }
+            }
+        }
+
+        Ok(content.into_bytes())
     }
 }
 

@@ -35,6 +35,8 @@ pub struct Change {
     pub timestamp: DateTime<Utc>,
     pub hash: Option<String>,
     pub size: Option<u64>,
+    /// Remote modification time (for comparing with local state)
+    pub mtime: Option<DateTime<Utc>>,
 }
 
 impl Change {
@@ -44,6 +46,7 @@ impl Change {
         source: ChangeSource,
         hash: Option<String>,
         size: Option<u64>,
+        mtime: Option<DateTime<Utc>>,
     ) -> Self {
         Self {
             path,
@@ -52,31 +55,32 @@ impl Change {
             timestamp: Utc::now(),
             hash,
             size,
+            mtime,
         }
     }
 
     pub fn local_created(path: String, hash: String, size: u64) -> Self {
-        Self::new(path, ChangeType::Created, ChangeSource::Local, Some(hash), Some(size))
+        Self::new(path, ChangeType::Created, ChangeSource::Local, Some(hash), Some(size), None)
     }
 
     pub fn local_modified(path: String, hash: String, size: u64) -> Self {
-        Self::new(path, ChangeType::Modified, ChangeSource::Local, Some(hash), Some(size))
+        Self::new(path, ChangeType::Modified, ChangeSource::Local, Some(hash), Some(size), None)
     }
 
     pub fn local_deleted(path: String) -> Self {
-        Self::new(path, ChangeType::Deleted, ChangeSource::Local, None, None)
+        Self::new(path, ChangeType::Deleted, ChangeSource::Local, None, None, None)
     }
 
-    pub fn remote_created(path: String, hash: String, size: u64) -> Self {
-        Self::new(path, ChangeType::Created, ChangeSource::Remote, Some(hash), Some(size))
+    pub fn remote_created(path: String, hash: String, size: u64, mtime: DateTime<Utc>) -> Self {
+        Self::new(path, ChangeType::Created, ChangeSource::Remote, Some(hash), Some(size), Some(mtime))
     }
 
-    pub fn remote_modified(path: String, hash: String, size: u64) -> Self {
-        Self::new(path, ChangeType::Modified, ChangeSource::Remote, Some(hash), Some(size))
+    pub fn remote_modified(path: String, hash: String, size: u64, mtime: DateTime<Utc>) -> Self {
+        Self::new(path, ChangeType::Modified, ChangeSource::Remote, Some(hash), Some(size), Some(mtime))
     }
 
     pub fn remote_deleted(path: String) -> Self {
-        Self::new(path, ChangeType::Deleted, ChangeSource::Remote, None, None)
+        Self::new(path, ChangeType::Deleted, ChangeSource::Remote, None, None, None)
     }
 }
 

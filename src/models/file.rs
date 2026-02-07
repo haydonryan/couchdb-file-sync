@@ -3,39 +3,77 @@ use couch_rs::document::TypedCouchDocument;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
-/// File metadata stored in CouchDB
+/// File metadata stored in CouchDB (matches Obsidian LiveSync format)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileDoc {
     #[serde(rename = "_id")]
     pub id: String,
     #[serde(rename = "_rev", skip_serializing_if = "Option::is_none")]
     pub rev: Option<String>,
-    pub content_type: String,
+    /// Chunk IDs that make up the file content
+    #[serde(default)]
+    pub children: Vec<String>,
+    /// File path (same as id for files)
+    #[serde(default)]
+    pub path: String,
+    /// Creation time in milliseconds
+    #[serde(default)]
+    pub ctime: u64,
+    /// Modification time in milliseconds
+    #[serde(default)]
+    pub mtime: u64,
+    /// File size in bytes
+    #[serde(default)]
     pub size: u64,
-    pub modified_at: DateTime<Utc>,
-    pub hash: String,
+    /// Document type: "plain" for files, "leaf" for chunks
+    #[serde(rename = "type", default)]
+    pub doc_type: String,
+    /// Whether the file is deleted
     #[serde(default)]
     pub deleted: bool,
-    pub synced_at: DateTime<Utc>,
 }
 
 impl FileDoc {
-    pub fn new(path: String, hash: String, size: u64) -> Self {
-        let now = Utc::now();
-        let content_type = mime_guess::from_path(&path)
-            .first_or_octet_stream()
-            .to_string();
+    pub fn new(path: String, _hash: String, size: u64) -> Self {
+        let now = chrono::Utc::now().timestamp_millis() as u64;
         Self {
-            id: path,
+            id: path.clone(),
             rev: None,
-            content_type,
+            children: Vec::new(),
+            path,
+            ctime: now,
+            mtime: now,
             size,
-            modified_at: now,
-            hash,
+            doc_type: "plain".to_string(),
             deleted: false,
-            synced_at: now,
         }
     }
+
+    /// Check if this is a file document (not a chunk)
+    pub fn is_file(&self) -> bool {
+        // Files have type "plain" and IDs that don't start with "h:"
+        self.doc_type == "plain" || (!self.id.starts_with("h:") && self.doc_type.is_empty())
+    }
+
+    /// Get modification time as DateTime
+    pub fn modified_at(&self) -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(self.mtime as i64).unwrap_or_else(Utc::now)
+    }
+}
+
+/// Chunk document containing actual file content
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkDoc {
+    #[serde(rename = "_id")]
+    pub id: String,
+    #[serde(rename = "_rev", skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+    /// The actual content data
+    #[serde(default)]
+    pub data: String,
+    /// Document type: "leaf" for chunks
+    #[serde(rename = "type", default)]
+    pub doc_type: String,
 }
 
 impl TypedCouchDocument for FileDoc {
@@ -99,11 +137,12 @@ pub struct RemoteState {
 
 impl From<FileDoc> for RemoteState {
     fn from(doc: FileDoc) -> Self {
+        let modified_at = doc.modified_at();
         Self {
             path: doc.id,
-            hash: doc.hash,
+            hash: String::new(), // Hash not stored in CouchDB, computed locally
             size: doc.size,
-            modified_at: doc.modified_at,
+            modified_at,
             couch_rev: doc.rev.unwrap_or_default(),
             deleted: doc.deleted,
         }
