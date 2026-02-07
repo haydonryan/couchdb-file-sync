@@ -3,7 +3,7 @@ use anyhow::Result;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 use walkdir::WalkDir;
 
 /// Scans the filesystem for changes
@@ -112,6 +112,7 @@ impl Scanner {
             match stored_map.get(&state.path) {
                 None => {
                     // New file
+                    info!("New local file detected: {} (size: {} bytes)", state.path, state.size);
                     changes.push(Change::local_created(
                         state.path.clone(),
                         state.hash.clone(),
@@ -121,6 +122,7 @@ impl Scanner {
                 Some(stored) => {
                     // Check if modified
                     if state.hash != stored.hash {
+                        info!("Modified local file detected: {} (hash changed)", state.path);
                         changes.push(Change::local_modified(
                             state.path.clone(),
                             state.hash.clone(),
