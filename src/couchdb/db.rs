@@ -190,6 +190,39 @@ impl CouchDb {
         }
     }
 
+    /// Fetch remote file metadata (without downloading chunks)
+    pub async fn fetch_metadata(&self, path: &str) -> Result<Option<FileDoc>> {
+        // Check if path is within allowed remote path
+        if !self.is_path_allowed(path) {
+            return Ok(None);
+        }
+
+        debug!("[FETCH METADATA] Fetching metadata for: {}", path);
+
+        match self.db.get::<FileDoc>(path).await {
+            Ok(doc) => {
+                debug!("[FETCH METADATA] Retrieved metadata:");
+                debug!("  path: {}", doc.path);
+                debug!("  size: {} bytes", doc.size);
+                debug!("  mtime: {} ms", doc.mtime);
+                debug!("  ctime: {} ms", doc.ctime);
+                debug!("  rev: {:?}", doc.rev);
+                debug!("  chunks: {}", doc.children.len());
+                Ok(Some(doc))
+            }
+            Err(e) => {
+                // Check if it's a 404
+                let err_str = e.to_string();
+                if err_str.contains("404") || err_str.contains("Not Found") {
+                    debug!("[FETCH METADATA] Not found: {}", path);
+                    Ok(None)
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
+    }
+
     /// Test connection to CouchDB
     pub async fn ping(&self) -> Result<bool> {
         // Get all files (limit 1) to test connection

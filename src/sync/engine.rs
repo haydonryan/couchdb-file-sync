@@ -1,6 +1,6 @@
 use crate::couchdb::CouchDb;
 use crate::local::{compute_file_hash, LocalDb, Scanner};
-use crate::models::{Change, ChangeType, Conflict, FileState, ResolutionStrategy};
+use crate::models::{Change, ChangeType, Conflict, FileState, RemoteState, ResolutionStrategy};
 use anyhow::Result;
 use chrono::Utc;
 use std::collections::HashMap;
@@ -37,22 +37,25 @@ impl SyncEngine {
 
     /// Perform a full sync cycle
     pub async fn sync(&mut self) -> Result<SyncReport> {
-        info!("Starting sync cycle");
+        info!("========== SYNC CYCLE STARTING ==========");
         let mut report = SyncReport::default();
 
         // 1. Scan local changes
         let local_changes = self.scan_local_changes().await?;
-        info!("Detected {} local changes", local_changes.len());
+        info!("Local changes detected: {}", local_changes.len());
         for change in &local_changes {
-            debug!("Local change: {} ({:?})", change.path, change.change_type);
+            debug!("  [LOCAL] {} ({:?})", change.path, change.change_type);
         }
 
         // 2. Get remote changes
         let (remote_changes, last_seq) = self.fetch_remote_changes().await?;
-        info!(
-            "Fetched {} remote files for comparison",
-            remote_changes.len()
-        );
+        info!("Remote files fetched: {}", remote_changes.len());
+        for change in &remote_changes {
+            debug!(
+                "  [REMOTE] {} - rev: {:?}, mtime: {:?}",
+                change.path, change.rev, change.mtime
+            );
+        }
 
         // 3. Detect conflicts
         let (clean_local, clean_remote, conflicts) = self
@@ -61,14 +64,28 @@ impl SyncEngine {
 
         report.conflicts = conflicts.len();
 
+        info!("After analysis:");
+        info!("  - Files to upload: {}", clean_local.len());
+        info!("  - Files to download: {}", clean_remote.len());
+        info!("  - Conflicts: {}", conflicts.len());
+
         // 4. Store conflicts
         for conflict in conflicts {
-            info!("Conflict detected: {}", conflict.path);
+            info!("CONFLICT: {}", conflict.path);
             self.local_db.store_conflict(&conflict)?;
         }
 
         // 5. Apply clean local changes to remote
+        info!(
+            "========== UPLOADING {} FILES ==========",
+            clean_local.len()
+        );
         for change in clean_local {
+            debug!(
+                "  Preparing to upload: {} -> {}",
+                change.path,
+                self.couchdb.get_remote_path(&change.path)
+            );
             match self.apply_to_couchdb(&change).await {
                 Ok(_) => {
                     if matches!(change.change_type, ChangeType::Deleted) {
@@ -76,7 +93,6 @@ impl SyncEngine {
                         self.local_db.delete_file_state(&change.path)?;
                     } else {
                         report.uploaded += 1;
-                        // State is now saved inside apply_to_couchdb
                     }
                 }
                 Err(e) => {
@@ -87,7 +103,16 @@ impl SyncEngine {
         }
 
         // 6. Apply clean remote changes to local
+        info!(
+            "========== DOWNLOADING {} FILES ==========",
+            clean_remote.len()
+        );
         for change in clean_remote {
+            debug!(
+                "  Preparing to download: {} -> {}",
+                change.path,
+                self.couchdb.get_local_path(&change.path)
+            );
             match self.apply_to_filesystem(&change).await {
                 Ok(_) => {
                     if matches!(change.change_type, ChangeType::Deleted) {
@@ -109,7 +134,7 @@ impl SyncEngine {
         self.local_db.save_checkpoint(&last_seq)?;
 
         info!(
-            "Sync complete: {} uploaded, {} downloaded, {} conflicts",
+            "========== SYNC COMPLETE: {} uploaded, {} downloaded, {} conflicts ==========",
             report.uploaded, report.downloaded, report.conflicts
         );
 
@@ -134,14 +159,28 @@ impl SyncEngine {
             debug!("  Local change: {} ({:?})", change.path, change.change_type);
         }
 
+        // Build a map of stored states to preserve couch_rev
+        let stored_map: HashMap<_, _> = stored_states.iter().map(|s| (&s.path, s)).collect();
+
         // Only update stored states for files that haven't changed
         // (new and modified files will be updated after successful sync)
         for state in &current_states {
             // Check if this file is in the changes list
             let is_changed = changes.iter().any(|c| c.path == state.path);
             if !is_changed {
-                // File unchanged, update the state
-                self.local_db.save_file_state(state)?;
+                // File unchanged - preserve the couch_rev from stored state
+                let couch_rev = stored_map
+                    .get(&state.path)
+                    .and_then(|s| s.couch_rev.clone());
+                let preserved_state = FileState {
+                    path: state.path.clone(),
+                    hash: state.hash.clone(),
+                    size: state.size,
+                    modified_at: state.modified_at,
+                    couch_rev,
+                    last_sync_at: state.last_sync_at,
+                };
+                self.local_db.save_file_state(&preserved_state)?;
             }
         }
 
@@ -169,123 +208,199 @@ impl SyncEngine {
         let mut clean_remote = Vec::new();
         let mut conflicts = Vec::new();
 
-        // Check local changes against remote state
-        for local_change in local_changes {
-            // Convert local path to remote path for lookup
-            let remote_path = self.couchdb.get_remote_path(&local_change.path);
-            let stored_state = self.local_db.get_file_state(&local_change.path)?;
+        debug!(
+            "========== ANALYZING {} LOCAL CHANGES ==========",
+            local_changes.len()
+        );
+        for lc in local_changes {
+            let remote_path = self.couchdb.get_remote_path(&lc.path);
+            debug!("--- LOCAL CHANGE: {} ---", lc.path);
+            debug!("  Local path: {}", lc.path);
+            debug!("  Remote path: {}", remote_path);
+            debug!("  Change type: {:?}", lc.change_type);
 
-            // Check if remote has this file and if it changed
-            let remote_changed = if let Some(remote_change) = remote_map.get(&remote_path) {
-                match (&remote_change.mtime, &stored_state) {
-                    (Some(remote_mtime), Some(state)) => *remote_mtime > state.last_sync_at,
-                    (None, _) => true, // No mtime info, assume changed to be safe
-                    (_, None) => true, // No stored state, file is new
+            let stored_state = self.local_db.get_file_state(&lc.path)?;
+            if let Some(ref state) = stored_state {
+                debug!("  STORED STATE:");
+                debug!("    hash: {}...", &state.hash[..8.min(state.hash.len())]);
+                debug!("    size: {} bytes", state.size);
+                debug!("    modified_at: {:?}", state.modified_at);
+                debug!("    couch_rev: {:?}", state.couch_rev);
+                debug!("    last_sync_at: {:?}", state.last_sync_at);
+            } else {
+                debug!("  NO STORED STATE (first time sync)");
+            }
+
+            let remote_changed = if let Some(rc) = remote_map.get(&remote_path) {
+                debug!("  REMOTE CHANGE EXISTS:");
+                debug!("    mtime: {:?}", rc.mtime);
+                debug!("    rev: {:?}", rc.rev);
+                debug!("    size: {:?}", rc.size);
+                match (&rc.mtime, &stored_state) {
+                    (Some(remote_mtime), Some(state)) => {
+                        let changed = *remote_mtime > state.last_sync_at;
+                        debug!("    remote_mtime > last_sync_at: {}", changed);
+                        debug!("    remote_mtime: {:?}", remote_mtime);
+                        debug!("    last_sync_at: {:?}", state.last_sync_at);
+                        changed
+                    }
+                    (None, _) => {
+                        debug!("    no remote mtime, assuming changed");
+                        true
+                    }
+                    (_, None) => {
+                        debug!("    no stored state, assuming changed");
+                        true
+                    }
                 }
             } else {
-                false // File doesn't exist on remote
+                debug!("  NO REMOTE CHANGE (file not on remote)");
+                false
             };
 
             if remote_changed {
-                // Both local and remote changed - check if content is the same
-                let local_state = self.get_local_state(&local_change.path).await?;
+                debug!("  => Remote is newer, fetching metadata to compare...");
 
-                // Get remote content using the remote path
-                let remote_content = self
-                    .couchdb
-                    .get_file_content(&remote_path)
-                    .await
-                    .unwrap_or_default();
-                let remote_hash = crate::local::compute_bytes_hash(&remote_content);
-
-                if local_state.hash == remote_hash {
-                    // Same content - not a real conflict, just update local state
-                    debug!("Convergent change (same content): {}", local_change.path);
-                    self.local_db.save_file_state(&local_state)?;
-                } else {
-                    // Different content - real conflict
-                    let remote_state = match self.couchdb.get_remote_state(&remote_path).await? {
-                        Some(state) => state,
-                        None => continue,
-                    };
-
-                    info!("Conflict detected: {} (both local and remote changed with different content)", local_change.path);
-                    conflicts.push(Conflict::new(
-                        local_change.path.clone(),
-                        local_state,
-                        remote_state,
-                    ));
-                }
-            } else {
-                // Only local changed, safe to upload
-                info!("Local file changed, will upload: {}", local_change.path);
-                clean_local.push(local_change.clone());
-            }
-        }
-
-        // Add remote-only changes (only if remote has a different revision)
-        for remote_change in remote_changes {
-            // Convert remote path to local path
-            let local_path = self.couchdb.get_local_path(&remote_change.path);
-
-            if !local_map.contains_key(&local_path) {
-                // Check if we have local state for this file
-                let should_download = match self.local_db.get_file_state(&local_path)? {
-                    Some(local_state) => {
-                        // Compare remote revision with stored revision
-                        let remote_rev = remote_change.rev.as_ref();
-                        let stored_rev = local_state.couch_rev.as_ref();
-
-                        let needs_download = match (remote_rev, stored_rev) {
-                            (Some(remote), Some(stored)) => {
-                                let changed = remote != stored;
-                                debug!(
-                                    "File {}: stored_rev={:?}, remote_rev={:?}, changed={}",
-                                    local_path, stored_rev, remote_rev, changed
-                                );
-                                changed
-                            }
-                            (Some(_), None) => {
-                                debug!("File {}: no stored rev, downloading", local_path);
-                                true // New file on remote
-                            }
-                            (None, Some(_)) => {
-                                debug!("File {}: no remote rev, skipping", local_path);
-                                false
-                            }
-                            (None, None) => {
-                                debug!("File {}: no revs at all, skipping", local_path);
-                                false
-                            }
-                        };
-
-                        if !needs_download {
-                            debug!("Skipping {} - revision unchanged", local_path);
-                        }
-                        needs_download
-                    }
+                // Fetch remote metadata (without downloading chunks yet)
+                let remote_doc = match self.couchdb.fetch_metadata(&remote_path).await? {
+                    Some(doc) => doc,
                     None => {
-                        // No local state - check if file exists on disk
-                        let relative_path = local_path.trim_start_matches('/');
-                        let file_path = self.root_dir.join(relative_path);
-                        if file_path.exists() {
-                            debug!(
-                                "File {} exists but not tracked, skipping (add to local state)",
-                                local_path
-                            );
-                            false // File exists but not tracked, don't overwrite
-                        } else {
-                            debug!("New remote file: {}", local_path);
-                            true // New file, download it
-                        }
+                        debug!("  Remote document not found!");
+                        continue;
                     }
                 };
 
-                if should_download {
-                    clean_remote.push(remote_change.clone());
+                // Get local state for comparison
+                let local_state = self.get_local_state(&lc.path).await?;
+                debug!("  LOCAL STATE (from disk):");
+                debug!(
+                    "    hash: {}...",
+                    &local_state.hash[..8.min(local_state.hash.len())]
+                );
+                debug!("    size: {} bytes", local_state.size);
+                debug!("    modified_at: {:?}", local_state.modified_at);
+
+                // Compare sizes to determine if content differs
+                let remote_size = remote_doc.size;
+                debug!("  COMPARING:");
+                debug!("    local size:  {} bytes", local_state.size);
+                debug!("    remote size: {} bytes", remote_size);
+
+                // Compare sizes to decide action
+                if local_state.size == remote_size {
+                    debug!("  => SIZES MATCH - files likely identical");
+                    debug!("  => Skipping chunk download (not needed)");
+                    // Update local state to reflect remote rev
+                    let updated_state = FileState {
+                        path: lc.path.clone(),
+                        hash: local_state.hash,
+                        size: local_state.size,
+                        modified_at: local_state.modified_at,
+                        couch_rev: remote_doc.rev,
+                        last_sync_at: Utc::now(),
+                    };
+                    self.local_db.save_file_state(&updated_state)?;
+                } else {
+                    debug!("  => SIZES DIFFER - conflict detected!");
+                    debug!("  => Will NOT download chunks (conflict needs user resolution)");
+
+                    let remote_state = RemoteState::from(remote_doc);
+                    debug!("  REMOTE STATE:");
+                    debug!("    size: {} bytes", remote_state.size);
+                    debug!("    modified_at: {:?}", remote_state.modified_at);
+                    debug!("    couch_rev: {:?}", remote_state.couch_rev);
+
+                    conflicts.push(Conflict::new(lc.path.clone(), local_state, remote_state));
                 }
+            } else {
+                debug!("  => Remote unchanged, safe to upload");
+                debug!(
+                    "  => Adding to upload queue: {} -> {}",
+                    lc.path, remote_path
+                );
+                clean_local.push(lc.clone());
             }
+            debug!("");
         }
+
+        debug!(
+            "========== ANALYZING {} REMOTE-ONLY CHANGES ==========",
+            remote_changes.len()
+        );
+        for rc in remote_changes {
+            let local_path = self.couchdb.get_local_path(&rc.path);
+            debug!("--- REMOTE CHANGE: {} ---", rc.path);
+            debug!("  Remote path: {}", rc.path);
+            debug!("  Local path: {}", local_path);
+            debug!("  Change type: {:?}", rc.change_type);
+            debug!("  Remote mtime: {:?}", rc.mtime);
+            debug!("  Remote rev: {:?}", rc.rev);
+            debug!("  Remote size: {:?}", rc.size);
+
+            if local_map.contains_key(&local_path) {
+                debug!("  File also changed locally, skipping (handled above)");
+                continue;
+            }
+
+            let should_download = match self.local_db.get_file_state(&local_path)? {
+                Some(state) => {
+                    debug!("  LOCAL STATE EXISTS:");
+                    debug!("    hash: {}...", &state.hash[..8.min(state.hash.len())]);
+                    debug!("    size: {} bytes", state.size);
+                    debug!("    modified_at: {:?}", state.modified_at);
+                    debug!("    couch_rev: {:?}", state.couch_rev);
+                    debug!("    last_sync_at: {:?}", state.last_sync_at);
+
+                    match (rc.rev.as_ref(), state.couch_rev.as_ref()) {
+                        (Some(remote_rev), Some(stored_rev)) => {
+                            let changed = remote_rev != stored_rev;
+                            debug!("  REVISION COMPARE:");
+                            debug!("    stored_rev: {:?}", stored_rev);
+                            debug!("    remote_rev: {:?}", remote_rev);
+                            debug!("    changed: {}", changed);
+                            changed
+                        }
+                        (Some(_), None) => {
+                            debug!("  No stored rev, treating as new file");
+                            true
+                        }
+                        (None, Some(_)) => {
+                            debug!("  No remote rev, skipping");
+                            false
+                        }
+                        (None, None) => {
+                            debug!("  No revs at all, skipping");
+                            false
+                        }
+                    }
+                }
+                None => {
+                    debug!("  NO LOCAL STATE");
+                    let relative_path = local_path.trim_start_matches('/');
+                    let file_path = self.root_dir.join(relative_path);
+                    if file_path.exists() {
+                        debug!("  File exists on disk but not tracked, skipping");
+                        false
+                    } else {
+                        debug!("  New file on remote, will download");
+                        true
+                    }
+                }
+            };
+
+            if should_download {
+                debug!("  => Remote is newer, will download chunked file");
+                clean_remote.push(rc.clone());
+            } else {
+                debug!("  => Skipping (already in sync)");
+            }
+            debug!("");
+        }
+
+        debug!("========== ANALYSIS COMPLETE ==========");
+        debug!("  Uploads queued: {}", clean_local.len());
+        debug!("  Downloads queued: {}", clean_remote.len());
+        debug!("  Conflicts found: {}", conflicts.len());
 
         Ok((clean_local, clean_remote, conflicts))
     }
@@ -312,42 +427,48 @@ impl SyncEngine {
 
     /// Apply a change to CouchDB
     async fn apply_to_couchdb(&mut self, change: &Change) -> Result<()> {
-        debug!(
-            "Applying local change to CouchDB: {} ({:?})",
-            change.path, change.change_type
-        );
+        let remote_path = self.couchdb.get_remote_path(&change.path);
+        debug!("[UPLOAD] Starting: {} -> {}", change.path, remote_path);
+        debug!("[UPLOAD] Change type: {:?}", change.change_type);
+
         match change.change_type {
             ChangeType::Created | ChangeType::Modified => {
-                // Strip leading / to prevent absolute path issues
                 let relative_path = change.path.trim_start_matches('/');
                 let file_path = self.root_dir.join(relative_path);
-                let metadata = std::fs::metadata(&file_path).map_err(|e| {
-                    anyhow::anyhow!("Failed to read metadata for {}: {}", file_path.display(), e)
-                })?;
+                let metadata = std::fs::metadata(&file_path)?;
                 let mtime = metadata
                     .modified()?
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
 
-                // Read file content and upload as chunks
-                let content = tokio::fs::read(&file_path).await.map_err(|e| {
-                    anyhow::anyhow!("Failed to read file {}: {}", file_path.display(), e)
-                })?;
+                debug!("[UPLOAD] File path: {:?}", file_path);
+                debug!("[UPLOAD] Size: {} bytes", metadata.len());
+                debug!("[UPLOAD] mtime: {} ms", mtime);
 
-                // Get the remote path for this file
-                let remote_path = self.couchdb.get_remote_path(&change.path);
+                let content = tokio::fs::read(&file_path).await?;
+                debug!("[UPLOAD] Read {} bytes from disk", content.len());
 
                 let new_chunk_ids = self.couchdb.upload_file_content(&content).await?;
+                debug!(
+                    "[UPLOAD] Uploaded content, got {} chunks",
+                    new_chunk_ids.len()
+                );
 
-                // Get existing document to preserve ctime and delete old chunks
                 let (existing_rev, existing_ctime, old_chunk_ids) =
                     match self.couchdb.get_file(&remote_path).await? {
-                        Some(existing) => (existing.rev, existing.ctime, existing.children),
-                        None => (None, mtime, Vec::new()),
+                        Some(existing) => {
+                            debug!("[UPLOAD] Existing doc found, rev: {:?}", existing.rev);
+                            debug!("[UPLOAD] Existing ctime: {} ms", existing.ctime);
+                            debug!("[UPLOAD] Existing chunks: {}", existing.children.len());
+                            (existing.rev, existing.ctime, existing.children)
+                        }
+                        None => {
+                            debug!("[UPLOAD] No existing doc, creating new");
+                            (None, mtime, Vec::new())
+                        }
                     };
 
-                // Create FileDoc with new chunk IDs
                 let mut doc = crate::models::FileDoc {
                     id: remote_path.clone(),
                     rev: existing_rev,
@@ -361,13 +482,13 @@ impl SyncEngine {
                 };
 
                 self.couchdb.save_file(&mut doc).await?;
+                debug!("[UPLOAD] Saved doc, new rev: {:?}", doc.rev);
 
-                // Clean up old chunks if they were replaced
                 if !old_chunk_ids.is_empty() {
+                    debug!("[UPLOAD] Deleting {} old chunks", old_chunk_ids.len());
                     self.couchdb.delete_chunks(&old_chunk_ids).await?;
                 }
 
-                // Update local state with the new revision (store the local path)
                 let new_rev = doc.rev.clone();
                 let hash = compute_file_hash(&file_path)?;
                 let state = FileState {
@@ -379,9 +500,10 @@ impl SyncEngine {
                     last_sync_at: Utc::now(),
                 };
                 self.local_db.save_file_state(&state)?;
+                debug!("[UPLOAD] Updated local state with rev: {:?}", new_rev);
 
                 info!(
-                    "Uploaded to CouchDB: {} -> {} ({} bytes, rev: {:?})",
+                    "[UPLOAD] SUCCESS: {} -> {} ({} bytes, rev: {:?})",
                     change.path,
                     remote_path,
                     content.len(),
@@ -389,11 +511,10 @@ impl SyncEngine {
                 );
             }
             ChangeType::Deleted => {
-                // Get the remote path for this file
-                let remote_path = self.couchdb.get_remote_path(&change.path);
+                debug!("[DELETE] Remote: {}", remote_path);
                 self.couchdb.delete_file(&remote_path).await?;
                 self.local_db.delete_file_state(&change.path)?;
-                info!("Deleted from CouchDB: {} -> {}", change.path, remote_path);
+                info!("[DELETE] SUCCESS: {} -> {}", change.path, remote_path);
             }
         }
         Ok(())
@@ -401,17 +522,17 @@ impl SyncEngine {
 
     /// Apply a change to the local filesystem
     async fn apply_to_filesystem(&mut self, change: &Change) -> Result<()> {
-        // The change.path is the full remote path, convert to local path
         let local_path = self.couchdb.get_local_path(&change.path);
-
-        // Strip leading / to prevent absolute path issues
         let relative_path = local_path.trim_start_matches('/');
         let file_path = self.root_dir.join(relative_path);
 
+        debug!("[DOWNLOAD] Remote is newer, downloading chunked file");
+        debug!("[DOWNLOAD] {} -> {}", change.path, local_path);
+
         match change.change_type {
             ChangeType::Created | ChangeType::Modified => {
-                // Get the document from CouchDB using the remote path
-                let doc = match self.couchdb.get_file(&change.path).await? {
+                // Fetch metadata first
+                let doc = match self.couchdb.fetch_metadata(&change.path).await? {
                     Some(d) => d,
                     None => {
                         warn!("Document not found in CouchDB: {}", change.path);
@@ -419,43 +540,54 @@ impl SyncEngine {
                     }
                 };
 
-                // Ensure parent directory exists
                 if let Some(parent) = file_path.parent() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
 
-                // Download file content from CouchDB attachment
+                // Now download the chunked content
+                debug!("[DOWNLOAD] Downloading {} chunks...", doc.children.len());
                 let content = match self.couchdb.get_file_content(&change.path).await {
-                    Ok(data) => data,
+                    Ok(data) => {
+                        debug!("[DOWNLOAD] Downloaded {} bytes from chunks", data.len());
+                        data
+                    }
                     Err(e) => {
-                        // If attachment doesn't exist, create empty file
-                        debug!("No content attachment for {}: {}", change.path, e);
+                        debug!("No content for {}: {}, using empty file", change.path, e);
                         Vec::new()
                     }
                 };
 
                 tokio::fs::write(&file_path, &content).await?;
+                debug!("[DOWNLOAD] Wrote {} bytes to disk", content.len());
 
-                // Update local state (store the local path, not remote)
                 let hash = compute_file_hash(&file_path)?;
                 let metadata = std::fs::metadata(&file_path)?;
+
                 let state = FileState {
                     path: local_path.clone(),
                     hash,
                     size: metadata.len(),
                     modified_at: metadata.modified()?.into(),
-                    couch_rev: doc.rev,
+                    couch_rev: doc.rev.clone(),
                     last_sync_at: Utc::now(),
                 };
                 self.local_db.save_file_state(&state)?;
 
-                info!("Downloaded from CouchDB: {} -> {}", change.path, local_path);
+                info!(
+                    "[DOWNLOAD] Chunked file downloaded: {} ({} bytes)",
+                    local_path,
+                    content.len()
+                );
             }
             ChangeType::Deleted => {
+                debug!(
+                    "[LOCAL DELETE] Remote: {}, Local: {:?}",
+                    change.path, file_path
+                );
                 if file_path.exists() {
                     tokio::fs::remove_file(&file_path).await?;
                     self.local_db.delete_file_state(&local_path)?;
-                    info!("Deleted locally: {} -> {}", change.path, local_path);
+                    info!("[LOCAL DELETE] SUCCESS: {} -> {}", change.path, local_path);
                 }
             }
         }
