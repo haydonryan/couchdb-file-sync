@@ -111,8 +111,11 @@ impl LocalDb {
 
     /// Save or update file state
     pub fn save_file_state(&self, state: &FileState) -> Result<()> {
+        // Check if this is a new file
+        let is_new = self.get_file_state(&state.path)?.is_none();
+
         self.conn.execute(
-            "INSERT OR REPLACE INTO file_states 
+            "INSERT OR REPLACE INTO file_states
              (path, hash, size, modified_at, couch_rev, last_sync_at)
              VALUES (?, ?, ?, ?, ?, ?)",
             params![
@@ -124,6 +127,11 @@ impl LocalDb {
                 state.last_sync_at.to_rfc3339(),
             ],
         )?;
+
+        if is_new {
+            info!("Added new file to local database: {} (size: {} bytes)", state.path, state.size);
+        }
+
         Ok(())
     }
 

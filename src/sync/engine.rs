@@ -72,8 +72,22 @@ impl SyncEngine {
                 Ok(_) => {
                     if matches!(change.change_type, ChangeType::Deleted) {
                         report.deleted_remote += 1;
+                        self.local_db.delete_file_state(&change.path)?;
                     } else {
                         report.uploaded += 1;
+                        // Save file state after successful upload
+                        let relative_path = change.path.trim_start_matches('/');
+                        let file_path = self.root_dir.join(relative_path);
+                        if let Ok(metadata) = std::fs::metadata(&file_path) {
+                            let hash = compute_file_hash(&file_path).unwrap_or_default();
+                            let state = FileState::new(
+                                change.path.clone(),
+                                hash,
+                                metadata.len(),
+                                metadata.modified().unwrap_or(std::time::SystemTime::now()).into(),
+                            );
+                            self.local_db.save_file_state(&state)?;
+                        }
                     }
                 }
                 Err(e) => {
@@ -114,18 +128,32 @@ impl SyncEngine {
     /// Scan for local changes
     async fn scan_local_changes(&self) -> Result<Vec<Change>> {
         use crate::models::IgnoreMatcher;
-        
+
         let scanner = Scanner::new(self.root_dir.clone(), IgnoreMatcher::empty());
         let current_states = scanner.full_scan()?;
         let stored_states = self.local_db.get_all_file_states()?;
-        
+
+        debug!("Scanned {} files on disk", current_states.len());
+        debug!("Found {} files in local database", stored_states.len());
+
         let changes = scanner.detect_changes(&current_states, &stored_states);
-        
-        // Update stored states with computed hashes
-        for state in current_states {
-            self.local_db.save_file_state(&state)?;
+
+        debug!("Detected {} changes from local scan", changes.len());
+        for change in &changes {
+            debug!("  Local change: {} ({:?})", change.path, change.change_type);
         }
-        
+
+        // Only update stored states for files that haven't changed
+        // (new and modified files will be updated after successful sync)
+        for state in &current_states {
+            // Check if this file is in the changes list
+            let is_changed = changes.iter().any(|c| c.path == state.path);
+            if !is_changed {
+                // File unchanged, update the state
+                self.local_db.save_file_state(state)?;
+            }
+        }
+
         Ok(changes)
     }
 
