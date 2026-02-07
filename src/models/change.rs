@@ -37,6 +37,8 @@ pub struct Change {
     pub size: Option<u64>,
     /// Remote modification time (for comparing with local state)
     pub mtime: Option<DateTime<Utc>>,
+    /// Remote CouchDB revision
+    pub rev: Option<String>,
 }
 
 impl Change {
@@ -47,6 +49,7 @@ impl Change {
         hash: Option<String>,
         size: Option<u64>,
         mtime: Option<DateTime<Utc>>,
+        rev: Option<String>,
     ) -> Self {
         Self {
             path,
@@ -56,6 +59,7 @@ impl Change {
             hash,
             size,
             mtime,
+            rev,
         }
     }
 
@@ -66,6 +70,7 @@ impl Change {
             ChangeSource::Local,
             Some(hash),
             Some(size),
+            None,
             None,
         )
     }
@@ -78,6 +83,7 @@ impl Change {
             Some(hash),
             Some(size),
             None,
+            None,
         )
     }
 
@@ -89,10 +95,17 @@ impl Change {
             None,
             None,
             None,
+            None,
         )
     }
 
-    pub fn remote_created(path: String, hash: String, size: u64, mtime: DateTime<Utc>) -> Self {
+    pub fn remote_created(
+        path: String,
+        hash: String,
+        size: u64,
+        mtime: DateTime<Utc>,
+        rev: String,
+    ) -> Self {
         Self::new(
             path,
             ChangeType::Created,
@@ -100,10 +113,17 @@ impl Change {
             Some(hash),
             Some(size),
             Some(mtime),
+            Some(rev),
         )
     }
 
-    pub fn remote_modified(path: String, hash: String, size: u64, mtime: DateTime<Utc>) -> Self {
+    pub fn remote_modified(
+        path: String,
+        hash: String,
+        size: u64,
+        mtime: DateTime<Utc>,
+        rev: String,
+    ) -> Self {
         Self::new(
             path,
             ChangeType::Modified,
@@ -111,6 +131,7 @@ impl Change {
             Some(hash),
             Some(size),
             Some(mtime),
+            Some(rev),
         )
     }
 
@@ -119,6 +140,7 @@ impl Change {
             path,
             ChangeType::Deleted,
             ChangeSource::Remote,
+            None,
             None,
             None,
             None,

@@ -7,6 +7,9 @@ couchdb:
   username: "admin"
   password: "${COUCHDB_PASSWORD}"  # Can use environment variable substitution
   database: "couchfs_files"
+  # Remote path prefix to sync (e.g., "notes/" or "obsidian/")
+  # Empty or "/" means sync the entire database
+  remote_path: ""
   timeout_seconds: 30
   retry_attempts: 3
 

@@ -14,6 +14,8 @@ pub struct CouchDb {
     http_client: HttpClient,
     base_url: String,
     auth: Option<(String, String)>,
+    /// Remote path prefix to sync (e.g., "notes/" or "obsidian/")
+    remote_path: String,
 }
 
 impl CouchDb {
@@ -23,6 +25,7 @@ impl CouchDb {
         username: Option<&str>,
         password: Option<&str>,
         db_name: &str,
+        remote_path: &str,
     ) -> Result<Self> {
         let client = match (username, password) {
             (Some(u), Some(p)) => Client::new(url, u, p)?,
@@ -37,6 +40,17 @@ impl CouchDb {
             _ => None,
         };
 
+        // Normalize remote path - ensure it ends with / if not empty
+        let remote_path = if remote_path.is_empty() || remote_path == "/" {
+            String::new()
+        } else {
+            let mut path = remote_path.to_string();
+            if !path.ends_with('/') {
+                path.push('/');
+            }
+            path
+        };
+
         Ok(Self {
             client,
             db,
@@ -44,11 +58,50 @@ impl CouchDb {
             http_client: HttpClient::new(),
             base_url: url.to_string(),
             auth,
+            remote_path,
         })
+    }
+
+    /// Check if a path is within the configured remote path
+    /// Check if a path is within the configured remote path
+    pub fn is_path_allowed(&self, path: &str) -> bool {
+        if self.remote_path.is_empty() {
+            true
+        } else {
+            path.starts_with(&self.remote_path) || path == self.remote_path.trim_end_matches('/')
+        }
+    }
+
+    /// Get the full remote path for a local file
+    pub fn get_remote_path(&self, local_path: &str) -> String {
+        if self.remote_path.is_empty() {
+            local_path.to_string()
+        } else {
+            // Combine remote path prefix with local path
+            format!("{}{}", self.remote_path, local_path)
+        }
+    }
+
+    /// Get the local path from a remote path (strips the remote prefix)
+    pub fn get_local_path(&self, remote_path: &str) -> String {
+        if self.remote_path.is_empty() {
+            remote_path.to_string()
+        } else {
+            // Strip the remote path prefix
+            remote_path
+                .strip_prefix(&self.remote_path)
+                .unwrap_or(remote_path)
+                .to_string()
+        }
     }
 
     /// Get a document by ID
     pub async fn get_file(&self, path: &str) -> Result<Option<FileDoc>> {
+        // Check if path is within allowed remote path
+        if !self.is_path_allowed(path) {
+            return Ok(None);
+        }
+
         match self.db.get(path).await {
             Ok(doc) => Ok(Some(doc)),
             Err(e) => {
@@ -81,22 +134,26 @@ impl CouchDb {
     }
 
     /// Get all documents (non-deleted, files only - not chunks)
+    /// Filtered by the configured remote path
     pub async fn get_all_files(&self) -> Result<Vec<FileDoc>> {
         let collection = self.db.get_all::<FileDoc>().await?;
         Ok(collection
             .rows
             .into_iter()
-            .filter(|d| !d.deleted && d.is_file())
+            .filter(|d| !d.deleted && d.is_file() && self.is_path_allowed(&d.id))
             .collect())
     }
 
     /// Get changes since the last checkpoint
-    /// Returns all remote files with their mtime for comparison
+    /// Returns remote files within the configured remote path
     pub async fn get_changes(&self, since: Option<&str>) -> Result<(Vec<Change>, String)> {
         debug!("get_changes called with since = {:?}", since);
 
         let all_files = self.get_all_files().await?;
-        debug!("Total files in CouchDB: {}", all_files.len());
+        debug!(
+            "Total files in CouchDB (filtered by remote_path): {}",
+            all_files.len()
+        );
 
         // If no checkpoint exists (first run), return empty changes
         // The files will be handled as new files on the next sync
@@ -108,13 +165,13 @@ impl CouchDb {
 
         debug!("Checkpoint found: {}, returning changes", since.unwrap());
 
-        // Return all files as potential changes (sync will compare mtimes)
-        // The actual sync logic will determine if they're really changed
+        // Return all files as potential changes (sync will compare revs)
         let changes: Vec<Change> = all_files
             .into_iter()
             .map(|doc| {
                 let mtime = doc.modified_at();
-                crate::models::Change::remote_modified(doc.id, String::new(), doc.size, mtime)
+                let rev = doc.rev.unwrap_or_default();
+                crate::models::Change::remote_modified(doc.id, String::new(), doc.size, mtime, rev)
             })
             .collect();
 

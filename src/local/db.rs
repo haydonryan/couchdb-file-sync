@@ -207,6 +207,7 @@ impl LocalDb {
                     hash: row.get(4)?,
                     size: row.get(5)?,
                     mtime: None,
+                    rev: None,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

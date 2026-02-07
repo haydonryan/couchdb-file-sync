@@ -76,22 +76,7 @@ impl SyncEngine {
                         self.local_db.delete_file_state(&change.path)?;
                     } else {
                         report.uploaded += 1;
-                        // Save file state after successful upload
-                        let relative_path = change.path.trim_start_matches('/');
-                        let file_path = self.root_dir.join(relative_path);
-                        if let Ok(metadata) = std::fs::metadata(&file_path) {
-                            let hash = compute_file_hash(&file_path).unwrap_or_default();
-                            let state = FileState::new(
-                                change.path.clone(),
-                                hash,
-                                metadata.len(),
-                                metadata
-                                    .modified()
-                                    .unwrap_or(std::time::SystemTime::now())
-                                    .into(),
-                            );
-                            self.local_db.save_file_state(&state)?;
-                        }
+                        // State is now saved inside apply_to_couchdb
                     }
                 }
                 Err(e) => {
@@ -186,11 +171,12 @@ impl SyncEngine {
 
         // Check local changes against remote state
         for local_change in local_changes {
-            // Get our stored state (last sync) for this file
+            // Convert local path to remote path for lookup
+            let remote_path = self.couchdb.get_remote_path(&local_change.path);
             let stored_state = self.local_db.get_file_state(&local_change.path)?;
 
             // Check if remote has this file and if it changed
-            let remote_changed = if let Some(remote_change) = remote_map.get(&local_change.path) {
+            let remote_changed = if let Some(remote_change) = remote_map.get(&remote_path) {
                 match (&remote_change.mtime, &stored_state) {
                     (Some(remote_mtime), Some(state)) => *remote_mtime > state.last_sync_at,
                     (None, _) => true, // No mtime info, assume changed to be safe
@@ -204,10 +190,10 @@ impl SyncEngine {
                 // Both local and remote changed - check if content is the same
                 let local_state = self.get_local_state(&local_change.path).await?;
 
-                // Get remote content and compute hash
+                // Get remote content using the remote path
                 let remote_content = self
                     .couchdb
-                    .get_file_content(&local_change.path)
+                    .get_file_content(&remote_path)
                     .await
                     .unwrap_or_default();
                 let remote_hash = crate::local::compute_bytes_hash(&remote_content);
@@ -218,11 +204,10 @@ impl SyncEngine {
                     self.local_db.save_file_state(&local_state)?;
                 } else {
                     // Different content - real conflict
-                    let remote_state =
-                        match self.couchdb.get_remote_state(&local_change.path).await? {
-                            Some(state) => state,
-                            None => continue,
-                        };
+                    let remote_state = match self.couchdb.get_remote_state(&remote_path).await? {
+                        Some(state) => state,
+                        None => continue,
+                    };
 
                     info!("Conflict detected: {} (both local and remote changed with different content)", local_change.path);
                     conflicts.push(Conflict::new(
@@ -238,42 +223,59 @@ impl SyncEngine {
             }
         }
 
-        // Add remote-only changes (only if remote is newer than local or file doesn't exist)
+        // Add remote-only changes (only if remote has a different revision)
         for remote_change in remote_changes {
-            if !local_map.contains_key(&remote_change.path) {
-                // Strip leading / to check file existence
-                let relative_path = remote_change.path.trim_start_matches('/');
-                let file_path = self.root_dir.join(relative_path);
-                let file_exists = file_path.exists();
+            // Convert remote path to local path
+            let local_path = self.couchdb.get_local_path(&remote_change.path);
 
+            if !local_map.contains_key(&local_path) {
                 // Check if we have local state for this file
-                let should_download = match self.local_db.get_file_state(&remote_change.path)? {
+                let should_download = match self.local_db.get_file_state(&local_path)? {
                     Some(local_state) => {
-                        if !file_exists {
-                            // File was deleted locally, re-download it
-                            debug!(
-                                "File {} was deleted locally, will re-download",
-                                remote_change.path
-                            );
-                            true
-                        } else {
-                            // Only download if remote mtime is newer than our last sync
-                            match remote_change.mtime {
-                                Some(remote_mtime) => remote_mtime > local_state.last_sync_at,
-                                None => true, // No mtime info, download to be safe
+                        // Compare remote revision with stored revision
+                        let remote_rev = remote_change.rev.as_ref();
+                        let stored_rev = local_state.couch_rev.as_ref();
+
+                        let needs_download = match (remote_rev, stored_rev) {
+                            (Some(remote), Some(stored)) => {
+                                let changed = remote != stored;
+                                debug!(
+                                    "File {}: stored_rev={:?}, remote_rev={:?}, changed={}",
+                                    local_path, stored_rev, remote_rev, changed
+                                );
+                                changed
                             }
+                            (Some(_), None) => {
+                                debug!("File {}: no stored rev, downloading", local_path);
+                                true // New file on remote
+                            }
+                            (None, Some(_)) => {
+                                debug!("File {}: no remote rev, skipping", local_path);
+                                false
+                            }
+                            (None, None) => {
+                                debug!("File {}: no revs at all, skipping", local_path);
+                                false
+                            }
+                        };
+
+                        if !needs_download {
+                            debug!("Skipping {} - revision unchanged", local_path);
                         }
+                        needs_download
                     }
                     None => {
                         // No local state - check if file exists on disk
-                        if file_exists {
+                        let relative_path = local_path.trim_start_matches('/');
+                        let file_path = self.root_dir.join(relative_path);
+                        if file_path.exists() {
                             debug!(
                                 "File {} exists but not tracked, skipping (add to local state)",
-                                remote_change.path
+                                local_path
                             );
                             false // File exists but not tracked, don't overwrite
                         } else {
-                            debug!("New remote file: {}", remote_change.path);
+                            debug!("New remote file: {}", local_path);
                             true // New file, download it
                         }
                     }
@@ -281,8 +283,6 @@ impl SyncEngine {
 
                 if should_download {
                     clean_remote.push(remote_change.clone());
-                } else {
-                    debug!("Skipping {} - local is up to date", remote_change.path);
                 }
             }
         }
@@ -334,21 +334,25 @@ impl SyncEngine {
                 let content = tokio::fs::read(&file_path).await.map_err(|e| {
                     anyhow::anyhow!("Failed to read file {}: {}", file_path.display(), e)
                 })?;
+
+                // Get the remote path for this file
+                let remote_path = self.couchdb.get_remote_path(&change.path);
+
                 let new_chunk_ids = self.couchdb.upload_file_content(&content).await?;
 
                 // Get existing document to preserve ctime and delete old chunks
                 let (existing_rev, existing_ctime, old_chunk_ids) =
-                    match self.couchdb.get_file(&change.path).await? {
+                    match self.couchdb.get_file(&remote_path).await? {
                         Some(existing) => (existing.rev, existing.ctime, existing.children),
                         None => (None, mtime, Vec::new()),
                     };
 
                 // Create FileDoc with new chunk IDs
                 let mut doc = crate::models::FileDoc {
-                    id: change.path.clone(),
+                    id: remote_path.clone(),
                     rev: existing_rev,
                     children: new_chunk_ids,
-                    path: change.path.clone(),
+                    path: remote_path.clone(),
                     ctime: existing_ctime,
                     mtime,
                     size: metadata.len(),
@@ -363,16 +367,33 @@ impl SyncEngine {
                     self.couchdb.delete_chunks(&old_chunk_ids).await?;
                 }
 
+                // Update local state with the new revision (store the local path)
+                let new_rev = doc.rev.clone();
+                let hash = compute_file_hash(&file_path)?;
+                let state = FileState {
+                    path: change.path.clone(),
+                    hash,
+                    size: metadata.len(),
+                    modified_at: metadata.modified()?.into(),
+                    couch_rev: new_rev.clone(),
+                    last_sync_at: Utc::now(),
+                };
+                self.local_db.save_file_state(&state)?;
+
                 info!(
-                    "Uploaded to CouchDB: {} ({} bytes)",
+                    "Uploaded to CouchDB: {} -> {} ({} bytes, rev: {:?})",
                     change.path,
-                    content.len()
+                    remote_path,
+                    content.len(),
+                    new_rev
                 );
             }
             ChangeType::Deleted => {
-                self.couchdb.delete_file(&change.path).await?;
+                // Get the remote path for this file
+                let remote_path = self.couchdb.get_remote_path(&change.path);
+                self.couchdb.delete_file(&remote_path).await?;
                 self.local_db.delete_file_state(&change.path)?;
-                info!("Deleted from CouchDB: {}", change.path);
+                info!("Deleted from CouchDB: {} -> {}", change.path, remote_path);
             }
         }
         Ok(())
@@ -380,13 +401,16 @@ impl SyncEngine {
 
     /// Apply a change to the local filesystem
     async fn apply_to_filesystem(&mut self, change: &Change) -> Result<()> {
+        // The change.path is the full remote path, convert to local path
+        let local_path = self.couchdb.get_local_path(&change.path);
+
         // Strip leading / to prevent absolute path issues
-        let relative_path = change.path.trim_start_matches('/');
+        let relative_path = local_path.trim_start_matches('/');
         let file_path = self.root_dir.join(relative_path);
 
         match change.change_type {
             ChangeType::Created | ChangeType::Modified => {
-                // Get the document from CouchDB
+                // Get the document from CouchDB using the remote path
                 let doc = match self.couchdb.get_file(&change.path).await? {
                     Some(d) => d,
                     None => {
@@ -412,11 +436,11 @@ impl SyncEngine {
 
                 tokio::fs::write(&file_path, &content).await?;
 
-                // Update local state
+                // Update local state (store the local path, not remote)
                 let hash = compute_file_hash(&file_path)?;
                 let metadata = std::fs::metadata(&file_path)?;
                 let state = FileState {
-                    path: change.path.clone(),
+                    path: local_path.clone(),
                     hash,
                     size: metadata.len(),
                     modified_at: metadata.modified()?.into(),
@@ -425,13 +449,13 @@ impl SyncEngine {
                 };
                 self.local_db.save_file_state(&state)?;
 
-                info!("Downloaded from CouchDB: {}", change.path);
+                info!("Downloaded from CouchDB: {} -> {}", change.path, local_path);
             }
             ChangeType::Deleted => {
                 if file_path.exists() {
                     tokio::fs::remove_file(&file_path).await?;
-                    self.local_db.delete_file_state(&change.path)?;
-                    info!("Deleted locally: {}", change.path);
+                    self.local_db.delete_file_state(&local_path)?;
+                    info!("Deleted locally: {} -> {}", change.path, local_path);
                 }
             }
         }

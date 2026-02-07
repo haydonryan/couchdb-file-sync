@@ -94,6 +94,7 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
         config.couchdb.username.as_deref(),
         config.couchdb.password.as_deref(),
         &config.couchdb.database,
+        &config.couchdb.remote_path,
     )
     .await?;
 
@@ -189,6 +190,7 @@ pub async fn resolve(
         config.couchdb.username.as_deref(),
         config.couchdb.password.as_deref(),
         &config.couchdb.database,
+        &config.couchdb.remote_path,
     )
     .await?;
 

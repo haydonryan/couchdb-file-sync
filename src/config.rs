@@ -98,6 +98,9 @@ pub struct CouchDbConfig {
     pub password: Option<String>,
     #[serde(default = "default_db_name")]
     pub database: String,
+    /// Remote path to sync (e.g., "notes/" or "obsidian/"). Empty means sync all.
+    #[serde(default)]
+    pub remote_path: String,
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
     #[serde(default = "default_retry")]
@@ -111,6 +114,7 @@ impl Default for CouchDbConfig {
             username: None,
             password: None,
             database: default_db_name(),
+            remote_path: String::new(),
             timeout_seconds: default_timeout(),
             retry_attempts: default_retry(),
         }
