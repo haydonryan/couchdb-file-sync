@@ -177,19 +177,39 @@ impl SyncEngine {
             }
         }
 
-        // Add remote-only changes (only if remote is newer than local)
+        // Add remote-only changes (only if remote is newer than local or file doesn't exist)
         for remote_change in remote_changes {
             if !local_map.contains_key(&remote_change.path) {
+                // Strip leading / to check file existence
+                let relative_path = remote_change.path.trim_start_matches('/');
+                let file_path = self.root_dir.join(relative_path);
+                let file_exists = file_path.exists();
+
                 // Check if we have local state for this file
                 let should_download = match self.local_db.get_file_state(&remote_change.path)? {
                     Some(local_state) => {
-                        // Only download if remote mtime is newer than our last sync
-                        match remote_change.mtime {
-                            Some(remote_mtime) => remote_mtime > local_state.last_sync_at,
-                            None => true, // No mtime info, download to be safe
+                        if !file_exists {
+                            // File was deleted locally, re-download it
+                            debug!("File {} was deleted locally, will re-download", remote_change.path);
+                            true
+                        } else {
+                            // Only download if remote mtime is newer than our last sync
+                            match remote_change.mtime {
+                                Some(remote_mtime) => remote_mtime > local_state.last_sync_at,
+                                None => true, // No mtime info, download to be safe
+                            }
                         }
                     }
-                    None => true, // No local state, this is a new file
+                    None => {
+                        // No local state - check if file exists on disk
+                        if file_exists {
+                            debug!("File {} exists but not tracked, skipping (add to local state)", remote_change.path);
+                            false // File exists but not tracked, don't overwrite
+                        } else {
+                            debug!("New remote file: {}", remote_change.path);
+                            true // New file, download it
+                        }
+                    }
                 };
 
                 if should_download {
