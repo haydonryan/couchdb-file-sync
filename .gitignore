@@ -1,0 +1,7 @@
+/target
+Cargo.lock
+*.log
+.couchfs/
+*.db
+*.remote
+.DS_Store
