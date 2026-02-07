@@ -195,19 +195,31 @@ impl SyncEngine {
             };
 
             if remote_changed {
-                // Both local and remote changed - conflict
+                // Both local and remote changed - check if content is the same
                 let local_state = self.get_local_state(&local_change.path).await?;
-                let remote_state = match self.couchdb.get_remote_state(&local_change.path).await? {
-                    Some(state) => state,
-                    None => continue,
-                };
 
-                info!("Conflict detected: {} (both local and remote changed)", local_change.path);
-                conflicts.push(Conflict::new(
-                    local_change.path.clone(),
-                    local_state,
-                    remote_state,
-                ));
+                // Get remote content and compute hash
+                let remote_content = self.couchdb.get_file_content(&local_change.path).await.unwrap_or_default();
+                let remote_hash = crate::local::compute_bytes_hash(&remote_content);
+
+                if local_state.hash == remote_hash {
+                    // Same content - not a real conflict, just update local state
+                    debug!("Convergent change (same content): {}", local_change.path);
+                    self.local_db.save_file_state(&local_state)?;
+                } else {
+                    // Different content - real conflict
+                    let remote_state = match self.couchdb.get_remote_state(&local_change.path).await? {
+                        Some(state) => state,
+                        None => continue,
+                    };
+
+                    info!("Conflict detected: {} (both local and remote changed with different content)", local_change.path);
+                    conflicts.push(Conflict::new(
+                        local_change.path.clone(),
+                        local_state,
+                        remote_state,
+                    ));
+                }
             } else {
                 // Only local changed, safe to upload
                 info!("Local file changed, will upload: {}", local_change.path);
@@ -295,28 +307,38 @@ impl SyncEngine {
                     .unwrap_or_default()
                     .as_millis() as u64;
 
-                // Create FileDoc with current file info (Obsidian LiveSync format)
+                // Read file content and upload as chunks
+                let content = tokio::fs::read(&file_path).await
+                    .map_err(|e| anyhow::anyhow!("Failed to read file {}: {}", file_path.display(), e))?;
+                let new_chunk_ids = self.couchdb.upload_file_content(&content).await?;
+
+                // Get existing document to preserve ctime and delete old chunks
+                let (existing_rev, existing_ctime, old_chunk_ids) = match self.couchdb.get_file(&change.path).await? {
+                    Some(existing) => (existing.rev, existing.ctime, existing.children),
+                    None => (None, mtime, Vec::new()),
+                };
+
+                // Create FileDoc with new chunk IDs
                 let mut doc = crate::models::FileDoc {
                     id: change.path.clone(),
-                    rev: None, // Will be set by CouchDB
-                    children: Vec::new(), // TODO: implement chunking for uploads
+                    rev: existing_rev,
+                    children: new_chunk_ids,
                     path: change.path.clone(),
-                    ctime: mtime, // Use mtime as ctime for now
+                    ctime: existing_ctime,
                     mtime,
                     size: metadata.len(),
                     doc_type: "plain".to_string(),
                     deleted: false,
                 };
 
-                // Check if document exists to get its revision and children
-                if let Some(existing) = self.couchdb.get_file(&change.path).await? {
-                    doc.rev = existing.rev;
-                    doc.children = existing.children;
-                    doc.ctime = existing.ctime;
+                self.couchdb.save_file(&mut doc).await?;
+
+                // Clean up old chunks if they were replaced
+                if !old_chunk_ids.is_empty() {
+                    self.couchdb.delete_chunks(&old_chunk_ids).await?;
                 }
 
-                self.couchdb.save_file(&mut doc).await?;
-                info!("Uploaded to CouchDB: {}", change.path);
+                info!("Uploaded to CouchDB: {} ({} bytes)", change.path, content.len());
             }
             ChangeType::Deleted => {
                 self.couchdb.delete_file(&change.path).await?;
