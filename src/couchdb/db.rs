@@ -204,6 +204,79 @@ impl CouchDb {
 
         Ok(content.into_bytes())
     }
+
+    /// Generate a unique chunk ID
+    fn generate_chunk_id() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        // Generate a base36-like ID similar to Obsidian LiveSync
+        format!("h:{:x}{:x}", timestamp, rand::random::<u32>())
+    }
+
+    /// Save a chunk document to CouchDB
+    async fn save_chunk(&self, chunk: &ChunkDoc) -> Result<()> {
+        let url = format!("{}/{}", self.base_url, chunk.id);
+
+        let mut request = self.http_client.put(&url);
+        if let Some((username, password)) = &self.auth {
+            request = request.basic_auth(username, Some(password));
+        }
+
+        let response = request
+            .header("Content-Type", "application/json")
+            .json(chunk)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to save chunk {}: {} - {}", chunk.id, status, body);
+        }
+
+        debug!("Saved chunk: {}", chunk.id);
+        Ok(())
+    }
+
+    /// Upload file content as chunks and return the chunk IDs
+    pub async fn upload_file_content(&self, content: &[u8]) -> Result<Vec<String>> {
+        let content_str = String::from_utf8_lossy(content);
+
+        // For simplicity, store entire content as a single chunk
+        // (Obsidian LiveSync may split into multiple chunks for large files)
+        let chunk_id = Self::generate_chunk_id();
+        let chunk = ChunkDoc {
+            id: chunk_id.clone(),
+            rev: None,
+            data: content_str.to_string(),
+            doc_type: "leaf".to_string(),
+        };
+
+        self.save_chunk(&chunk).await?;
+
+        Ok(vec![chunk_id])
+    }
+
+    /// Delete old chunks that are no longer referenced
+    pub async fn delete_chunks(&self, chunk_ids: &[String]) -> Result<()> {
+        for chunk_id in chunk_ids {
+            if let Some(chunk) = self.get_chunk(chunk_id).await? {
+                if let Some(rev) = chunk.rev {
+                    let url = format!("{}/{}?rev={}", self.base_url, chunk_id, rev);
+                    let mut request = self.http_client.delete(&url);
+                    if let Some((username, password)) = &self.auth {
+                        request = request.basic_auth(username, Some(password));
+                    }
+                    let _ = request.send().await;
+                    debug!("Deleted old chunk: {}", chunk_id);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Helper to create CouchDB URL from components
