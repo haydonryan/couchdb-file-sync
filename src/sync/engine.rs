@@ -178,29 +178,39 @@ impl SyncEngine {
         let mut clean_remote = Vec::new();
         let mut conflicts = Vec::new();
 
-        // Check for conflicts (same path modified on both sides)
+        // Check local changes against remote state
         for local_change in local_changes {
-            if let Some(remote_change) = remote_map.get(&local_change.path) {
-                // Both sides changed - potential conflict
-                if Self::is_actual_conflict(local_change, remote_change).await? {
-                    // Get detailed state for conflict record
-                    let local_state = self.get_local_state(&local_change.path).await?;
-                    let remote_state = match self.couchdb.get_remote_state(&local_change.path).await? {
-                        Some(state) => state,
-                        None => continue,
-                    };
-                    
-                    conflicts.push(Conflict::new(
-                        local_change.path.clone(),
-                        local_state,
-                        remote_state,
-                    ));
-                } else {
-                    // Same change on both sides - no conflict
-                    debug!("Convergent change on both sides: {}", local_change.path);
+            // Get our stored state (last sync) for this file
+            let stored_state = self.local_db.get_file_state(&local_change.path)?;
+
+            // Check if remote has this file and if it changed
+            let remote_changed = if let Some(remote_change) = remote_map.get(&local_change.path) {
+                match (&remote_change.mtime, &stored_state) {
+                    (Some(remote_mtime), Some(state)) => *remote_mtime > state.last_sync_at,
+                    (None, _) => true, // No mtime info, assume changed to be safe
+                    (_, None) => true, // No stored state, file is new
                 }
             } else {
-                // Only local changed
+                false // File doesn't exist on remote
+            };
+
+            if remote_changed {
+                // Both local and remote changed - conflict
+                let local_state = self.get_local_state(&local_change.path).await?;
+                let remote_state = match self.couchdb.get_remote_state(&local_change.path).await? {
+                    Some(state) => state,
+                    None => continue,
+                };
+
+                info!("Conflict detected: {} (both local and remote changed)", local_change.path);
+                conflicts.push(Conflict::new(
+                    local_change.path.clone(),
+                    local_state,
+                    remote_state,
+                ));
+            } else {
+                // Only local changed, safe to upload
+                info!("Local file changed, will upload: {}", local_change.path);
                 clean_local.push(local_change.clone());
             }
         }
@@ -249,15 +259,6 @@ impl SyncEngine {
         }
 
         Ok((clean_local, clean_remote, conflicts))
-    }
-
-    /// Determine if two changes are actually in conflict
-    async fn is_actual_conflict(local: &Change, remote: &Change) -> Result<bool> {
-        // If hashes are the same, it's not a conflict (convergent change)
-        match (&local.hash, &remote.hash) {
-            (Some(lh), Some(rh)) if lh == rh => Ok(false),
-            _ => Ok(true),
-        }
     }
 
     /// Get local file state
