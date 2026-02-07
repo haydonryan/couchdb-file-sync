@@ -90,17 +90,35 @@ impl CouchDb {
             .collect())
     }
 
-    /// Get changes by comparing local state with remote
+    /// Get changes since the last checkpoint
     /// Returns all remote files with their mtime for comparison
-    pub async fn get_changes(&self, _since: Option<&str>) -> Result<(Vec<Change>, String)> {
-        let files = self.get_all_files().await?;
-        let changes: Vec<Change> = files
+    pub async fn get_changes(&self, since: Option<&str>) -> Result<(Vec<Change>, String)> {
+        debug!("get_changes called with since = {:?}", since);
+
+        let all_files = self.get_all_files().await?;
+        debug!("Total files in CouchDB: {}", all_files.len());
+
+        // If no checkpoint exists (first run), return empty changes
+        // The files will be handled as new files on the next sync
+        if since.is_none() {
+            debug!("No checkpoint found, returning empty changes list");
+            let seq = chrono::Utc::now().timestamp().to_string();
+            return Ok((Vec::new(), seq));
+        }
+
+        debug!("Checkpoint found: {}, returning changes", since.unwrap());
+
+        // Return all files as potential changes (sync will compare mtimes)
+        // The actual sync logic will determine if they're really changed
+        let changes: Vec<Change> = all_files
             .into_iter()
             .map(|doc| {
                 let mtime = doc.modified_at();
                 crate::models::Change::remote_modified(doc.id, String::new(), doc.size, mtime)
             })
             .collect();
+
+        debug!("Returning {} changes", changes.len());
 
         // Return a simple sequence number (timestamp)
         let seq = chrono::Utc::now().timestamp().to_string();

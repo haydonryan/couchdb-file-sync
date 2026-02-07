@@ -49,7 +49,10 @@ impl SyncEngine {
 
         // 2. Get remote changes
         let (remote_changes, last_seq) = self.fetch_remote_changes().await?;
-        info!("Detected {} remote changes", remote_changes.len());
+        info!(
+            "Fetched {} remote files for comparison",
+            remote_changes.len()
+        );
 
         // 3. Detect conflicts
         let (clean_local, clean_remote, conflicts) = self
