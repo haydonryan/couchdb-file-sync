@@ -1,0 +1,67 @@
+# CouchFS Configuration Example
+# Copy this file to couchfs.yaml and customize for your setup
+
+# CouchDB connection settings
+couchdb:
+  url: "http://localhost:5984"
+  username: "admin"
+  password: "${COUCHDB_PASSWORD}"  # Can use environment variable substitution
+  database: "couchfs_files"
+  timeout_seconds: 30
+  retry_attempts: 3
+
+# Sync behavior settings
+sync:
+  # Root directory to sync (default: current directory)
+  # root_dir: "/home/user/documents"
+  
+  # Daemon mode: poll interval in seconds
+  poll_interval: 60
+  
+  # File watching: debounce time in milliseconds
+  debounce_ms: 500
+  
+  # Batch size for bulk operations
+  batch_size: 100
+  
+  # Maximum file size to sync (in bytes, 0 = unlimited)
+  max_file_size: 1073741824  # 1GB
+  
+  # Enable parallel uploads/downloads
+  parallel: true
+  max_parallel: 4
+
+# Ignore patterns (alternative to .sync-ignore file)
+ignore:
+  patterns:
+    - "*.log"
+    - "*.tmp"
+    - "*.swp"
+    - ".DS_Store"
+  
+  # Additional ignore files to read
+  ignore_files:
+    - ".sync-ignore"
+    - ".gitignore"
+
+# Conflict resolution settings
+conflicts:
+  default_strategy: "keep-both"  # keep-local, keep-remote, keep-both
+  auto_resolve: false
+  conflict_dir: ".conflicts"  # Where to store conflict copies
+
+# Telegram notifications for conflicts
+notifications:
+  enabled: false
+  telegram:
+    bot_token: "${TELEGRAM_BOT_TOKEN}"  # From @BotFather
+    chat_id: "${TELEGRAM_CHAT_ID}"      # Your chat ID
+  notify_on_conflict: true
+  notify_on_sync_error: true
+  notify_summary: false
+
+# Logging settings
+logging:
+  level: "info"      # error, warn, info, debug, trace
+  format: "pretty"   # pretty, json, compact
+  # file: "/var/log/couchfs.log"  # Optional file output
