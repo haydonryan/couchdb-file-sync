@@ -129,7 +129,10 @@ impl LocalDb {
         )?;
 
         if is_new {
-            info!("Added new file to local database: {} (size: {} bytes)", state.path, state.size);
+            info!(
+                "Added new file to local database: {} (size: {} bytes)",
+                state.path, state.size
+            );
         }
 
         Ok(())
@@ -195,7 +198,7 @@ impl LocalDb {
             .query_map([], |row| {
                 let change_type_str: String = row.get(1)?;
                 let source_str: String = row.get(2)?;
-                
+
                 Ok(Change {
                     path: row.get(0)?,
                     change_type: parse_change_type(&change_type_str),
@@ -214,24 +217,23 @@ impl LocalDb {
     /// Mark changes as processed
     pub fn mark_changes_processed(&self, paths: &[String]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        
+
         for path in paths {
             self.conn.execute(
                 "UPDATE change_queue SET processed = TRUE WHERE path = ?",
                 params![path],
             )?;
         }
-        
+
         tx.commit()?;
         Ok(())
     }
 
     /// Clear processed changes
     pub fn clear_processed_changes(&self) -> Result<usize> {
-        let count = self.conn.execute(
-            "DELETE FROM change_queue WHERE processed = TRUE",
-            [],
-        )?;
+        let count = self
+            .conn
+            .execute("DELETE FROM change_queue WHERE processed = TRUE", [])?;
         Ok(count)
     }
 
@@ -273,7 +275,7 @@ impl LocalDb {
         let conflicts = stmt
             .query_map([], |row| {
                 use crate::models::RemoteState;
-                
+
                 let path: String = row.get(0)?;
                 let local_state = FileState {
                     path: path.clone(),
@@ -283,7 +285,7 @@ impl LocalDb {
                     couch_rev: None,
                     last_sync_at: Utc::now(),
                 };
-                
+
                 let remote_state = RemoteState {
                     path: path.clone(),
                     hash: row.get(4)?,
@@ -292,11 +294,11 @@ impl LocalDb {
                     couch_rev: row.get(7)?,
                     deleted: false,
                 };
-                
+
                 let mut conflict = Conflict::new(path, local_state, remote_state);
                 conflict.detected_at = row.get(8)?;
                 conflict.notified = row.get(9)?;
-                
+
                 Ok(conflict)
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -316,7 +318,7 @@ impl LocalDb {
         let conflict = stmt
             .query_row(params![path], |row| {
                 use crate::models::RemoteState;
-                
+
                 let path: String = row.get(0)?;
                 let local_state = FileState {
                     path: path.clone(),
@@ -326,7 +328,7 @@ impl LocalDb {
                     couch_rev: None,
                     last_sync_at: Utc::now(),
                 };
-                
+
                 let remote_state = RemoteState {
                     path: path.clone(),
                     hash: row.get(4)?,
@@ -335,11 +337,11 @@ impl LocalDb {
                     couch_rev: row.get(7)?,
                     deleted: false,
                 };
-                
+
                 let mut conflict = Conflict::new(path, local_state, remote_state);
                 conflict.detected_at = row.get(8)?;
                 conflict.notified = row.get(9)?;
-                
+
                 Ok(conflict)
             })
             .optional()?;

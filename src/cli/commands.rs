@@ -8,11 +8,7 @@ use std::path::{Path, PathBuf};
 use tracing::{error, info};
 
 /// Initialize a new sync directory
-pub async fn init(
-    path: PathBuf,
-    _db_url: Option<String>,
-    _db_name: Option<String>,
-) -> Result<()> {
+pub async fn init(path: PathBuf, _db_url: Option<String>, _db_name: Option<String>) -> Result<()> {
     info!("Initializing CouchFS directory: {}", path.display());
 
     // Create directory if it doesn't exist
@@ -82,11 +78,7 @@ target/
 }
 
 /// Run a one-time sync
-pub async fn sync(
-    path: PathBuf,
-    config: AppConfig,
-    dry_run: bool,
-) -> Result<SyncReport> {
+pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<SyncReport> {
     info!("Running sync in: {}", path.display());
 
     // Load ignore patterns
@@ -102,7 +94,8 @@ pub async fn sync(
         config.couchdb.username.as_deref(),
         config.couchdb.password.as_deref(),
         &config.couchdb.database,
-    ).await?;
+    )
+    .await?;
 
     if dry_run {
         println!("Dry run mode - no changes will be made");
@@ -120,11 +113,7 @@ pub async fn sync(
 }
 
 /// Run continuous sync daemon
-pub async fn daemon(
-    path: PathBuf,
-    config: AppConfig,
-    interval: u64,
-) -> Result<()> {
+pub async fn daemon(path: PathBuf, config: AppConfig, interval: u64) -> Result<()> {
     info!("Starting CouchFS daemon in: {}", path.display());
     println!("CouchFS daemon started (interval: {}s)", interval);
     println!("Press Ctrl+C to stop");
@@ -135,7 +124,7 @@ pub async fn daemon(
 
     loop {
         interval.tick().await;
-        
+
         if let Err(e) = sync(path.clone(), config.clone(), false).await {
             error!("Sync error: {}", e);
         }
@@ -158,12 +147,16 @@ pub async fn conflicts(path: PathBuf, json: bool) -> Result<()> {
             println!("Conflicts ({}):", conflicts.len());
             for conflict in conflicts {
                 println!("  • {}", conflict.path);
-                println!("    Local:  {} (modified: {})",
+                println!(
+                    "    Local:  {} (modified: {})",
                     &conflict.local_state.hash[..8.min(conflict.local_state.hash.len())],
-                    conflict.local_state.modified_at.format("%Y-%m-%d %H:%M"));
-                println!("    Remote: {} (modified: {})",
+                    conflict.local_state.modified_at.format("%Y-%m-%d %H:%M")
+                );
+                println!(
+                    "    Remote: {} (modified: {})",
                     &conflict.remote_state.hash[..8.min(conflict.remote_state.hash.len())],
-                    conflict.remote_state.modified_at.format("%Y-%m-%d %H:%M"));
+                    conflict.remote_state.modified_at.format("%Y-%m-%d %H:%M")
+                );
                 println!();
             }
             println!("Resolve with:");
@@ -183,7 +176,10 @@ pub async fn resolve(
     strategy: ResolutionStrategy,
     config: AppConfig,
 ) -> Result<()> {
-    info!("Resolving conflict: {:?} with strategy: {}", conflict_path, strategy);
+    info!(
+        "Resolving conflict: {:?} with strategy: {}",
+        conflict_path, strategy
+    );
 
     let db_path = path.join(".couchfs/state.db");
     let local_db = LocalDb::open(&db_path)?;
@@ -193,14 +189,21 @@ pub async fn resolve(
         config.couchdb.username.as_deref(),
         config.couchdb.password.as_deref(),
         &config.couchdb.database,
-    ).await?;
+    )
+    .await?;
 
     let mut engine = SyncEngine::new(couchdb, local_db, path);
-    
-    let conflict_path_str = conflict_path.to_string_lossy().to_string();
-    engine.resolve_conflict(&conflict_path_str, strategy).await?;
 
-    println!("✓ Resolved conflict: {} (strategy: {})", conflict_path.display(), strategy);
+    let conflict_path_str = conflict_path.to_string_lossy().to_string();
+    engine
+        .resolve_conflict(&conflict_path_str, strategy)
+        .await?;
+
+    println!(
+        "✓ Resolved conflict: {} (strategy: {})",
+        conflict_path.display(),
+        strategy
+    );
 
     Ok(())
 }
@@ -237,7 +240,7 @@ pub async fn status(path: PathBuf, json: bool, _config: &AppConfig) -> Result<()
         println!("Local files:    {}", file_count);
         println!("Tracked files:  {}", file_states.len());
         println!("Pending conflicts: {}", conflicts.len());
-        
+
         if let Some((seq, ts)) = checkpoint {
             println!("Last sync:      {}", ts.format("%Y-%m-%d %H:%M:%S UTC"));
             println!("Last sequence:  {}", seq);
@@ -281,13 +284,13 @@ fn print_sync_report(report: &SyncReport) {
     println!("  Downloaded: {}", report.downloaded);
     println!("  Deleted (local): {}", report.deleted_local);
     println!("  Deleted (remote): {}", report.deleted_remote);
-    
+
     if report.conflicts > 0 {
         println!("  Conflicts: {} ⚠️", report.conflicts);
         println!();
         println!("Run 'couchfs conflicts' to see details");
     }
-    
+
     if !report.errors.is_empty() {
         println!();
         println!("Errors:");

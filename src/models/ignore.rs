@@ -37,18 +37,14 @@ impl IgnoreMatcher {
 
         for line in content.lines() {
             let line = line.trim();
-            
+
             // Skip empty lines and comments
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
 
             let is_negation = line.starts_with('!');
-            let pattern_str = if is_negation {
-                &line[1..]
-            } else {
-                line
-            };
+            let pattern_str = if is_negation { &line[1..] } else { line };
 
             // Skip empty patterns after removing !
             let pattern_str = pattern_str.trim();
@@ -84,7 +80,7 @@ impl IgnoreMatcher {
     /// Convert a gitignore-style pattern to a glob pattern
     fn pattern_to_glob(pattern: &str) -> anyhow::Result<Glob> {
         let mut glob_pattern = String::new();
-        
+
         // Handle patterns starting with **/ (match at any depth)
         let remaining_pattern = if pattern.starts_with("**/") {
             glob_pattern.push_str("**/");
@@ -133,7 +129,7 @@ impl IgnoreMatcher {
     /// Check if a file should be ignored
     pub fn should_ignore(&self, path: &Path) -> bool {
         let path_str = path.to_string_lossy();
-        
+
         // Always ignore .sync-ignore itself and internal files
         if path.file_name() == Some(std::ffi::OsStr::new(".sync-ignore")) {
             return true;

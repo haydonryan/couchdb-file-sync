@@ -150,7 +150,11 @@ async fn main() -> Result<()> {
 
     // Execute command
     match cli.command {
-        Commands::Init { path, db_url, db_name } => {
+        Commands::Init {
+            path,
+            db_url,
+            db_name,
+        } => {
             cli::init(path, db_url, db_name).await?;
         }
         Commands::Sync { path, dry_run } => {
@@ -162,7 +166,11 @@ async fn main() -> Result<()> {
         Commands::Conflicts { path, json } => {
             cli::conflicts(path, json).await?;
         }
-        Commands::Resolve { path, strategy, work_dir } => {
+        Commands::Resolve {
+            path,
+            strategy,
+            work_dir,
+        } => {
             cli::resolve(work_dir, path, strategy, config).await?;
         }
         Commands::Status { path, json } => {
