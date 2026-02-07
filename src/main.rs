@@ -181,15 +181,21 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Initialize logging based on verbosity
+/// Initialize logging based on verbosity or RUST_LOG env var
 fn init_logging(verbose: u8) {
-    let level = match verbose {
-        0 => "info",
-        1 => "debug",
-        _ => "trace",
+    use tracing_subscriber::EnvFilter;
+
+    // Prefer RUST_LOG if set, otherwise use verbosity flag
+    let filter = if std::env::var("RUST_LOG").is_ok() {
+        EnvFilter::from_default_env()
+    } else {
+        let level = match verbose {
+            0 => "info",
+            1 => "debug",
+            _ => "trace",
+        };
+        EnvFilter::new(format!("couchfs={}", level))
     };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(format!("couchfs={}", level))
-        .init();
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 }
