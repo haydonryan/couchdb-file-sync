@@ -43,6 +43,12 @@ impl SyncEngine {
         // 1. Scan local changes
         let local_changes = self.scan_local_changes().await?;
         info!("Detected {} local changes", local_changes.len());
+        for change in &local_changes {
+            debug!(
+                "Local change: {} ({:?})",
+                change.path, change.change_type
+            );
+        }
 
         // 2. Get remote changes
         let (remote_changes, last_seq) = self.fetch_remote_changes().await?;
@@ -208,10 +214,14 @@ impl SyncEngine {
 
     /// Get local file state
     async fn get_local_state(&self, path: &str) -> Result<FileState> {
-        let file_path = self.root_dir.join(path);
-        let hash = compute_file_hash(&file_path)?;
-        let metadata = std::fs::metadata(&file_path)?;
-        
+        // Strip leading / to prevent absolute path issues
+        let relative_path = path.trim_start_matches('/');
+        let file_path = self.root_dir.join(relative_path);
+        let hash = compute_file_hash(&file_path)
+            .map_err(|e| anyhow::anyhow!("Failed to compute hash for {}: {}", file_path.display(), e))?;
+        let metadata = std::fs::metadata(&file_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read metadata for {}: {}", file_path.display(), e))?;
+
         Ok(FileState::new(
             path.to_string(),
             hash,
@@ -222,10 +232,14 @@ impl SyncEngine {
 
     /// Apply a change to CouchDB
     async fn apply_to_couchdb(&mut self, change: &Change) -> Result<()> {
+        debug!("Applying local change to CouchDB: {} ({:?})", change.path, change.change_type);
         match change.change_type {
             ChangeType::Created | ChangeType::Modified => {
-                let file_path = self.root_dir.join(&change.path);
-                let metadata = std::fs::metadata(&file_path)?;
+                // Strip leading / to prevent absolute path issues
+                let relative_path = change.path.trim_start_matches('/');
+                let file_path = self.root_dir.join(relative_path);
+                let metadata = std::fs::metadata(&file_path)
+                    .map_err(|e| anyhow::anyhow!("Failed to read metadata for {}: {}", file_path.display(), e))?;
                 let mtime = metadata
                     .modified()?
                     .duration_since(std::time::UNIX_EPOCH)
@@ -266,7 +280,9 @@ impl SyncEngine {
 
     /// Apply a change to the local filesystem
     async fn apply_to_filesystem(&mut self, change: &Change) -> Result<()> {
-        let file_path = self.root_dir.join(&change.path);
+        // Strip leading / to prevent absolute path issues
+        let relative_path = change.path.trim_start_matches('/');
+        let file_path = self.root_dir.join(relative_path);
         
         match change.change_type {
             ChangeType::Created | ChangeType::Modified => {
