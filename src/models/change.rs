@@ -60,27 +60,69 @@ impl Change {
     }
 
     pub fn local_created(path: String, hash: String, size: u64) -> Self {
-        Self::new(path, ChangeType::Created, ChangeSource::Local, Some(hash), Some(size), None)
+        Self::new(
+            path,
+            ChangeType::Created,
+            ChangeSource::Local,
+            Some(hash),
+            Some(size),
+            None,
+        )
     }
 
     pub fn local_modified(path: String, hash: String, size: u64) -> Self {
-        Self::new(path, ChangeType::Modified, ChangeSource::Local, Some(hash), Some(size), None)
+        Self::new(
+            path,
+            ChangeType::Modified,
+            ChangeSource::Local,
+            Some(hash),
+            Some(size),
+            None,
+        )
     }
 
     pub fn local_deleted(path: String) -> Self {
-        Self::new(path, ChangeType::Deleted, ChangeSource::Local, None, None, None)
+        Self::new(
+            path,
+            ChangeType::Deleted,
+            ChangeSource::Local,
+            None,
+            None,
+            None,
+        )
     }
 
     pub fn remote_created(path: String, hash: String, size: u64, mtime: DateTime<Utc>) -> Self {
-        Self::new(path, ChangeType::Created, ChangeSource::Remote, Some(hash), Some(size), Some(mtime))
+        Self::new(
+            path,
+            ChangeType::Created,
+            ChangeSource::Remote,
+            Some(hash),
+            Some(size),
+            Some(mtime),
+        )
     }
 
     pub fn remote_modified(path: String, hash: String, size: u64, mtime: DateTime<Utc>) -> Self {
-        Self::new(path, ChangeType::Modified, ChangeSource::Remote, Some(hash), Some(size), Some(mtime))
+        Self::new(
+            path,
+            ChangeType::Modified,
+            ChangeSource::Remote,
+            Some(hash),
+            Some(size),
+            Some(mtime),
+        )
     }
 
     pub fn remote_deleted(path: String) -> Self {
-        Self::new(path, ChangeType::Deleted, ChangeSource::Remote, None, None, None)
+        Self::new(
+            path,
+            ChangeType::Deleted,
+            ChangeSource::Remote,
+            None,
+            None,
+            None,
+        )
     }
 }
 
@@ -92,7 +134,9 @@ pub struct ChangeBatch {
 
 impl ChangeBatch {
     pub fn new() -> Self {
-        Self { changes: Vec::new() }
+        Self {
+            changes: Vec::new(),
+        }
     }
 
     pub fn push(&mut self, change: Change) {

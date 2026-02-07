@@ -44,10 +44,7 @@ impl SyncEngine {
         let local_changes = self.scan_local_changes().await?;
         info!("Detected {} local changes", local_changes.len());
         for change in &local_changes {
-            debug!(
-                "Local change: {} ({:?})",
-                change.path, change.change_type
-            );
+            debug!("Local change: {} ({:?})", change.path, change.change_type);
         }
 
         // 2. Get remote changes
@@ -55,9 +52,10 @@ impl SyncEngine {
         info!("Detected {} remote changes", remote_changes.len());
 
         // 3. Detect conflicts
-        let (clean_local, clean_remote, conflicts) = 
-            self.detect_conflicts(&local_changes, &remote_changes).await?;
-        
+        let (clean_local, clean_remote, conflicts) = self
+            .detect_conflicts(&local_changes, &remote_changes)
+            .await?;
+
         report.conflicts = conflicts.len();
 
         // 4. Store conflicts
@@ -84,7 +82,10 @@ impl SyncEngine {
                                 change.path.clone(),
                                 hash,
                                 metadata.len(),
-                                metadata.modified().unwrap_or(std::time::SystemTime::now()).into(),
+                                metadata
+                                    .modified()
+                                    .unwrap_or(std::time::SystemTime::now())
+                                    .into(),
                             );
                             self.local_db.save_file_state(&state)?;
                         }
@@ -109,7 +110,9 @@ impl SyncEngine {
                 }
                 Err(e) => {
                     error!("Failed to download {}: {}", change.path, e);
-                    report.errors.push(format!("Download {}: {}", change.path, e));
+                    report
+                        .errors
+                        .push(format!("Download {}: {}", change.path, e));
                 }
             }
         }
@@ -161,7 +164,7 @@ impl SyncEngine {
     async fn fetch_remote_changes(&self) -> Result<(Vec<Change>, String)> {
         let checkpoint = self.local_db.get_checkpoint()?;
         let since = checkpoint.map(|(seq, _)| seq);
-        
+
         self.couchdb.get_changes(since.as_deref()).await
     }
 
@@ -173,7 +176,7 @@ impl SyncEngine {
     ) -> Result<(Vec<Change>, Vec<Change>, Vec<Conflict>)> {
         let local_map: HashMap<_, _> = local_changes.iter().map(|c| (&c.path, c)).collect();
         let remote_map: HashMap<_, _> = remote_changes.iter().map(|c| (&c.path, c)).collect();
-        
+
         let mut clean_local = Vec::new();
         let mut clean_remote = Vec::new();
         let mut conflicts = Vec::new();
@@ -199,7 +202,11 @@ impl SyncEngine {
                 let local_state = self.get_local_state(&local_change.path).await?;
 
                 // Get remote content and compute hash
-                let remote_content = self.couchdb.get_file_content(&local_change.path).await.unwrap_or_default();
+                let remote_content = self
+                    .couchdb
+                    .get_file_content(&local_change.path)
+                    .await
+                    .unwrap_or_default();
                 let remote_hash = crate::local::compute_bytes_hash(&remote_content);
 
                 if local_state.hash == remote_hash {
@@ -208,10 +215,11 @@ impl SyncEngine {
                     self.local_db.save_file_state(&local_state)?;
                 } else {
                     // Different content - real conflict
-                    let remote_state = match self.couchdb.get_remote_state(&local_change.path).await? {
-                        Some(state) => state,
-                        None => continue,
-                    };
+                    let remote_state =
+                        match self.couchdb.get_remote_state(&local_change.path).await? {
+                            Some(state) => state,
+                            None => continue,
+                        };
 
                     info!("Conflict detected: {} (both local and remote changed with different content)", local_change.path);
                     conflicts.push(Conflict::new(
@@ -240,7 +248,10 @@ impl SyncEngine {
                     Some(local_state) => {
                         if !file_exists {
                             // File was deleted locally, re-download it
-                            debug!("File {} was deleted locally, will re-download", remote_change.path);
+                            debug!(
+                                "File {} was deleted locally, will re-download",
+                                remote_change.path
+                            );
                             true
                         } else {
                             // Only download if remote mtime is newer than our last sync
@@ -253,7 +264,10 @@ impl SyncEngine {
                     None => {
                         // No local state - check if file exists on disk
                         if file_exists {
-                            debug!("File {} exists but not tracked, skipping (add to local state)", remote_change.path);
+                            debug!(
+                                "File {} exists but not tracked, skipping (add to local state)",
+                                remote_change.path
+                            );
                             false // File exists but not tracked, don't overwrite
                         } else {
                             debug!("New remote file: {}", remote_change.path);
@@ -278,10 +292,12 @@ impl SyncEngine {
         // Strip leading / to prevent absolute path issues
         let relative_path = path.trim_start_matches('/');
         let file_path = self.root_dir.join(relative_path);
-        let hash = compute_file_hash(&file_path)
-            .map_err(|e| anyhow::anyhow!("Failed to compute hash for {}: {}", file_path.display(), e))?;
-        let metadata = std::fs::metadata(&file_path)
-            .map_err(|e| anyhow::anyhow!("Failed to read metadata for {}: {}", file_path.display(), e))?;
+        let hash = compute_file_hash(&file_path).map_err(|e| {
+            anyhow::anyhow!("Failed to compute hash for {}: {}", file_path.display(), e)
+        })?;
+        let metadata = std::fs::metadata(&file_path).map_err(|e| {
+            anyhow::anyhow!("Failed to read metadata for {}: {}", file_path.display(), e)
+        })?;
 
         Ok(FileState::new(
             path.to_string(),
@@ -293,14 +309,18 @@ impl SyncEngine {
 
     /// Apply a change to CouchDB
     async fn apply_to_couchdb(&mut self, change: &Change) -> Result<()> {
-        debug!("Applying local change to CouchDB: {} ({:?})", change.path, change.change_type);
+        debug!(
+            "Applying local change to CouchDB: {} ({:?})",
+            change.path, change.change_type
+        );
         match change.change_type {
             ChangeType::Created | ChangeType::Modified => {
                 // Strip leading / to prevent absolute path issues
                 let relative_path = change.path.trim_start_matches('/');
                 let file_path = self.root_dir.join(relative_path);
-                let metadata = std::fs::metadata(&file_path)
-                    .map_err(|e| anyhow::anyhow!("Failed to read metadata for {}: {}", file_path.display(), e))?;
+                let metadata = std::fs::metadata(&file_path).map_err(|e| {
+                    anyhow::anyhow!("Failed to read metadata for {}: {}", file_path.display(), e)
+                })?;
                 let mtime = metadata
                     .modified()?
                     .duration_since(std::time::UNIX_EPOCH)
@@ -308,15 +328,17 @@ impl SyncEngine {
                     .as_millis() as u64;
 
                 // Read file content and upload as chunks
-                let content = tokio::fs::read(&file_path).await
-                    .map_err(|e| anyhow::anyhow!("Failed to read file {}: {}", file_path.display(), e))?;
+                let content = tokio::fs::read(&file_path).await.map_err(|e| {
+                    anyhow::anyhow!("Failed to read file {}: {}", file_path.display(), e)
+                })?;
                 let new_chunk_ids = self.couchdb.upload_file_content(&content).await?;
 
                 // Get existing document to preserve ctime and delete old chunks
-                let (existing_rev, existing_ctime, old_chunk_ids) = match self.couchdb.get_file(&change.path).await? {
-                    Some(existing) => (existing.rev, existing.ctime, existing.children),
-                    None => (None, mtime, Vec::new()),
-                };
+                let (existing_rev, existing_ctime, old_chunk_ids) =
+                    match self.couchdb.get_file(&change.path).await? {
+                        Some(existing) => (existing.rev, existing.ctime, existing.children),
+                        None => (None, mtime, Vec::new()),
+                    };
 
                 // Create FileDoc with new chunk IDs
                 let mut doc = crate::models::FileDoc {
@@ -338,7 +360,11 @@ impl SyncEngine {
                     self.couchdb.delete_chunks(&old_chunk_ids).await?;
                 }
 
-                info!("Uploaded to CouchDB: {} ({} bytes)", change.path, content.len());
+                info!(
+                    "Uploaded to CouchDB: {} ({} bytes)",
+                    change.path,
+                    content.len()
+                );
             }
             ChangeType::Deleted => {
                 self.couchdb.delete_file(&change.path).await?;
@@ -354,7 +380,7 @@ impl SyncEngine {
         // Strip leading / to prevent absolute path issues
         let relative_path = change.path.trim_start_matches('/');
         let file_path = self.root_dir.join(relative_path);
-        
+
         match change.change_type {
             ChangeType::Created | ChangeType::Modified => {
                 // Get the document from CouchDB
@@ -382,7 +408,7 @@ impl SyncEngine {
                 };
 
                 tokio::fs::write(&file_path, &content).await?;
-                
+
                 // Update local state
                 let hash = compute_file_hash(&file_path)?;
                 let metadata = std::fs::metadata(&file_path)?;
@@ -395,7 +421,7 @@ impl SyncEngine {
                     last_sync_at: Utc::now(),
                 };
                 self.local_db.save_file_state(&state)?;
-                
+
                 info!("Downloaded from CouchDB: {}", change.path);
             }
             ChangeType::Deleted => {
@@ -474,9 +500,13 @@ impl SyncEngine {
                 }
 
                 // Download file content from CouchDB attachment
-                let content = self.couchdb.get_file_content(path).await.unwrap_or_default();
+                let content = self
+                    .couchdb
+                    .get_file_content(path)
+                    .await
+                    .unwrap_or_default();
                 tokio::fs::write(&file_path, &content).await?;
-                
+
                 // Update local state
                 let hash = compute_file_hash(&file_path)?;
                 let metadata = std::fs::metadata(&file_path)?;
@@ -489,7 +519,7 @@ impl SyncEngine {
                     last_sync_at: Utc::now(),
                 };
                 self.local_db.save_file_state(&state)?;
-                
+
                 info!("Resolved conflict (keep-remote): {}", path);
             }
             ResolutionStrategy::KeepBoth => {
@@ -506,13 +536,17 @@ impl SyncEngine {
                 }
 
                 // Download file content from CouchDB attachment
-                let content = self.couchdb.get_file_content(path).await.unwrap_or_default();
+                let content = self
+                    .couchdb
+                    .get_file_content(path)
+                    .await
+                    .unwrap_or_default();
                 tokio::fs::write(&file_path, &content).await?;
                 info!("Saved remote version as: {}", remote_path);
-                
+
                 // Local file stays as-is
                 // User can manually merge/compare
-                
+
                 // Update local state for remote file
                 let hash = compute_file_hash(&file_path)?;
                 let metadata = std::fs::metadata(&file_path)?;
@@ -534,7 +568,7 @@ impl SyncEngine {
 
         // Remove conflict record
         self.local_db.delete_conflict(path)?;
-        
+
         Ok(())
     }
 }

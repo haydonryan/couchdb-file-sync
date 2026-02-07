@@ -1,6 +1,6 @@
+use crate::models::file::{FileState, RemoteState};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use crate::models::file::{FileState, RemoteState};
 
 /// Conflict resolution strategies
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

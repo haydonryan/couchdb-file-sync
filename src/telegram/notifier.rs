@@ -68,10 +68,7 @@ impl TelegramNotifier {
 
     /// Send generic message
     async fn send_message(&self, text: &str) -> Result<()> {
-        let url = format!(
-            "https://api.telegram.org/bot{}/sendMessage",
-            self.bot_token
-        );
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
 
         let params = serde_json::json!({
             "chat_id": self.chat_id,
@@ -80,11 +77,7 @@ impl TelegramNotifier {
             "disable_notification": false,
         });
 
-        let response = self.client
-            .post(&url)
-            .json(&params)
-            .send()
-            .await?;
+        let response = self.client.post(&url).json(&params).send().await?;
 
         if !response.status().is_success() {
             let error_text = response.text().await?;
@@ -96,10 +89,7 @@ impl TelegramNotifier {
 
     /// Test the connection
     pub async fn test(&self) -> Result<bool> {
-        let url = format!(
-            "https://api.telegram.org/bot{}/getMe",
-            self.bot_token
-        );
+        let url = format!("https://api.telegram.org/bot{}/getMe", self.bot_token);
 
         match self.client.get(&url).send().await {
             Ok(response) => Ok(response.status().is_success()),

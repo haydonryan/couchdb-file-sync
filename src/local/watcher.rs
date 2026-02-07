@@ -1,8 +1,9 @@
 use crate::models::{Change, IgnoreMatcher};
 use anyhow::Result;
 use notify_debouncer_full::{
-    new_debouncer, DebounceEventResult, DebouncedEvent,
-    notify::{EventKind, RecursiveMode}
+    new_debouncer,
+    notify::{EventKind, RecursiveMode},
+    DebounceEventResult, DebouncedEvent,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,11 +30,7 @@ pub enum WatcherEvent {
 
 impl FileWatcher {
     /// Create a new file watcher
-    pub fn new(
-        root_dir: PathBuf,
-        ignore_matcher: IgnoreMatcher,
-        debounce_ms: u64,
-    ) -> Result<Self> {
+    pub fn new(root_dir: PathBuf, ignore_matcher: IgnoreMatcher, debounce_ms: u64) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::channel(100);
         let ignore_matcher = Arc::new(ignore_matcher);
         let root = root_dir.clone();
@@ -41,17 +38,15 @@ impl FileWatcher {
         let mut debouncer = new_debouncer(
             Duration::from_millis(debounce_ms),
             None,
-            move |result: DebounceEventResult| {
-                match result {
-                    Ok(events) => {
-                        for event in events {
-                            let _ = process_event(event, &event_tx, &ignore_matcher, &root);
-                        }
+            move |result: DebounceEventResult| match result {
+                Ok(events) => {
+                    for event in events {
+                        let _ = process_event(event, &event_tx, &ignore_matcher, &root);
                     }
-                    Err(errors) => {
-                        for error in errors {
-                            error!("Watcher error: {:?}", error);
-                        }
+                }
+                Err(errors) => {
+                    for error in errors {
+                        error!("Watcher error: {:?}", error);
                     }
                 }
             },
@@ -98,7 +93,9 @@ impl FileWatcher {
             }
             WatcherEvent::FileDeleted(path) => {
                 let relative = self.relative_path(&path)?;
-                Some(Change::local_deleted(relative.to_string_lossy().to_string()))
+                Some(Change::local_deleted(
+                    relative.to_string_lossy().to_string(),
+                ))
             }
             WatcherEvent::FileRenamed(_from, to) => {
                 let to_relative = self.relative_path(&to)?;
@@ -113,7 +110,9 @@ impl FileWatcher {
 
     /// Get path relative to root
     fn relative_path(&self, path: &Path) -> Option<PathBuf> {
-        path.strip_prefix(&self.root_dir).ok().map(|p| p.to_path_buf())
+        path.strip_prefix(&self.root_dir)
+            .ok()
+            .map(|p| p.to_path_buf())
     }
 }
 

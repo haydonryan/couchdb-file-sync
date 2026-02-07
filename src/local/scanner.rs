@@ -75,11 +75,9 @@ impl Scanner {
 
         // Compute hash
         let hash = compute_file_hash(path)?;
-        
+
         // Get modification time
-        let modified_at = metadata
-            .modified()?
-            .into();
+        let modified_at = metadata.modified()?.into();
 
         Ok(FileState {
             path: path_str,
@@ -98,21 +96,20 @@ impl Scanner {
         stored_states: &[FileState],
     ) -> Vec<Change> {
         let mut changes = Vec::new();
-        let stored_map: std::collections::HashMap<_, _> = stored_states
-            .iter()
-            .map(|s| (&s.path, s))
-            .collect();
-        let current_map: std::collections::HashMap<_, _> = current_states
-            .iter()
-            .map(|s| (&s.path, s))
-            .collect();
+        let stored_map: std::collections::HashMap<_, _> =
+            stored_states.iter().map(|s| (&s.path, s)).collect();
+        let current_map: std::collections::HashMap<_, _> =
+            current_states.iter().map(|s| (&s.path, s)).collect();
 
         // Detect created and modified files
         for state in current_states {
             match stored_map.get(&state.path) {
                 None => {
                     // New file
-                    info!("New local file detected: {} (size: {} bytes)", state.path, state.size);
+                    info!(
+                        "New local file detected: {} (size: {} bytes)",
+                        state.path, state.size
+                    );
                     changes.push(Change::local_created(
                         state.path.clone(),
                         state.hash.clone(),
@@ -122,7 +119,10 @@ impl Scanner {
                 Some(stored) => {
                     // Check if modified
                     if state.hash != stored.hash {
-                        info!("Modified local file detected: {} (hash changed)", state.path);
+                        info!(
+                            "Modified local file detected: {} (hash changed)",
+                            state.path
+                        );
                         changes.push(Change::local_modified(
                             state.path.clone(),
                             state.hash.clone(),
@@ -188,7 +188,7 @@ mod tests {
     fn test_compute_file_hash() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test.txt");
-        
+
         let mut file = std::fs::File::create(&file_path).unwrap();
         file.write_all(b"hello world").unwrap();
         drop(file);
@@ -204,7 +204,7 @@ mod tests {
     fn test_hash_changes_with_content() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test.txt");
-        
+
         // First content
         std::fs::write(&file_path, "content1").unwrap();
         let hash1 = compute_file_hash(&file_path).unwrap();
