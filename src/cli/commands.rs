@@ -24,8 +24,8 @@ pub async fn init(
     let couchfs_dir = path.join(".couchfs");
     std::fs::create_dir_all(&couchfs_dir)?;
 
-    // Create couchfs.yaml.example
-    let config_example = path.join("couchfs.yaml.example");
+    // Create couchfs.yaml.example in .couchfs directory
+    let config_example = couchfs_dir.join("couchfs.yaml.example");
     std::fs::write(&config_example, include_str!("../../couchfs.yaml.example"))?;
 
     // Create .sync-ignore if it doesn't exist
@@ -74,8 +74,8 @@ target/
     println!("  Ignore file: {}", sync_ignore.display());
     println!();
     println!("Next steps:");
-    println!("  1. Copy couchfs.yaml.example to couchfs.yaml");
-    println!("  2. Edit couchfs.yaml with your CouchDB credentials");
+    println!("  1. Copy .couchfs/couchfs.yaml.example to .couchfs/couchfs.yaml");
+    println!("  2. Edit .couchfs/couchfs.yaml with your CouchDB credentials");
     println!("  3. Run: couchfs sync {}", path.display());
 
     Ok(())
