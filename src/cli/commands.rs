@@ -3,9 +3,10 @@ use crate::couchdb::CouchDb;
 use crate::local::LocalDb;
 use crate::models::{IgnoreMatcher, ResolutionStrategy};
 use crate::sync::{SyncEngine, SyncReport};
+use crate::telegram::TelegramNotifier;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Initialize a new sync directory
 pub async fn init(path: PathBuf, _db_url: Option<String>, _db_name: Option<String>) -> Result<()> {
@@ -105,12 +106,69 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
     }
 
     // Run sync
-    let mut engine = SyncEngine::new(couchdb, local_db, path);
+    let mut engine = SyncEngine::new(couchdb, local_db, path.clone());
     let report = engine.sync().await?;
 
     print_sync_report(&report);
 
+    // Send Telegram notifications for conflicts
+    if report.conflicts > 0 {
+        notify_conflicts_telegram(&config, &db_path, &path).await;
+    }
+
     Ok(report)
+}
+
+/// Send Telegram notifications for any unnotified conflicts
+async fn notify_conflicts_telegram(config: &AppConfig, db_path: &Path, sync_dir: &Path) {
+    // Check if Telegram is configured
+    let (bot_token, chat_id) = match (
+        &config.notifications.telegram.bot_token,
+        &config.notifications.telegram.chat_id,
+    ) {
+        (Some(token), Some(id)) if !token.is_empty() && !id.is_empty() => {
+            (token.clone(), id.clone())
+        }
+        _ => {
+            info!("Telegram not configured, skipping conflict notifications");
+            return;
+        }
+    };
+
+    // Re-open database to get conflicts
+    let local_db = match LocalDb::open(db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("Failed to open database for notifications: {}", e);
+            return;
+        }
+    };
+
+    let notifier = TelegramNotifier::new(bot_token, chat_id);
+    let sync_dir_str = sync_dir.display().to_string();
+
+    // Get unnotified conflicts
+    let conflicts = match local_db.get_conflicts() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Failed to get conflicts for notification: {}", e);
+            return;
+        }
+    };
+
+    for conflict in conflicts.iter().filter(|c| !c.notified) {
+        match notifier.notify_conflict(conflict, &sync_dir_str).await {
+            Ok(_) => {
+                info!("Sent Telegram notification for conflict: {}", conflict.path);
+                if let Err(e) = local_db.mark_conflict_notified(&conflict.path) {
+                    warn!("Failed to mark conflict as notified: {}", e);
+                }
+            }
+            Err(e) => {
+                warn!("Failed to send Telegram notification: {}", e);
+            }
+        }
+    }
 }
 
 /// Run continuous sync daemon
