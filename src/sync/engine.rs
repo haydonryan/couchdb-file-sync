@@ -630,9 +630,8 @@ impl SyncEngine {
 
         match strategy {
             ResolutionStrategy::KeepLocal => {
-                // Force upload local version
+                // Force upload local version to remote
                 let file_path = self.root_dir.join(local_path);
-                let _hash = compute_file_hash(&file_path)?;
                 let metadata = std::fs::metadata(&file_path)?;
                 let mtime = metadata
                     .modified()?
@@ -640,27 +639,49 @@ impl SyncEngine {
                     .unwrap_or_default()
                     .as_millis() as u64;
 
+                // Read local file content and upload as chunks
+                let content = tokio::fs::read(&file_path).await?;
+                let new_chunk_ids = self.couchdb.upload_file_content(&content).await?;
+
+                // Get existing revision and old chunks
+                let (existing_rev, existing_ctime, old_chunk_ids) =
+                    match self.couchdb.get_file(&remote_path).await? {
+                        Some(existing) => (existing.rev, existing.ctime, existing.children),
+                        None => (None, mtime, Vec::new()),
+                    };
+
                 let mut doc = crate::models::FileDoc {
                     id: remote_path.clone(),
-                    rev: None,
-                    children: Vec::new(),
+                    rev: existing_rev,
+                    children: new_chunk_ids,
                     path: remote_path.clone(),
-                    ctime: mtime,
+                    ctime: existing_ctime,
                     mtime,
                     size: metadata.len(),
                     doc_type: "plain".to_string(),
                     deleted: false,
                 };
 
-                // Get existing revision if available
-                if let Some(existing) = self.couchdb.get_file(&remote_path).await? {
-                    doc.rev = existing.rev;
-                    doc.children = existing.children;
-                    doc.ctime = existing.ctime;
+                self.couchdb.save_file(&mut doc).await?;
+
+                // Delete old chunks
+                if !old_chunk_ids.is_empty() {
+                    self.couchdb.delete_chunks(&old_chunk_ids).await?;
                 }
 
-                self.couchdb.save_file(&mut doc).await?;
-                info!("Resolved conflict (keep-local): {}", local_path);
+                // Update local state with new revision
+                let hash = compute_file_hash(&file_path)?;
+                let state = FileState {
+                    path: local_path.to_string(),
+                    hash,
+                    size: metadata.len(),
+                    modified_at: metadata.modified()?.into(),
+                    couch_rev: doc.rev.clone(),
+                    last_sync_at: Utc::now(),
+                };
+                self.local_db.save_file_state(&state)?;
+
+                info!("Resolved conflict (keep-local): {} - uploaded to remote", local_path);
             }
             ResolutionStrategy::KeepRemote => {
                 // Force download remote version
