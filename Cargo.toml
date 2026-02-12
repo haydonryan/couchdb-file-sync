@@ -26,6 +26,10 @@ serde_yaml = "0.9"
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
+dialoguer = "0.11"
+
+# Diff
+similar = "2.6"
 
 # Configuration
 config = "0.15"

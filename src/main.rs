@@ -5,7 +5,6 @@ use tracing::info;
 
 use couchfs::cli;
 use couchfs::config::AppConfig;
-use couchfs::models::ResolutionStrategy;
 
 #[derive(Parser, Debug)]
 #[command(name = "couchfs")]
@@ -90,18 +89,11 @@ enum Commands {
         json: bool,
     },
 
-    /// Resolve a conflict
+    /// Resolve conflicts interactively
     Resolve {
-        /// Path to the conflicted file
-        path: PathBuf,
-
-        /// Resolution strategy
-        #[arg(short, long)]
-        strategy: ResolutionStrategy,
-
         /// Working directory (default: current directory)
         #[arg(default_value = ".")]
-        work_dir: PathBuf,
+        path: PathBuf,
     },
 
     /// Show sync status
@@ -166,12 +158,8 @@ async fn main() -> Result<()> {
         Commands::Conflicts { path, json } => {
             cli::conflicts(path, json).await?;
         }
-        Commands::Resolve {
-            path,
-            strategy,
-            work_dir,
-        } => {
-            cli::resolve(work_dir, path, strategy, config).await?;
+        Commands::Resolve { path } => {
+            cli::resolve(path, config).await?;
         }
         Commands::Status { path, json } => {
             cli::status(path, json, &config).await?;

@@ -599,23 +599,39 @@ impl SyncEngine {
         self.local_db.get_conflicts()
     }
 
+    /// Get remote file content (converts local path to remote path)
+    pub async fn get_remote_content(&self, local_path: &str) -> Result<Vec<u8>> {
+        let remote_path = self.couchdb.get_remote_path(local_path);
+        self.couchdb.get_file_content(&remote_path).await
+    }
+
+    /// Get the root directory
+    pub fn root_dir(&self) -> &PathBuf {
+        &self.root_dir
+    }
+
     /// Resolve a conflict
+    /// Note: `local_path` is the local file path (stored in conflict), which gets
+    /// converted to remote path when interacting with CouchDB
     pub async fn resolve_conflict(
         &mut self,
-        path: &str,
+        local_path: &str,
         strategy: ResolutionStrategy,
     ) -> Result<()> {
-        let _conflict = match self.local_db.get_conflict(path)? {
+        let _conflict = match self.local_db.get_conflict(local_path)? {
             Some(c) => c,
             None => {
-                anyhow::bail!("No conflict found for path: {}", path);
+                anyhow::bail!("No conflict found for path: {}", local_path);
             }
         };
+
+        // Convert local path to remote path for CouchDB operations
+        let remote_path = self.couchdb.get_remote_path(local_path);
 
         match strategy {
             ResolutionStrategy::KeepLocal => {
                 // Force upload local version
-                let file_path = self.root_dir.join(path);
+                let file_path = self.root_dir.join(local_path);
                 let _hash = compute_file_hash(&file_path)?;
                 let metadata = std::fs::metadata(&file_path)?;
                 let mtime = metadata
@@ -625,10 +641,10 @@ impl SyncEngine {
                     .as_millis() as u64;
 
                 let mut doc = crate::models::FileDoc {
-                    id: path.to_string(),
+                    id: remote_path.clone(),
                     rev: None,
                     children: Vec::new(),
-                    path: path.to_string(),
+                    path: remote_path.clone(),
                     ctime: mtime,
                     mtime,
                     size: metadata.len(),
@@ -637,31 +653,31 @@ impl SyncEngine {
                 };
 
                 // Get existing revision if available
-                if let Some(existing) = self.couchdb.get_file(path).await? {
+                if let Some(existing) = self.couchdb.get_file(&remote_path).await? {
                     doc.rev = existing.rev;
                     doc.children = existing.children;
                     doc.ctime = existing.ctime;
                 }
 
                 self.couchdb.save_file(&mut doc).await?;
-                info!("Resolved conflict (keep-local): {}", path);
+                info!("Resolved conflict (keep-local): {}", local_path);
             }
             ResolutionStrategy::KeepRemote => {
                 // Force download remote version
-                let doc = match self.couchdb.get_file(path).await? {
+                let doc = match self.couchdb.get_file(&remote_path).await? {
                     Some(d) => d,
-                    None => anyhow::bail!("Document not found: {}", path),
+                    None => anyhow::bail!("Document not found: {}", remote_path),
                 };
 
-                let file_path = self.root_dir.join(path);
+                let file_path = self.root_dir.join(local_path);
                 if let Some(parent) = file_path.parent() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
 
-                // Download file content from CouchDB attachment
+                // Download file content from CouchDB
                 let content = self
                     .couchdb
-                    .get_file_content(path)
+                    .get_file_content(&remote_path)
                     .await
                     .unwrap_or_default();
                 tokio::fs::write(&file_path, &content).await?;
@@ -670,7 +686,7 @@ impl SyncEngine {
                 let hash = compute_file_hash(&file_path)?;
                 let metadata = std::fs::metadata(&file_path)?;
                 let state = FileState {
-                    path: path.to_string(),
+                    path: local_path.to_string(),
                     hash,
                     size: metadata.len(),
                     modified_at: metadata.modified()?.into(),
@@ -679,29 +695,29 @@ impl SyncEngine {
                 };
                 self.local_db.save_file_state(&state)?;
 
-                info!("Resolved conflict (keep-remote): {}", path);
+                info!("Resolved conflict (keep-remote): {}", local_path);
             }
             ResolutionStrategy::KeepBoth => {
                 // Save remote as .remote file
-                let doc = match self.couchdb.get_file(path).await? {
+                let doc = match self.couchdb.get_file(&remote_path).await? {
                     Some(d) => d,
-                    None => anyhow::bail!("Document not found: {}", path),
+                    None => anyhow::bail!("Document not found: {}", remote_path),
                 };
 
-                let remote_path = format!("{}.remote", path);
-                let file_path = self.root_dir.join(&remote_path);
+                let local_remote_path = format!("{}.remote", local_path);
+                let file_path = self.root_dir.join(&local_remote_path);
                 if let Some(parent) = file_path.parent() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
 
-                // Download file content from CouchDB attachment
+                // Download file content from CouchDB
                 let content = self
                     .couchdb
-                    .get_file_content(path)
+                    .get_file_content(&remote_path)
                     .await
                     .unwrap_or_default();
                 tokio::fs::write(&file_path, &content).await?;
-                info!("Saved remote version as: {}", remote_path);
+                info!("Saved remote version as: {}", local_remote_path);
 
                 // Local file stays as-is
                 // User can manually merge/compare
@@ -710,7 +726,7 @@ impl SyncEngine {
                 let hash = compute_file_hash(&file_path)?;
                 let metadata = std::fs::metadata(&file_path)?;
                 let state = FileState {
-                    path: remote_path,
+                    path: local_remote_path,
                     hash,
                     size: metadata.len(),
                     modified_at: metadata.modified()?.into(),
@@ -726,7 +742,7 @@ impl SyncEngine {
         }
 
         // Remove conflict record
-        self.local_db.delete_conflict(path)?;
+        self.local_db.delete_conflict(local_path)?;
 
         Ok(())
     }
