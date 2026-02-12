@@ -138,6 +138,17 @@ impl IgnoreMatcher {
             return true;
         }
 
+        // Ignore any file or directory that starts with '.'
+        for component in path.components() {
+            if let std::path::Component::Normal(name) = component {
+                if let Some(name_str) = name.to_str() {
+                    if name_str.starts_with('.') {
+                        return true;
+                    }
+                }
+            }
+        }
+
         self.is_ignored(&path_str, path.is_dir())
     }
 
@@ -178,5 +189,17 @@ mod tests {
         let matcher = IgnoreMatcher::from_content("# This is a comment\n\n*.tmp");
         assert!(matcher.is_ignored("file.tmp", false));
         assert!(!matcher.is_ignored("# This is a comment", false));
+    }
+
+    #[test]
+    fn test_dotfiles_ignored() {
+        let matcher = IgnoreMatcher::empty();
+        assert!(matcher.should_ignore(Path::new(".hidden")));
+        assert!(matcher.should_ignore(Path::new(".couchfs2")));
+        assert!(matcher.should_ignore(Path::new(".git")));
+        assert!(matcher.should_ignore(Path::new("folder/.hidden")));
+        assert!(matcher.should_ignore(Path::new(".dotdir/file.txt")));
+        assert!(!matcher.should_ignore(Path::new("visible")));
+        assert!(!matcher.should_ignore(Path::new("folder/visible.txt")));
     }
 }
