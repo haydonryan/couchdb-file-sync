@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use tracing::info;
 
 use couchfs::cli;
-use couchfs::config::AppConfig;
+use couchfs::config::{AppConfig, SyncPath};
 
 #[derive(Parser, Debug)]
 #[command(name = "couchfs")]
@@ -58,9 +58,8 @@ enum Commands {
 
     /// Run a one-time sync
     Sync {
-        /// Directory to sync (default: current directory)
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Directory to sync (uses paths from config if not specified)
+        path: Option<PathBuf>,
 
         /// Dry run (don't make changes)
         #[arg(long)]
@@ -69,9 +68,8 @@ enum Commands {
 
     /// Run continuous sync daemon
     Daemon {
-        /// Directory to sync (default: current directory)
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Directory to sync (uses paths from config if not specified)
+        path: Option<PathBuf>,
 
         /// Poll interval in seconds
         #[arg(short, long, default_value = "60")]
@@ -80,9 +78,8 @@ enum Commands {
 
     /// List conflicts
     Conflicts {
-        /// Directory to check (default: current directory)
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Directory to check (uses paths from config if not specified)
+        path: Option<PathBuf>,
 
         /// Output as JSON
         #[arg(long)]
@@ -91,16 +88,14 @@ enum Commands {
 
     /// Resolve conflicts interactively
     Resolve {
-        /// Working directory (default: current directory)
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Working directory (uses paths from config if not specified)
+        path: Option<PathBuf>,
     },
 
     /// Show sync status
     Status {
-        /// Directory to check (default: current directory)
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Directory to check (uses paths from config if not specified)
+        path: Option<PathBuf>,
 
         /// Output as JSON
         #[arg(long)]
@@ -150,23 +145,93 @@ async fn main() -> Result<()> {
             cli::init(path, db_url, db_name).await?;
         }
         Commands::Sync { path, dry_run } => {
-            cli::sync(path, config, dry_run).await?;
+            let paths = resolve_paths(path, &config);
+            if paths.is_empty() {
+                anyhow::bail!("No sync paths configured. Specify a path or add paths to couchfs.yaml");
+            }
+            for sync_path in paths {
+                let mut path_config = config.clone();
+                path_config.couchdb.remote_path = sync_path.remote;
+                info!("Syncing: {} -> {}", sync_path.local.display(), path_config.couchdb.remote_path);
+                cli::sync(sync_path.local, path_config, dry_run).await?;
+            }
         }
         Commands::Daemon { path, interval } => {
-            cli::daemon(path, config, interval).await?;
+            let paths = resolve_paths(path, &config);
+            if paths.is_empty() {
+                anyhow::bail!("No sync paths configured. Specify a path or add paths to couchfs.yaml");
+            }
+            cli::daemon(paths, config, interval).await?;
         }
         Commands::Conflicts { path, json } => {
-            cli::conflicts(path, json).await?;
+            let paths = resolve_paths(path, &config);
+            if paths.is_empty() {
+                anyhow::bail!("No sync paths configured. Specify a path or add paths to couchfs.yaml");
+            }
+            let multi = paths.len() > 1;
+            for sync_path in &paths {
+                if multi {
+                    println!("\n=== {} ===", sync_path.local.display());
+                }
+                cli::conflicts(sync_path.local.clone(), json).await?;
+            }
         }
         Commands::Resolve { path } => {
-            cli::resolve(path, config).await?;
+            let paths = resolve_paths(path, &config);
+            if paths.is_empty() {
+                anyhow::bail!("No sync paths configured. Specify a path or add paths to couchfs.yaml");
+            }
+            let multi = paths.len() > 1;
+            for sync_path in &paths {
+                let mut path_config = config.clone();
+                path_config.couchdb.remote_path = sync_path.remote.clone();
+                if multi {
+                    println!("\n=== {} ===", sync_path.local.display());
+                }
+                cli::resolve(sync_path.local.clone(), path_config).await?;
+            }
         }
         Commands::Status { path, json } => {
-            cli::status(path, json, &config).await?;
+            let paths = resolve_paths(path, &config);
+            if paths.is_empty() {
+                anyhow::bail!("No sync paths configured. Specify a path or add paths to couchfs.yaml");
+            }
+            let multi = paths.len() > 1;
+            for sync_path in &paths {
+                if multi {
+                    println!("\n=== {} ===", sync_path.local.display());
+                }
+                cli::status(sync_path.local.clone(), json, &config).await?;
+            }
         }
     }
 
     Ok(())
+}
+
+/// Resolve sync paths from CLI argument or config
+fn resolve_paths(cli_path: Option<PathBuf>, config: &AppConfig) -> Vec<SyncPath> {
+    match cli_path {
+        Some(path) => {
+            // CLI path specified - use it with the config's remote_path
+            vec![SyncPath {
+                local: path,
+                remote: config.couchdb.remote_path.clone(),
+            }]
+        }
+        None => {
+            // No CLI path - use paths from config
+            if config.paths.is_empty() {
+                // Fallback to current directory with config's remote_path
+                vec![SyncPath {
+                    local: PathBuf::from("."),
+                    remote: config.couchdb.remote_path.clone(),
+                }]
+            } else {
+                config.paths.clone()
+            }
+        }
+    }
 }
 
 /// Initialize logging based on verbosity or RUST_LOG env var
