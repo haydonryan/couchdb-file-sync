@@ -1,5 +1,5 @@
 use crate::couchdb::CouchDb;
-use crate::local::{compute_file_hash, LocalDb, Scanner};
+use crate::local::{compute_bytes_hash, compute_file_hash, LocalDb, Scanner};
 use crate::models::{Change, ChangeType, Conflict, FileState, RemoteState, ResolutionStrategy};
 use anyhow::Result;
 use chrono::Utc;
@@ -259,9 +259,9 @@ impl SyncEngine {
             };
 
             if remote_changed {
-                debug!("  => Remote is newer, fetching metadata to compare...");
+                debug!("  => Remote is newer, fetching content to compare...");
 
-                // Fetch remote metadata (without downloading chunks yet)
+                // Fetch remote metadata
                 let remote_doc = match self.couchdb.fetch_metadata(&remote_path).await? {
                     Some(doc) => doc,
                     None => {
@@ -280,16 +280,19 @@ impl SyncEngine {
                 debug!("    size: {} bytes", local_state.size);
                 debug!("    modified_at: {:?}", local_state.modified_at);
 
-                // Compare sizes to determine if content differs
-                let remote_size = remote_doc.size;
-                debug!("  COMPARING:");
-                debug!("    local size:  {} bytes", local_state.size);
-                debug!("    remote size: {} bytes", remote_size);
+                // Download remote content and compute hash for comparison
+                let remote_content = self.couchdb.get_file_content(&remote_path).await?;
+                let remote_hash = compute_bytes_hash(&remote_content);
 
-                // Compare sizes to decide action
-                if local_state.size == remote_size {
-                    debug!("  => SIZES MATCH - files likely identical");
-                    debug!("  => Skipping chunk download (not needed)");
+                debug!("  COMPARING CONTENT:");
+                debug!("    local hash:  {}", &local_state.hash[..8.min(local_state.hash.len())]);
+                debug!("    remote hash: {}", &remote_hash[..8.min(remote_hash.len())]);
+                debug!("    local size:  {} bytes", local_state.size);
+                debug!("    remote size: {} bytes", remote_content.len());
+
+                // Compare hashes to determine if content actually differs
+                if local_state.hash == remote_hash {
+                    debug!("  => CONTENT IDENTICAL - no conflict");
                     // Update local state to reflect remote rev
                     let updated_state = FileState {
                         path: lc.path.clone(),
@@ -301,10 +304,23 @@ impl SyncEngine {
                     };
                     self.local_db.save_file_state(&updated_state)?;
                 } else {
-                    debug!("  => SIZES DIFFER - conflict detected!");
-                    debug!("  => Will NOT download chunks (conflict needs user resolution)");
+                    debug!("  => CONTENT DIFFERS - conflict detected!");
 
-                    let remote_state = RemoteState::from(remote_doc);
+                    // Convert mtime (milliseconds since epoch) to DateTime
+                    use chrono::TimeZone;
+                    let remote_modified_at = Utc
+                        .timestamp_millis_opt(remote_doc.mtime as i64)
+                        .single()
+                        .unwrap_or_else(Utc::now);
+
+                    let remote_state = RemoteState {
+                        path: remote_path.clone(),
+                        hash: remote_hash,
+                        size: remote_content.len() as u64,
+                        modified_at: remote_modified_at,
+                        couch_rev: remote_doc.rev.unwrap_or_default(),
+                        deleted: remote_doc.deleted,
+                    };
                     debug!("  REMOTE STATE:");
                     debug!("    size: {} bytes", remote_state.size);
                     debug!("    modified_at: {:?}", remote_state.modified_at);
