@@ -120,8 +120,24 @@ impl Scanner {
                     // Check if modified
                     if state.hash != stored.hash {
                         info!(
-                            "Modified local file detected: {} (hash changed)",
+                            "Modified local file detected: {}",
                             state.path
+                        );
+                        info!(
+                            "  hash: {} -> {}",
+                            &stored.hash[..8.min(stored.hash.len())],
+                            &state.hash[..8.min(state.hash.len())]
+                        );
+                        if state.size != stored.size {
+                            info!(
+                                "  size: {} -> {} bytes",
+                                stored.size, state.size
+                            );
+                        }
+                        info!(
+                            "  mtime: {} -> {}",
+                            stored.modified_at.format("%Y-%m-%d %H:%M:%S"),
+                            state.modified_at.format("%Y-%m-%d %H:%M:%S")
                         );
                         changes.push(Change::local_modified(
                             state.path.clone(),
