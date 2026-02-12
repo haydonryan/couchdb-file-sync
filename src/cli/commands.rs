@@ -1,4 +1,4 @@
-use crate::config::AppConfig;
+use crate::config::{AppConfig, SyncPath};
 use crate::couchdb::CouchDb;
 use crate::local::LocalDb;
 use crate::models::{IgnoreMatcher, ResolutionStrategy};
@@ -215,9 +215,11 @@ async fn notify_conflicts_telegram(
 }
 
 /// Run continuous sync daemon
-pub async fn daemon(path: PathBuf, config: AppConfig, interval: u64) -> Result<()> {
-    info!("Starting CouchFS daemon in: {}", path.display());
+pub async fn daemon(paths: Vec<SyncPath>, config: AppConfig, interval: u64) -> Result<()> {
+    let path_list: Vec<_> = paths.iter().map(|p| p.local.display().to_string()).collect();
+    info!("Starting CouchFS daemon for: {}", path_list.join(", "));
     println!("CouchFS daemon started (interval: {}s)", interval);
+    println!("Syncing {} path(s): {}", paths.len(), path_list.join(", "));
     println!("Press Ctrl+C to stop");
 
     // Track which conflicts have been notified during this daemon session
@@ -228,10 +230,15 @@ pub async fn daemon(path: PathBuf, config: AppConfig, interval: u64) -> Result<(
     loop {
         interval_timer.tick().await;
 
-        match daemon_sync(&path, &config, &mut session_notified).await {
-            Ok(_) => {}
-            Err(e) => {
-                error!("Sync error: {}", e);
+        for sync_path in &paths {
+            let mut path_config = config.clone();
+            path_config.couchdb.remote_path = sync_path.remote.clone();
+
+            match daemon_sync(&sync_path.local, &path_config, &mut session_notified).await {
+                Ok(_) => {}
+                Err(e) => {
+                    error!("Sync error for {}: {}", sync_path.local.display(), e);
+                }
             }
         }
     }

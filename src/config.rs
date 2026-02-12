@@ -2,6 +2,16 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// A sync path pair mapping local directory to remote path
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SyncPath {
+    /// Local directory path
+    pub local: PathBuf,
+    /// Remote path prefix in CouchDB (e.g., "notes/" or "obsidian/")
+    #[serde(default)]
+    pub remote: String,
+}
+
 /// Application configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
@@ -9,6 +19,9 @@ pub struct AppConfig {
     pub couchdb: CouchDbConfig,
     #[serde(default)]
     pub sync: SyncConfig,
+    /// Multiple sync path pairs (local -> remote)
+    #[serde(default)]
+    pub paths: Vec<SyncPath>,
     #[serde(default)]
     pub ignore: IgnoreConfig,
     #[serde(default)]
@@ -24,6 +37,7 @@ impl Default for AppConfig {
         Self {
             couchdb: CouchDbConfig::default(),
             sync: SyncConfig::default(),
+            paths: Vec::new(),
             ignore: IgnoreConfig::default(),
             conflicts: ConflictConfig::default(),
             notifications: NotificationConfig::default(),
