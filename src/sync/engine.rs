@@ -232,29 +232,60 @@ impl SyncEngine {
             }
 
             let remote_changed = if let Some(rc) = remote_map.get(&remote_path) {
-                debug!("  REMOTE CHANGE EXISTS:");
-                debug!("    mtime: {:?}", rc.mtime);
-                debug!("    rev: {:?}", rc.rev);
-                debug!("    size: {:?}", rc.size);
                 match (&rc.mtime, &stored_state) {
                     (Some(remote_mtime), Some(state)) => {
                         let changed = *remote_mtime > state.last_sync_at;
-                        debug!("    remote_mtime > last_sync_at: {}", changed);
-                        debug!("    remote_mtime: {:?}", remote_mtime);
-                        debug!("    last_sync_at: {:?}", state.last_sync_at);
+                        if changed {
+                            info!(
+                                "  [REMOTE CHANGE DETECTED] {}",
+                                lc.path
+                            );
+                            info!(
+                                "    Remote mtime: {} | Last sync: {} | Diff: +{}s",
+                                remote_mtime.format("%Y-%m-%d %H:%M:%S"),
+                                state.last_sync_at.format("%Y-%m-%d %H:%M:%S"),
+                                (*remote_mtime - state.last_sync_at).num_seconds()
+                            );
+                            if let Some(remote_rev) = &rc.rev {
+                                let stored_rev = state.couch_rev.as_deref().unwrap_or("none");
+                                info!(
+                                    "    Remote rev: {} | Stored rev: {}",
+                                    &remote_rev[..12.min(remote_rev.len())],
+                                    &stored_rev[..12.min(stored_rev.len())]
+                                );
+                            }
+                            if let Some(remote_size) = rc.size {
+                                info!(
+                                    "    Remote size: {} bytes | Local size: {} bytes",
+                                    remote_size,
+                                    state.size
+                                );
+                            }
+                        } else {
+                            debug!(
+                                "    {} - remote_mtime ({}) <= last_sync_at ({}), no remote change",
+                                lc.path,
+                                remote_mtime.format("%Y-%m-%d %H:%M:%S"),
+                                state.last_sync_at.format("%Y-%m-%d %H:%M:%S")
+                            );
+                        }
                         changed
                     }
                     (None, _) => {
-                        debug!("    no remote mtime, assuming changed");
+                        info!("  [REMOTE CHANGE DETECTED] {} - no remote mtime available, assuming changed", lc.path);
+                        if let Some(ref state) = stored_state {
+                            info!("    Stored rev: {:?} | Remote rev: {:?}", state.couch_rev, rc.rev);
+                        }
                         true
                     }
                     (_, None) => {
-                        debug!("    no stored state, assuming changed");
+                        info!("  [REMOTE CHANGE DETECTED] {} - no stored state (first sync)", lc.path);
+                        info!("    Remote mtime: {:?} | Remote rev: {:?} | Remote size: {:?}", rc.mtime, rc.rev, rc.size);
                         true
                     }
                 }
             } else {
-                debug!("  NO REMOTE CHANGE (file not on remote)");
+                debug!("  {} - file not on remote yet", lc.path);
                 false
             };
 
@@ -292,7 +323,11 @@ impl SyncEngine {
 
                 // Compare hashes to determine if content actually differs
                 if local_state.hash == remote_hash {
-                    debug!("  => CONTENT IDENTICAL - no conflict");
+                    info!(
+                        "  [OK] {} - content identical (hash: {}), updating sync state",
+                        lc.path,
+                        &local_state.hash[..8.min(local_state.hash.len())]
+                    );
                     // Update local state to reflect remote rev
                     let updated_state = FileState {
                         path: lc.path.clone(),
@@ -304,7 +339,12 @@ impl SyncEngine {
                     };
                     self.local_db.save_file_state(&updated_state)?;
                 } else {
-                    debug!("  => CONTENT DIFFERS - conflict detected!");
+                    info!(
+                        "  [CONFLICT] {} - content differs (local: {}, remote: {})",
+                        lc.path,
+                        &local_state.hash[..8.min(local_state.hash.len())],
+                        &remote_hash[..8.min(remote_hash.len())]
+                    );
 
                     // Convert mtime (milliseconds since epoch) to DateTime
                     use chrono::TimeZone;
@@ -329,29 +369,20 @@ impl SyncEngine {
                     conflicts.push(Conflict::new(lc.path.clone(), local_state, remote_state));
                 }
             } else {
-                debug!("  => Remote unchanged, safe to upload");
-                debug!(
-                    "  => Adding to upload queue: {} -> {}",
-                    lc.path, remote_path
-                );
+                info!("  [UPLOAD] {} - remote unchanged, queuing for upload", lc.path);
                 clean_local.push(lc.clone());
             }
             debug!("");
         }
 
         debug!(
-            "========== ANALYZING {} REMOTE-ONLY CHANGES ==========",
+            "========== CHECKING {} REMOTE FILES ==========",
             remote_changes.len()
         );
         for rc in remote_changes {
             let local_path = self.couchdb.get_local_path(&rc.path);
-            debug!("--- REMOTE CHANGE: {} ---", rc.path);
-            debug!("  Remote path: {}", rc.path);
-            debug!("  Local path: {}", local_path);
-            debug!("  Change type: {:?}", rc.change_type);
-            debug!("  Remote mtime: {:?}", rc.mtime);
-            debug!("  Remote rev: {:?}", rc.rev);
-            debug!("  Remote size: {:?}", rc.size);
+            debug!("--- REMOTE FILE: {} -> {} ---", rc.path, local_path);
+            debug!("  mtime: {:?}, rev: {:?}, size: {:?}", rc.mtime, rc.rev, rc.size);
 
             if local_map.contains_key(&local_path) {
                 debug!("  File also changed locally, skipping (handled above)");
