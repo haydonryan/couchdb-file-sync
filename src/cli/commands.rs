@@ -5,6 +5,8 @@ use crate::models::{IgnoreMatcher, ResolutionStrategy};
 use crate::sync::{SyncEngine, SyncReport};
 use crate::telegram::TelegramNotifier;
 use anyhow::Result;
+use dialoguer::{theme::ColorfulTheme, Select};
+use similar::{ChangeTag, TextDiff};
 use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
 
@@ -218,30 +220,24 @@ pub async fn conflicts(path: PathBuf, json: bool) -> Result<()> {
                 );
                 println!();
             }
-            println!("Resolve with:");
-            println!("  couchfs resolve <path> --strategy keep-local");
-            println!("  couchfs resolve <path> --strategy keep-remote");
-            println!("  couchfs resolve <path> --strategy keep-both");
+            println!("Resolve with: couchfs resolve");
         }
     }
 
     Ok(())
 }
 
-/// Resolve a conflict
-pub async fn resolve(
-    path: PathBuf,
-    conflict_path: PathBuf,
-    strategy: ResolutionStrategy,
-    config: AppConfig,
-) -> Result<()> {
-    info!(
-        "Resolving conflict: {:?} with strategy: {}",
-        conflict_path, strategy
-    );
-
+/// Resolve conflicts interactively
+pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
     let db_path = path.join(".couchfs/state.db");
     let local_db = LocalDb::open(&db_path)?;
+
+    let conflicts = local_db.get_conflicts()?;
+
+    if conflicts.is_empty() {
+        println!("No conflicts to resolve.");
+        return Ok(());
+    }
 
     let couchdb = CouchDb::new(
         &config.couchdb.url,
@@ -252,20 +248,156 @@ pub async fn resolve(
     )
     .await?;
 
-    let mut engine = SyncEngine::new(couchdb, local_db, path);
+    let mut engine = SyncEngine::new(couchdb, local_db, path.clone());
 
-    let conflict_path_str = conflict_path.to_string_lossy().to_string();
-    engine
-        .resolve_conflict(&conflict_path_str, strategy)
-        .await?;
+    println!("Found {} conflict(s) to resolve:\n", conflicts.len());
 
-    println!(
-        "✓ Resolved conflict: {} (strategy: {})",
-        conflict_path.display(),
-        strategy
-    );
+    for (i, conflict) in conflicts.iter().enumerate() {
+        println!(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        );
+        println!(
+            "Conflict {}/{}: {}",
+            i + 1,
+            conflicts.len(),
+            conflict.path
+        );
+        println!(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        );
 
+        // Show file metadata
+        println!(
+            "Local:  {} bytes, modified {}",
+            conflict.local_state.size,
+            conflict.local_state.modified_at.format("%Y-%m-%d %H:%M:%S")
+        );
+        println!(
+            "Remote: {} bytes, modified {}\n",
+            conflict.remote_state.size,
+            conflict.remote_state.modified_at.format("%Y-%m-%d %H:%M:%S")
+        );
+
+        // Read local content
+        let local_file_path = path.join(&conflict.path);
+        let local_content = match tokio::fs::read(&local_file_path).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+            Err(e) => {
+                println!("Could not read local file: {}", e);
+                String::new()
+            }
+        };
+
+        // Fetch remote content
+        let remote_content = match engine.get_remote_content(&conflict.path).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+            Err(e) => {
+                println!("Could not fetch remote file: {}", e);
+                String::new()
+            }
+        };
+
+        // Display side-by-side diff
+        print_side_by_side_diff(&local_content, &remote_content);
+
+        // Ask user for action
+        let options = &["Keep Local", "Keep Remote", "Keep Both (merge manually)", "Skip"];
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("How do you want to resolve this conflict?")
+            .items(options)
+            .default(0)
+            .interact()?;
+
+        let strategy = match selection {
+            0 => ResolutionStrategy::KeepLocal,
+            1 => ResolutionStrategy::KeepRemote,
+            2 => ResolutionStrategy::KeepBoth,
+            3 => ResolutionStrategy::Skip,
+            _ => unreachable!(),
+        };
+
+        if strategy == ResolutionStrategy::Skip {
+            println!("Skipped.\n");
+            continue;
+        }
+
+        engine.resolve_conflict(&conflict.path, strategy).await?;
+
+        match strategy {
+            ResolutionStrategy::KeepLocal => {
+                println!("Resolved: kept local version.\n");
+            }
+            ResolutionStrategy::KeepRemote => {
+                println!("Resolved: kept remote version.\n");
+            }
+            ResolutionStrategy::KeepBoth => {
+                println!(
+                    "Resolved: saved remote as {}.remote - merge manually.\n",
+                    conflict.path
+                );
+            }
+            ResolutionStrategy::Skip => {}
+        }
+    }
+
+    println!("All conflicts processed.");
     Ok(())
+}
+
+/// Print a side-by-side diff of two text contents
+fn print_side_by_side_diff(local: &str, remote: &str) {
+    let diff = TextDiff::from_lines(local, remote);
+    let width = 38; // Width for each side
+
+    println!("{:─<width$}┬{:─<width$}", "", "", width = width + 2);
+    println!(
+        " {:^width$} │ {:^width$}",
+        "LOCAL",
+        "REMOTE",
+        width = width
+    );
+    println!("{:─<width$}┼{:─<width$}", "", "", width = width + 2);
+
+    for change in diff.iter_all_changes() {
+        let line = change.value().trim_end();
+        match change.tag() {
+            ChangeTag::Equal => {
+                let truncated = truncate_str(line, width);
+                println!(" {:<width$} │ {:<width$}", truncated, truncated, width = width);
+            }
+            ChangeTag::Delete => {
+                // Line only in local (deleted from remote's perspective)
+                let truncated = truncate_str(line, width);
+                println!(
+                    " \x1b[31m{:<width$}\x1b[0m │ {:<width$}",
+                    truncated,
+                    "",
+                    width = width
+                );
+            }
+            ChangeTag::Insert => {
+                // Line only in remote (inserted from remote's perspective)
+                let truncated = truncate_str(line, width);
+                println!(
+                    " {:<width$} │ \x1b[32m{:<width$}\x1b[0m",
+                    "",
+                    truncated,
+                    width = width
+                );
+            }
+        }
+    }
+
+    println!("{:─<width$}┴{:─<width$}\n", "", "", width = width + 2);
+}
+
+/// Truncate a string to fit within a given width
+fn truncate_str(s: &str, max_width: usize) -> String {
+    if s.len() <= max_width {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_width.saturating_sub(3)])
+    }
 }
 
 /// Show sync status
