@@ -7,6 +7,7 @@ use crate::telegram::TelegramNotifier;
 use anyhow::Result;
 use dialoguer::{theme::ColorfulTheme, Select};
 use similar::{ChangeTag, TextDiff};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
 
@@ -113,16 +114,23 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
 
     print_sync_report(&report);
 
-    // Send Telegram notifications for conflicts
+    // Send Telegram notifications for conflicts (one-time sync uses DB tracking)
     if report.conflicts > 0 {
-        notify_conflicts_telegram(&config, &db_path, &path).await;
+        notify_conflicts_telegram(&config, &db_path, &path, None).await;
     }
 
     Ok(report)
 }
 
 /// Send Telegram notifications for any unnotified conflicts
-async fn notify_conflicts_telegram(config: &AppConfig, db_path: &Path, sync_dir: &Path) {
+/// If session_notified is provided, only notify about conflicts not in that set (daemon mode)
+/// If session_notified is None, notify about all conflicts not marked as notified in DB (one-time sync)
+async fn notify_conflicts_telegram(
+    config: &AppConfig,
+    db_path: &Path,
+    sync_dir: &Path,
+    mut session_notified: Option<&mut HashSet<String>>,
+) {
     // Check if Telegram is configured
     let (bot_token, chat_id) = match (
         &config.notifications.telegram.bot_token,
@@ -149,7 +157,7 @@ async fn notify_conflicts_telegram(config: &AppConfig, db_path: &Path, sync_dir:
     let notifier = TelegramNotifier::new(bot_token, chat_id);
     let sync_dir_str = sync_dir.display().to_string();
 
-    // Get unnotified conflicts
+    // Get all conflicts
     let conflicts = match local_db.get_conflicts() {
         Ok(c) => c,
         Err(e) => {
@@ -158,17 +166,50 @@ async fn notify_conflicts_telegram(config: &AppConfig, db_path: &Path, sync_dir:
         }
     };
 
-    for conflict in conflicts.iter().filter(|c| !c.notified) {
-        match notifier.notify_conflict(conflict, &sync_dir_str).await {
-            Ok(_) => {
-                info!("Sent Telegram notification for conflict: {}", conflict.path);
-                if let Err(e) = local_db.mark_conflict_notified(&conflict.path) {
-                    warn!("Failed to mark conflict as notified: {}", e);
+    // Filter to only new conflicts based on mode
+    let new_conflicts: Vec<_> = match &session_notified {
+        Some(notified) => {
+            // Daemon mode: only conflicts not notified this session
+            conflicts
+                .iter()
+                .filter(|c| !notified.contains(&c.path))
+                .collect()
+        }
+        None => {
+            // One-time sync: only conflicts not marked notified in DB
+            conflicts.iter().filter(|c| !c.notified).collect()
+        }
+    };
+
+    if new_conflicts.is_empty() {
+        return;
+    }
+
+    // Send notification for all new conflicts at once
+    match notifier
+        .notify_new_conflicts(&new_conflicts, &sync_dir_str)
+        .await
+    {
+        Ok(_) => {
+            info!(
+                "Sent Telegram notification for {} new conflict(s)",
+                new_conflicts.len()
+            );
+            // Mark conflicts as notified
+            for conflict in &new_conflicts {
+                if let Some(ref mut notified) = session_notified {
+                    // Daemon mode: track in session
+                    notified.insert(conflict.path.clone());
+                } else {
+                    // One-time sync: mark in DB
+                    if let Err(e) = local_db.mark_conflict_notified(&conflict.path) {
+                        warn!("Failed to mark conflict as notified: {}", e);
+                    }
                 }
             }
-            Err(e) => {
-                warn!("Failed to send Telegram notification: {}", e);
-            }
+        }
+        Err(e) => {
+            warn!("Failed to send Telegram notification: {}", e);
         }
     }
 }
@@ -179,17 +220,60 @@ pub async fn daemon(path: PathBuf, config: AppConfig, interval: u64) -> Result<(
     println!("CouchFS daemon started (interval: {}s)", interval);
     println!("Press Ctrl+C to stop");
 
-    // TODO: Implement file watcher + periodic sync
-    // For now, just do periodic sync
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval));
+    // Track which conflicts have been notified during this daemon session
+    let mut session_notified: HashSet<String> = HashSet::new();
+
+    let mut interval_timer = tokio::time::interval(tokio::time::Duration::from_secs(interval));
 
     loop {
-        interval.tick().await;
+        interval_timer.tick().await;
 
-        if let Err(e) = sync(path.clone(), config.clone(), false).await {
-            error!("Sync error: {}", e);
+        match daemon_sync(&path, &config, &mut session_notified).await {
+            Ok(_) => {}
+            Err(e) => {
+                error!("Sync error: {}", e);
+            }
         }
     }
+}
+
+/// Internal sync function for daemon that uses session-based notification tracking
+async fn daemon_sync(
+    path: &Path,
+    config: &AppConfig,
+    session_notified: &mut HashSet<String>,
+) -> Result<SyncReport> {
+    info!("Running sync in: {}", path.display());
+
+    // Load ignore patterns
+    let _ignore_matcher = load_ignore_patterns(path);
+
+    // Open local database
+    let db_path = path.join(".couchfs/state.db");
+    let local_db = LocalDb::open(&db_path)?;
+
+    // Connect to CouchDB
+    let couchdb = CouchDb::new(
+        &config.couchdb.url,
+        config.couchdb.username.as_deref(),
+        config.couchdb.password.as_deref(),
+        &config.couchdb.database,
+        &config.couchdb.remote_path,
+    )
+    .await?;
+
+    // Run sync
+    let mut engine = SyncEngine::new(couchdb, local_db, path.to_path_buf());
+    let report = engine.sync().await?;
+
+    print_sync_report(&report);
+
+    // Send Telegram notifications for NEW conflicts only (session-based tracking)
+    if report.conflicts > 0 {
+        notify_conflicts_telegram(config, &db_path, path, Some(session_notified)).await;
+    }
+
+    Ok(report)
 }
 
 /// List conflicts
