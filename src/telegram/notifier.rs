@@ -20,37 +20,32 @@ impl TelegramNotifier {
         }
     }
 
-    /// Send conflict notification
-    pub async fn notify_conflict(&self, conflict: &Conflict, sync_dir: &str) -> Result<()> {
+    /// Send notification for multiple new conflicts (single message per sync run)
+    pub async fn notify_new_conflicts(&self, conflicts: &[&Conflict], sync_dir: &str) -> Result<()> {
+        if conflicts.is_empty() {
+            return Ok(());
+        }
+
+        let file_list: String = conflicts
+            .iter()
+            .map(|c| format!("  • <code>{}</code>", escape_html(&c.path)))
+            .collect::<Vec<_>>()
+            .join("\n");
+
         let message = format!(
-            "⚠️ <b>CouchFS Conflict Detected</b>\n\n\
-             📁 File: <code>{}</code>\n\
+            "⚠️ <b>CouchFS: {} New Conflict{}</b>\n\n\
              📂 Location: <code>{}</code>\n\n\
-             📝 <b>Local version:</b>\n\
-              • Modified: {}\n\
-              • Size: {} KB\n\n\
-             🌐 <b>Remote version:</b>\n\
-              • Modified: {}\n\
-              • Size: {} KB\n\n\
-             ✅ Remote file saved as: <code>{}.remote</code>\n\n\
-             Resolve with:\n\
-             <code>couchfs resolve {} --strategy keep-local</code>\n\
-             <code>couchfs resolve {} --strategy keep-remote</code>\n\
-             <code>couchfs resolve {} --strategy keep-both</code>",
-            escape_html(&conflict.path),
+             📁 <b>Files in conflict:</b>\n\
+             {}\n\n\
+             Run <code>couchfs resolve</code> to resolve interactively.",
+            conflicts.len(),
+            if conflicts.len() == 1 { "" } else { "s" },
             escape_html(sync_dir),
-            conflict.local_state.modified_at.format("%Y-%m-%d %H:%M"),
-            conflict.local_state.size / 1024,
-            conflict.remote_state.modified_at.format("%Y-%m-%d %H:%M"),
-            conflict.remote_state.size / 1024,
-            escape_html(&conflict.path),
-            escape_html(&conflict.path),
-            escape_html(&conflict.path),
-            escape_html(&conflict.path)
+            file_list
         );
 
         self.send_message(&message).await?;
-        debug!("Sent Telegram notification for conflict: {}", conflict.path);
+        debug!("Sent Telegram notification for {} conflicts", conflicts.len());
         Ok(())
     }
 
