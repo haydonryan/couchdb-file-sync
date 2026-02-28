@@ -219,6 +219,13 @@ impl SyncEngine {
             debug!("  Remote path: {}", remote_path);
             debug!("  Change type: {:?}", lc.change_type);
 
+            if lc.change_type == ChangeType::Deleted {
+                debug!("  Local delete, skipping remote content comparison");
+                clean_local.push(lc.clone());
+                debug!("");
+                continue;
+            }
+
             let stored_state = self.local_db.get_file_state(&lc.path)?;
             if let Some(ref state) = stored_state {
                 debug!("  STORED STATE:");
@@ -386,6 +393,20 @@ impl SyncEngine {
 
             if local_map.contains_key(&local_path) {
                 debug!("  File also changed locally, skipping (handled above)");
+                continue;
+            }
+
+            if rc.change_type == ChangeType::Deleted {
+                let relative_path = local_path.trim_start_matches('/');
+                let file_path = self.root_dir.join(relative_path);
+                let has_state = self.local_db.get_file_state(&local_path)?.is_some();
+                if file_path.exists() || has_state {
+                    debug!("  Remote deleted, scheduling local delete");
+                    clean_remote.push(rc.clone());
+                } else {
+                    debug!("  Remote deleted, no local file/state, skipping");
+                }
+                debug!("");
                 continue;
             }
 
@@ -633,9 +654,9 @@ impl SyncEngine {
                 );
                 if file_path.exists() {
                     tokio::fs::remove_file(&file_path).await?;
-                    self.local_db.delete_file_state(&local_path)?;
-                    info!("[LOCAL DELETE] SUCCESS: {} -> {}", change.path, local_path);
                 }
+                self.local_db.delete_file_state(&local_path)?;
+                info!("[LOCAL DELETE] SUCCESS: {} -> {}", change.path, local_path);
             }
         }
         Ok(())
