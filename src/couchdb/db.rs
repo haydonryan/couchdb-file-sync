@@ -10,7 +10,6 @@ pub struct CouchDb {
     #[allow(dead_code)]
     client: Client,
     db: Database,
-    db_name: String,
     http_client: HttpClient,
     base_url: String,
     auth: Option<(String, String)>,
@@ -54,7 +53,6 @@ impl CouchDb {
         Ok(Self {
             client,
             db,
-            db_name: db_name.to_string(),
             http_client: HttpClient::new(),
             base_url: url.to_string(),
             auth,
