@@ -135,13 +135,56 @@ fn process_event(
                 let _ = tx.try_send(event);
             }
         }
-        EventKind::Modify(_) => {
-            for path in &paths {
-                if should_ignore(path, matcher, root) {
-                    continue;
+        EventKind::Modify(modify_kind) => {
+            use notify_debouncer_full::notify::event::ModifyKind;
+
+            match modify_kind {
+                ModifyKind::Name(rename_mode) => {
+                    use notify_debouncer_full::notify::event::RenameMode;
+                    match rename_mode {
+                        RenameMode::From => {
+                            // File was renamed FROM this path (treat as delete)
+                            for path in &paths {
+                                if should_ignore(path, matcher, root) {
+                                    continue;
+                                }
+                                let _ = tx.try_send(WatcherEvent::FileDeleted(path.to_path_buf()));
+                            }
+                        }
+                        RenameMode::To => {
+                            // File was renamed TO this path (treat as create)
+                            for path in &paths {
+                                if should_ignore(path, matcher, root) {
+                                    continue;
+                                }
+                                let _ = tx.try_send(WatcherEvent::FileCreated(path.to_path_buf()));
+                            }
+                        }
+                        RenameMode::Both => {
+                            // Both paths in one event - first is old, second is new
+                            if paths.len() >= 2 {
+                                if !should_ignore(paths[0], matcher, root) {
+                                    let _ =
+                                        tx.try_send(WatcherEvent::FileDeleted(paths[0].to_path_buf()));
+                                }
+                                if !should_ignore(paths[1], matcher, root) {
+                                    let _ =
+                                        tx.try_send(WatcherEvent::FileCreated(paths[1].to_path_buf()));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-                let event = WatcherEvent::FileModified(path.to_path_buf());
-                let _ = tx.try_send(event);
+                _ => {
+                    // All other modifications (content changes, metadata, etc.)
+                    for path in &paths {
+                        if should_ignore(path, matcher, root) {
+                            continue;
+                        }
+                        let _ = tx.try_send(WatcherEvent::FileModified(path.to_path_buf()));
+                    }
+                }
             }
         }
         EventKind::Remove(_) => {
