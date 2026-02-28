@@ -1,4 +1,4 @@
-use crate::models::{Change, ChunkDoc, FileDoc, RemoteState};
+use crate::models::{Change, ChangeSource, ChangeType, ChunkDoc, FileDoc, RemoteState};
 use anyhow::Result;
 use couch_rs::database::Database;
 use couch_rs::Client;
@@ -133,14 +133,14 @@ impl CouchDb {
         Ok(())
     }
 
-    /// Get all documents (non-deleted, files only - not chunks)
+    /// Get all documents (files only - not chunks, including deleted)
     /// Filtered by the configured remote path
     pub async fn get_all_files(&self) -> Result<Vec<FileDoc>> {
         let collection = self.db.get_all::<FileDoc>().await?;
         Ok(collection
             .rows
             .into_iter()
-            .filter(|d| !d.deleted && d.is_file() && self.is_path_allowed(&d.id))
+            .filter(|d| d.is_file() && self.is_path_allowed(&d.id))
             .collect())
     }
 
@@ -165,13 +165,31 @@ impl CouchDb {
 
         debug!("Checkpoint found: {}, returning changes", since.unwrap());
 
-        // Return all files as potential changes (sync will compare revs)
+        // Return all files (including deleted) as potential changes (sync will compare revs)
         let changes: Vec<Change> = all_files
             .into_iter()
             .map(|doc| {
                 let mtime = doc.modified_at();
                 let rev = doc.rev.unwrap_or_default();
-                crate::models::Change::remote_modified(doc.id, String::new(), doc.size, mtime, rev)
+                if doc.deleted {
+                    Change::new(
+                        doc.id,
+                        ChangeType::Deleted,
+                        ChangeSource::Remote,
+                        None,
+                        None,
+                        Some(mtime),
+                        Some(rev),
+                    )
+                } else {
+                    crate::models::Change::remote_modified(
+                        doc.id,
+                        String::new(),
+                        doc.size,
+                        mtime,
+                        rev,
+                    )
+                }
             })
             .collect();
 
