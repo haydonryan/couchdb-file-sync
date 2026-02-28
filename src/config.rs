@@ -13,7 +13,7 @@ pub struct SyncPath {
 }
 
 /// Application configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub couchdb: CouchDbConfig,
@@ -30,20 +30,6 @@ pub struct AppConfig {
     pub notifications: NotificationConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            couchdb: CouchDbConfig::default(),
-            sync: SyncConfig::default(),
-            paths: Vec::new(),
-            ignore: IgnoreConfig::default(),
-            conflicts: ConflictConfig::default(),
-            notifications: NotificationConfig::default(),
-            logging: LoggingConfig::default(),
-        }
-    }
 }
 
 impl AppConfig {

@@ -119,20 +119,14 @@ impl Scanner {
                 Some(stored) => {
                     // Check if modified
                     if state.hash != stored.hash {
-                        info!(
-                            "Modified local file detected: {}",
-                            state.path
-                        );
+                        info!("Modified local file detected: {}", state.path);
                         info!(
                             "  hash: {} -> {}",
                             &stored.hash[..8.min(stored.hash.len())],
                             &state.hash[..8.min(state.hash.len())]
                         );
                         if state.size != stored.size {
-                            info!(
-                                "  size: {} -> {} bytes",
-                                stored.size, state.size
-                            );
+                            info!("  size: {} -> {} bytes", stored.size, state.size);
                         }
                         info!(
                             "  mtime: {} -> {}",

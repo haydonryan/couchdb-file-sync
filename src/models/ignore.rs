@@ -70,9 +70,9 @@ impl IgnoreMatcher {
         let mut glob_pattern = String::new();
 
         // Handle patterns starting with **/ (match at any depth)
-        let remaining_pattern = if pattern.starts_with("**/") {
+        let remaining_pattern = if let Some(stripped) = pattern.strip_prefix("**/") {
             glob_pattern.push_str("**/");
-            &pattern[3..]
+            stripped
         } else if pattern.contains('/') {
             // Contains path separator - exact or prefix match
             glob_pattern.push_str(pattern);

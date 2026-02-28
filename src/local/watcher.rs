@@ -164,12 +164,14 @@ fn process_event(
                             // Both paths in one event - first is old, second is new
                             if paths.len() >= 2 {
                                 if !should_ignore(paths[0], matcher, root) {
-                                    let _ =
-                                        tx.try_send(WatcherEvent::FileDeleted(paths[0].to_path_buf()));
+                                    let _ = tx.try_send(WatcherEvent::FileDeleted(
+                                        paths[0].to_path_buf(),
+                                    ));
                                 }
                                 if !should_ignore(paths[1], matcher, root) {
-                                    let _ =
-                                        tx.try_send(WatcherEvent::FileCreated(paths[1].to_path_buf()));
+                                    let _ = tx.try_send(WatcherEvent::FileCreated(
+                                        paths[1].to_path_buf(),
+                                    ));
                                 }
                             }
                         }

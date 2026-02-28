@@ -1,0 +1,209 @@
+use anyhow::Result;
+use couchfs::{CouchDb, LocalDb, SyncEngine};
+use std::collections::HashSet;
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+struct TestDir {
+    path: PathBuf,
+}
+
+impl TestDir {
+    fn new(prefix: &str) -> Result<Self> {
+        let cwd = env::current_dir()?;
+        let base = cwd.join("_testdata");
+        fs::create_dir_all(&base)?;
+        let path = base.join(format!("{}-{}", prefix, unique_suffix()));
+        fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+
+    fn join(&self, rel: &str) -> PathBuf {
+        self.path.join(rel)
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a running CouchDB server (see COUCHFS_TEST_DB_* env vars)"]
+async fn remote_move_deletes_old_local_path() -> Result<()> {
+    let test_dir = TestDir::new("remote-move")?;
+    let couchfs_dir = test_dir.join(".couchfs");
+    fs::create_dir_all(&couchfs_dir)?;
+
+    let state_db = couchfs_dir.join("state.db");
+
+    let old_local = test_dir.join("old.txt");
+    fs::write(&old_local, "hello\n")?;
+
+    let (url, db_name, user, pass, remote_path) = test_db_config();
+    let old_remote = format!("{}old.txt", remote_path);
+    let new_remote = format!("{}new.txt", remote_path);
+    let cleanup_docs = vec![old_remote.clone(), new_remote.clone()];
+    let mut cleanup_chunks: Vec<String> = Vec::new();
+
+    let couchdb = CouchDb::new(
+        &url,
+        user.as_deref(),
+        pass.as_deref(),
+        &db_name,
+        &remote_path,
+    )
+    .await?;
+    assert!(couchdb.ping().await?, "CouchDB ping failed");
+
+    let test_result: Result<()> = async {
+        let local_db = LocalDb::open(&state_db)?;
+        let mut engine = SyncEngine::new(couchdb, local_db, test_dir.path.clone());
+        engine.sync().await?;
+
+        // Simulate a remote move: copy doc to new ID and mark old ID deleted.
+        let couchdb = CouchDb::new(
+            &url,
+            user.as_deref(),
+            pass.as_deref(),
+            &db_name,
+            &remote_path,
+        )
+        .await?;
+
+        let mut old_doc = couchdb
+            .get_file(&old_remote)
+            .await?
+            .expect("missing remote doc for old.txt");
+
+        let now = now_ms();
+        let mut new_doc = old_doc.clone();
+        new_doc.id = new_remote.clone();
+        new_doc.rev = None;
+        new_doc.path = new_remote.clone();
+        new_doc.mtime = now;
+        new_doc.deleted = false;
+        couchdb.save_file(&mut new_doc).await?;
+
+        cleanup_chunks.extend(old_doc.children.clone());
+        cleanup_chunks.extend(new_doc.children.clone());
+
+        old_doc.deleted = true;
+        old_doc.mtime = now;
+        couchdb.save_file(&mut old_doc).await?;
+
+        let local_db = LocalDb::open(&state_db)?;
+        let couchdb = CouchDb::new(
+            &url,
+            user.as_deref(),
+            pass.as_deref(),
+            &db_name,
+            &remote_path,
+        )
+        .await?;
+        let mut engine = SyncEngine::new(couchdb, local_db, test_dir.path.clone());
+        engine.sync().await?;
+
+        let new_local = test_dir.join("new.txt");
+        assert!(!old_local.exists(), "old local file should be removed");
+        assert!(new_local.exists(), "new local file should exist");
+        assert_eq!(fs::read_to_string(&new_local)?, "hello\n");
+
+        Ok(())
+    }
+    .await;
+
+    let cleanup_docs = dedup_strings(cleanup_docs);
+    let cleanup_chunks = dedup_strings(cleanup_chunks);
+    if let Err(err) = cleanup_remote(
+        &url,
+        &db_name,
+        user.as_deref(),
+        pass.as_deref(),
+        &remote_path,
+        &cleanup_docs,
+        &cleanup_chunks,
+    )
+    .await
+    {
+        eprintln!("cleanup failed: {}", err);
+    }
+
+    test_result
+}
+
+fn test_db_config() -> (String, String, Option<String>, Option<String>, String) {
+    let url = env_or("COUCHFS_TEST_DB_URL", "http://localhost:5984");
+    let db_name = env_or("COUCHFS_TEST_DB_NAME", "couchfs_move_test");
+    let mut remote_path = env::var("COUCHFS_TEST_REMOTE_PATH")
+        .unwrap_or_else(|_| format!("remote-move-test-{}", unique_suffix()));
+    if !remote_path.is_empty() && !remote_path.ends_with('/') {
+        remote_path.push('/');
+    }
+
+    let user = env_opt("COUCHFS_TEST_DB_USER", Some("admin"));
+    let pass = env_opt("COUCHFS_TEST_DB_PASS", Some("password"));
+    let (user, pass) = match (user, pass) {
+        (Some(u), Some(p)) => (Some(u), Some(p)),
+        _ => (None, None),
+    };
+
+    (url, db_name, user, pass, remote_path)
+}
+
+fn env_or(key: &str, default: &str) -> String {
+    env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+fn env_opt(key: &str, default: Option<&str>) -> Option<String> {
+    match env::var(key) {
+        Ok(v) if !v.is_empty() => Some(v),
+        Ok(_) => None,
+        Err(_) => default.map(|d| d.to_string()),
+    }
+}
+
+fn unique_suffix() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .to_string()
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn dedup_strings(items: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    items
+        .into_iter()
+        .filter(|item| seen.insert(item.clone()))
+        .collect()
+}
+
+async fn cleanup_remote(
+    url: &str,
+    db_name: &str,
+    user: Option<&str>,
+    pass: Option<&str>,
+    remote_path: &str,
+    doc_ids: &[String],
+    chunk_ids: &[String],
+) -> Result<()> {
+    let couchdb = CouchDb::new(url, user, pass, db_name, remote_path).await?;
+    if !chunk_ids.is_empty() {
+        couchdb.delete_chunks(chunk_ids).await?;
+    }
+    for doc_id in doc_ids {
+        let _ = couchdb.delete_file(doc_id).await;
+    }
+    Ok(())
+}

@@ -21,7 +21,11 @@ impl TelegramNotifier {
     }
 
     /// Send notification for multiple new conflicts (single message per sync run)
-    pub async fn notify_new_conflicts(&self, conflicts: &[&Conflict], sync_dir: &str) -> Result<()> {
+    pub async fn notify_new_conflicts(
+        &self,
+        conflicts: &[&Conflict],
+        sync_dir: &str,
+    ) -> Result<()> {
         if conflicts.is_empty() {
             return Ok(());
         }
@@ -45,7 +49,10 @@ impl TelegramNotifier {
         );
 
         self.send_message(&message).await?;
-        debug!("Sent Telegram notification for {} conflicts", conflicts.len());
+        debug!(
+            "Sent Telegram notification for {} conflicts",
+            conflicts.len()
+        );
         Ok(())
     }
 

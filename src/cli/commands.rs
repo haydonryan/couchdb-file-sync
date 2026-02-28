@@ -216,7 +216,10 @@ async fn notify_conflicts_telegram(
 
 /// Run continuous sync daemon
 pub async fn daemon(paths: Vec<SyncPath>, config: AppConfig, interval: u64) -> Result<()> {
-    let path_list: Vec<_> = paths.iter().map(|p| p.local.display().to_string()).collect();
+    let path_list: Vec<_> = paths
+        .iter()
+        .map(|p| p.local.display().to_string())
+        .collect();
     info!("Starting CouchFS daemon for: {}", path_list.join(", "));
     println!("CouchFS daemon started (interval: {}s)", interval);
     println!("Syncing {} path(s): {}", paths.len(), path_list.join(", "));
@@ -292,27 +295,25 @@ pub async fn conflicts(path: PathBuf, json: bool) -> Result<()> {
 
     if json {
         println!("{}", serde_json::to_string_pretty(&conflicts)?);
+    } else if conflicts.is_empty() {
+        println!("No conflicts found ✓");
     } else {
-        if conflicts.is_empty() {
-            println!("No conflicts found ✓");
-        } else {
-            println!("Conflicts ({}):", conflicts.len());
-            for conflict in conflicts {
-                println!("  • {}", conflict.path);
-                println!(
-                    "    Local:  {} (modified: {})",
-                    &conflict.local_state.hash[..8.min(conflict.local_state.hash.len())],
-                    conflict.local_state.modified_at.format("%Y-%m-%d %H:%M")
-                );
-                println!(
-                    "    Remote: {} (modified: {})",
-                    &conflict.remote_state.hash[..8.min(conflict.remote_state.hash.len())],
-                    conflict.remote_state.modified_at.format("%Y-%m-%d %H:%M")
-                );
-                println!();
-            }
-            println!("Resolve with: couchfs resolve");
+        println!("Conflicts ({}):", conflicts.len());
+        for conflict in conflicts {
+            println!("  • {}", conflict.path);
+            println!(
+                "    Local:  {} (modified: {})",
+                &conflict.local_state.hash[..8.min(conflict.local_state.hash.len())],
+                conflict.local_state.modified_at.format("%Y-%m-%d %H:%M")
+            );
+            println!(
+                "    Remote: {} (modified: {})",
+                &conflict.remote_state.hash[..8.min(conflict.remote_state.hash.len())],
+                conflict.remote_state.modified_at.format("%Y-%m-%d %H:%M")
+            );
+            println!();
         }
+        println!("Resolve with: couchfs resolve");
     }
 
     Ok(())
@@ -344,15 +345,8 @@ pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
     println!("Found {} conflict(s) to resolve:\n", conflicts.len());
 
     for (i, conflict) in conflicts.iter().enumerate() {
-        println!(
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        );
-        println!(
-            "Conflict {}/{}: {}",
-            i + 1,
-            conflicts.len(),
-            conflict.path
-        );
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("Conflict {}/{}: {}", i + 1, conflicts.len(), conflict.path);
         println!(
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         );
@@ -366,7 +360,10 @@ pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
         println!(
             "Remote: {} bytes, modified {}\n",
             conflict.remote_state.size,
-            conflict.remote_state.modified_at.format("%Y-%m-%d %H:%M:%S")
+            conflict
+                .remote_state
+                .modified_at
+                .format("%Y-%m-%d %H:%M:%S")
         );
 
         // Read local content
@@ -392,7 +389,12 @@ pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
         print_side_by_side_diff(&local_content, &remote_content);
 
         // Ask user for action
-        let options = &["Keep Local", "Keep Remote", "Keep Both (merge manually)", "Skip"];
+        let options = &[
+            "Keep Local",
+            "Keep Remote",
+            "Keep Both (merge manually)",
+            "Skip",
+        ];
         let selection = Select::with_theme(&ColorfulTheme::default())
             .with_prompt("How do you want to resolve this conflict?")
             .items(options)
@@ -441,12 +443,7 @@ fn print_side_by_side_diff(local: &str, remote: &str) {
     let width = 38; // Width for each side
 
     println!("{:─<width$}┬{:─<width$}", "", "", width = width + 2);
-    println!(
-        " {:^width$} │ {:^width$}",
-        "LOCAL",
-        "REMOTE",
-        width = width
-    );
+    println!(" {:^width$} │ {:^width$}", "LOCAL", "REMOTE", width = width);
     println!("{:─<width$}┼{:─<width$}", "", "", width = width + 2);
 
     for change in diff.iter_all_changes() {
@@ -454,7 +451,12 @@ fn print_side_by_side_diff(local: &str, remote: &str) {
         match change.tag() {
             ChangeTag::Equal => {
                 let truncated = truncate_str(line, width);
-                println!(" {:<width$} │ {:<width$}", truncated, truncated, width = width);
+                println!(
+                    " {:<width$} │ {:<width$}",
+                    truncated,
+                    truncated,
+                    width = width
+                );
             }
             ChangeTag::Delete => {
                 // Line only in local (deleted from remote's perspective)
