@@ -58,15 +58,15 @@ impl SyncEngine {
         }
 
         // 3. Detect conflicts
-        let (clean_local, clean_remote, conflicts) = self
+        let (local_to_upload, remote_to_apply, conflicts) = self
             .detect_conflicts(&local_changes, &remote_changes)
             .await?;
 
         report.conflicts = conflicts.len();
 
         info!("After analysis:");
-        info!("  - Files to upload: {}", clean_local.len());
-        info!("  - Files to download: {}", clean_remote.len());
+        info!("  - Files to upload: {}", local_to_upload.len());
+        info!("  - Files to download: {}", remote_to_apply.len());
         info!("  - Conflicts: {}", conflicts.len());
 
         // 4. Store conflicts
@@ -78,9 +78,9 @@ impl SyncEngine {
         // 5. Apply clean local changes to remote
         info!(
             "========== UPLOADING {} FILES ==========",
-            clean_local.len()
+            local_to_upload.len()
         );
-        for change in clean_local {
+        for change in local_to_upload {
             debug!(
                 "  Preparing to upload: {} -> {}",
                 change.path,
@@ -105,9 +105,9 @@ impl SyncEngine {
         // 6. Apply clean remote changes to local
         info!(
             "========== DOWNLOADING {} FILES ==========",
-            clean_remote.len()
+            remote_to_apply.len()
         );
-        for change in clean_remote {
+        for change in remote_to_apply {
             debug!(
                 "  Preparing to download: {} -> {}",
                 change.path,
@@ -204,8 +204,8 @@ impl SyncEngine {
         let local_map: HashMap<_, _> = local_changes.iter().map(|c| (&c.path, c)).collect();
         let remote_map: HashMap<_, _> = remote_changes.iter().map(|c| (&c.path, c)).collect();
 
-        let mut clean_local = Vec::new();
-        let mut clean_remote = Vec::new();
+        let mut local_to_upload = Vec::new();
+        let mut remote_to_apply = Vec::new();
         let mut conflicts = Vec::new();
 
         debug!(
@@ -221,7 +221,7 @@ impl SyncEngine {
 
             if lc.change_type == ChangeType::Deleted {
                 debug!("  Local delete, skipping remote content comparison");
-                clean_local.push(lc.clone());
+                local_to_upload.push(lc.clone());
                 debug!("");
                 continue;
             }
@@ -377,7 +377,7 @@ impl SyncEngine {
                 }
             } else {
                 info!("  [UPLOAD] {} - remote unchanged, queuing for upload", lc.path);
-                clean_local.push(lc.clone());
+                local_to_upload.push(lc.clone());
             }
             debug!("");
         }
@@ -402,7 +402,7 @@ impl SyncEngine {
                 let has_state = self.local_db.get_file_state(&local_path)?.is_some();
                 if file_path.exists() || has_state {
                     debug!("  Remote deleted, scheduling local delete");
-                    clean_remote.push(rc.clone());
+                    remote_to_apply.push(rc.clone());
                 } else {
                     debug!("  Remote deleted, no local file/state, skipping");
                 }
@@ -458,7 +458,7 @@ impl SyncEngine {
 
             if should_download {
                 debug!("  => Remote is newer, will download chunked file");
-                clean_remote.push(rc.clone());
+                remote_to_apply.push(rc.clone());
             } else {
                 debug!("  => Skipping (already in sync)");
             }
@@ -466,11 +466,11 @@ impl SyncEngine {
         }
 
         debug!("========== ANALYSIS COMPLETE ==========");
-        debug!("  Uploads queued: {}", clean_local.len());
-        debug!("  Downloads queued: {}", clean_remote.len());
+        debug!("  Uploads queued: {}", local_to_upload.len());
+        debug!("  Downloads queued: {}", remote_to_apply.len());
         debug!("  Conflicts found: {}", conflicts.len());
 
-        Ok((clean_local, clean_remote, conflicts))
+        Ok((local_to_upload, remote_to_apply, conflicts))
     }
 
     /// Get local file state
@@ -652,17 +652,18 @@ impl SyncEngine {
 
     /// Apply a change to the local filesystem
     async fn apply_to_filesystem(&mut self, change: &Change) -> Result<()> {
-        let local_path = self.couchdb.get_local_path(&change.path);
+        let remote_path = change.path.as_str();
+        let local_path = self.couchdb.get_local_path(remote_path);
         let relative_path = local_path.trim_start_matches('/');
         let file_path = self.root_dir.join(relative_path);
 
         debug!("[DOWNLOAD] Remote is newer, downloading chunked file");
-        debug!("[DOWNLOAD] {} -> {}", change.path, local_path);
+        debug!("[DOWNLOAD] {} -> {}", remote_path, local_path);
 
         match change.change_type {
             ChangeType::Created | ChangeType::Modified => {
                 if let Some(bytes) =
-                    self.download_remote_file(&change.path, &local_path, false).await?
+                    self.download_remote_file(remote_path, &local_path, false).await?
                 {
                     info!(
                         "[DOWNLOAD] Chunked file downloaded: {} ({} bytes)",
@@ -673,13 +674,13 @@ impl SyncEngine {
             ChangeType::Deleted => {
                 debug!(
                     "[LOCAL DELETE] Remote: {}, Local: {:?}",
-                    change.path, file_path
+                    remote_path, file_path
                 );
                 if file_path.exists() {
                     tokio::fs::remove_file(&file_path).await?;
                 }
                 self.local_db.delete_file_state(&local_path)?;
-                info!("[LOCAL DELETE] SUCCESS: {} -> {}", change.path, local_path);
+                info!("[LOCAL DELETE] SUCCESS: {} -> {}", remote_path, local_path);
             }
         }
         Ok(())
