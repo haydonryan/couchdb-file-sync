@@ -1,0 +1,16 @@
+# Test couchdb server
+
+services:
+  couchdb:
+    image: couchdb
+    container_name: obsidian-livesync
+    environment:
+      - COUCHDB_USER=admin              # enter the desired CouchDB admin username
+      - COUCHDB_PASSWORD=password       # enter the desired CouchDB admin password
+    volumes:
+      - ./_docker/obsidian-livesync/data:/opt/couchdb/data
+      - ./_docker/obsidian-livesync/local.ini:/opt/couchdb/etc/local.ini
+    ports:
+      - 5984:5984
+    restart: unless-stopped
+    #network_mode: "bridge"
