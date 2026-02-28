@@ -569,6 +569,59 @@ impl SyncEngine {
         Ok((content.len(), doc.rev))
     }
 
+    async fn download_remote_file(
+        &mut self,
+        remote_path: &str,
+        local_path: &str,
+        require_doc: bool,
+    ) -> Result<Option<usize>> {
+        let doc = match self.couchdb.fetch_metadata(remote_path).await? {
+            Some(d) => d,
+            None => {
+                if require_doc {
+                    anyhow::bail!("Document not found in CouchDB: {}", remote_path);
+                }
+                warn!("Document not found in CouchDB: {}", remote_path);
+                return Ok(None);
+            }
+        };
+
+        let relative_path = local_path.trim_start_matches('/');
+        let file_path = self.root_dir.join(relative_path);
+        if let Some(parent) = file_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        debug!("[DOWNLOAD] Downloading {} chunks...", doc.children.len());
+        let content = match self.couchdb.get_file_content(remote_path).await {
+            Ok(data) => {
+                debug!("[DOWNLOAD] Downloaded {} bytes from chunks", data.len());
+                data
+            }
+            Err(e) => {
+                debug!("No content for {}: {}, using empty file", remote_path, e);
+                Vec::new()
+            }
+        };
+
+        tokio::fs::write(&file_path, &content).await?;
+        debug!("[DOWNLOAD] Wrote {} bytes to disk", content.len());
+
+        let hash = compute_file_hash(&file_path)?;
+        let metadata = std::fs::metadata(&file_path)?;
+        let state = FileState {
+            path: local_path.to_string(),
+            hash,
+            size: metadata.len(),
+            modified_at: metadata.modified()?.into(),
+            couch_rev: doc.rev.clone(),
+            last_sync_at: Utc::now(),
+        };
+        self.local_db.save_file_state(&state)?;
+
+        Ok(Some(content.len()))
+    }
+
     /// Apply a change to CouchDB
     async fn apply_to_couchdb(&mut self, change: &Change) -> Result<()> {
         let remote_path = self.couchdb.get_remote_path(&change.path);
@@ -608,53 +661,14 @@ impl SyncEngine {
 
         match change.change_type {
             ChangeType::Created | ChangeType::Modified => {
-                // Fetch metadata first
-                let doc = match self.couchdb.fetch_metadata(&change.path).await? {
-                    Some(d) => d,
-                    None => {
-                        warn!("Document not found in CouchDB: {}", change.path);
-                        return Ok(());
-                    }
-                };
-
-                if let Some(parent) = file_path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
+                if let Some(bytes) =
+                    self.download_remote_file(&change.path, &local_path, false).await?
+                {
+                    info!(
+                        "[DOWNLOAD] Chunked file downloaded: {} ({} bytes)",
+                        local_path, bytes
+                    );
                 }
-
-                // Now download the chunked content
-                debug!("[DOWNLOAD] Downloading {} chunks...", doc.children.len());
-                let content = match self.couchdb.get_file_content(&change.path).await {
-                    Ok(data) => {
-                        debug!("[DOWNLOAD] Downloaded {} bytes from chunks", data.len());
-                        data
-                    }
-                    Err(e) => {
-                        debug!("No content for {}: {}, using empty file", change.path, e);
-                        Vec::new()
-                    }
-                };
-
-                tokio::fs::write(&file_path, &content).await?;
-                debug!("[DOWNLOAD] Wrote {} bytes to disk", content.len());
-
-                let hash = compute_file_hash(&file_path)?;
-                let metadata = std::fs::metadata(&file_path)?;
-
-                let state = FileState {
-                    path: local_path.clone(),
-                    hash,
-                    size: metadata.len(),
-                    modified_at: metadata.modified()?.into(),
-                    couch_rev: doc.rev.clone(),
-                    last_sync_at: Utc::now(),
-                };
-                self.local_db.save_file_state(&state)?;
-
-                info!(
-                    "[DOWNLOAD] Chunked file downloaded: {} ({} bytes)",
-                    local_path,
-                    content.len()
-                );
             }
             ChangeType::Deleted => {
                 debug!(
@@ -716,76 +730,19 @@ impl SyncEngine {
             }
             ResolutionStrategy::KeepRemote => {
                 // Force download remote version
-                let doc = match self.couchdb.get_file(&remote_path).await? {
-                    Some(d) => d,
-                    None => anyhow::bail!("Document not found: {}", remote_path),
-                };
-
-                let file_path = self.root_dir.join(local_path);
-                if let Some(parent) = file_path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-
-                // Download file content from CouchDB
-                let content = self
-                    .couchdb
-                    .get_file_content(&remote_path)
-                    .await
-                    .unwrap_or_default();
-                tokio::fs::write(&file_path, &content).await?;
-
-                // Update local state
-                let hash = compute_file_hash(&file_path)?;
-                let metadata = std::fs::metadata(&file_path)?;
-                let state = FileState {
-                    path: local_path.to_string(),
-                    hash,
-                    size: metadata.len(),
-                    modified_at: metadata.modified()?.into(),
-                    couch_rev: doc.rev,
-                    last_sync_at: Utc::now(),
-                };
-                self.local_db.save_file_state(&state)?;
-
+                self.download_remote_file(&remote_path, local_path, true)
+                    .await?;
                 info!("Resolved conflict (keep-remote): {}", local_path);
             }
             ResolutionStrategy::KeepBoth => {
                 // Save remote as .remote file
-                let doc = match self.couchdb.get_file(&remote_path).await? {
-                    Some(d) => d,
-                    None => anyhow::bail!("Document not found: {}", remote_path),
-                };
-
                 let local_remote_path = format!("{}.remote", local_path);
-                let file_path = self.root_dir.join(&local_remote_path);
-                if let Some(parent) = file_path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-
-                // Download file content from CouchDB
-                let content = self
-                    .couchdb
-                    .get_file_content(&remote_path)
-                    .await
-                    .unwrap_or_default();
-                tokio::fs::write(&file_path, &content).await?;
+                self.download_remote_file(&remote_path, &local_remote_path, true)
+                    .await?;
                 info!("Saved remote version as: {}", local_remote_path);
 
                 // Local file stays as-is
                 // User can manually merge/compare
-
-                // Update local state for remote file
-                let hash = compute_file_hash(&file_path)?;
-                let metadata = std::fs::metadata(&file_path)?;
-                let state = FileState {
-                    path: local_remote_path,
-                    hash,
-                    size: metadata.len(),
-                    modified_at: metadata.modified()?.into(),
-                    couch_rev: doc.rev,
-                    last_sync_at: Utc::now(),
-                };
-                self.local_db.save_file_state(&state)?;
             }
             ResolutionStrategy::Skip => {
                 // Do nothing, leave conflict for later
