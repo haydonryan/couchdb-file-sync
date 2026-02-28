@@ -493,6 +493,82 @@ impl SyncEngine {
         ))
     }
 
+    async fn upload_local_file(
+        &mut self,
+        local_path: &str,
+        remote_path: &str,
+    ) -> Result<(usize, Option<String>)> {
+        let relative_path = local_path.trim_start_matches('/');
+        let file_path = self.root_dir.join(relative_path);
+        let metadata = std::fs::metadata(&file_path)?;
+        let mtime = metadata
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        debug!("[UPLOAD] File path: {:?}", file_path);
+        debug!("[UPLOAD] Size: {} bytes", metadata.len());
+        debug!("[UPLOAD] mtime: {} ms", mtime);
+
+        let content = tokio::fs::read(&file_path).await?;
+        debug!("[UPLOAD] Read {} bytes from disk", content.len());
+
+        let new_chunk_ids = self.couchdb.upload_file_content(&content).await?;
+        debug!(
+            "[UPLOAD] Uploaded content, got {} chunks",
+            new_chunk_ids.len()
+        );
+
+        let (existing_rev, existing_ctime, old_chunk_ids) =
+            match self.couchdb.get_file(remote_path).await? {
+                Some(existing) => {
+                    debug!("[UPLOAD] Existing doc found, rev: {:?}", existing.rev);
+                    debug!("[UPLOAD] Existing ctime: {} ms", existing.ctime);
+                    debug!("[UPLOAD] Existing chunks: {}", existing.children.len());
+                    (existing.rev, existing.ctime, existing.children)
+                }
+                None => {
+                    debug!("[UPLOAD] No existing doc, creating new");
+                    (None, mtime, Vec::new())
+                }
+            };
+
+        let mut doc = crate::models::FileDoc {
+            id: remote_path.to_string(),
+            rev: existing_rev,
+            children: new_chunk_ids,
+            path: remote_path.to_string(),
+            ctime: existing_ctime,
+            mtime,
+            size: metadata.len(),
+            doc_type: "plain".to_string(),
+            deleted: false,
+        };
+
+        self.couchdb.save_file(&mut doc).await?;
+        debug!("[UPLOAD] Saved doc, new rev: {:?}", doc.rev);
+
+        if !old_chunk_ids.is_empty() {
+            debug!("[UPLOAD] Deleting {} old chunks", old_chunk_ids.len());
+            self.couchdb.delete_chunks(&old_chunk_ids).await?;
+        }
+
+        let hash = compute_file_hash(&file_path)?;
+        let state = FileState {
+            path: local_path.to_string(),
+            hash,
+            size: metadata.len(),
+            modified_at: metadata.modified()?.into(),
+            couch_rev: doc.rev.clone(),
+            last_sync_at: Utc::now(),
+        };
+        self.local_db.save_file_state(&state)?;
+        debug!("[UPLOAD] Updated local state with rev: {:?}", doc.rev);
+
+        Ok((content.len(), doc.rev))
+    }
+
     /// Apply a change to CouchDB
     async fn apply_to_couchdb(&mut self, change: &Change) -> Result<()> {
         let remote_path = self.couchdb.get_remote_path(&change.path);
@@ -501,80 +577,13 @@ impl SyncEngine {
 
         match change.change_type {
             ChangeType::Created | ChangeType::Modified => {
-                let relative_path = change.path.trim_start_matches('/');
-                let file_path = self.root_dir.join(relative_path);
-                let metadata = std::fs::metadata(&file_path)?;
-                let mtime = metadata
-                    .modified()?
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-
-                debug!("[UPLOAD] File path: {:?}", file_path);
-                debug!("[UPLOAD] Size: {} bytes", metadata.len());
-                debug!("[UPLOAD] mtime: {} ms", mtime);
-
-                let content = tokio::fs::read(&file_path).await?;
-                debug!("[UPLOAD] Read {} bytes from disk", content.len());
-
-                let new_chunk_ids = self.couchdb.upload_file_content(&content).await?;
-                debug!(
-                    "[UPLOAD] Uploaded content, got {} chunks",
-                    new_chunk_ids.len()
-                );
-
-                let (existing_rev, existing_ctime, old_chunk_ids) =
-                    match self.couchdb.get_file(&remote_path).await? {
-                        Some(existing) => {
-                            debug!("[UPLOAD] Existing doc found, rev: {:?}", existing.rev);
-                            debug!("[UPLOAD] Existing ctime: {} ms", existing.ctime);
-                            debug!("[UPLOAD] Existing chunks: {}", existing.children.len());
-                            (existing.rev, existing.ctime, existing.children)
-                        }
-                        None => {
-                            debug!("[UPLOAD] No existing doc, creating new");
-                            (None, mtime, Vec::new())
-                        }
-                    };
-
-                let mut doc = crate::models::FileDoc {
-                    id: remote_path.clone(),
-                    rev: existing_rev,
-                    children: new_chunk_ids,
-                    path: remote_path.clone(),
-                    ctime: existing_ctime,
-                    mtime,
-                    size: metadata.len(),
-                    doc_type: "plain".to_string(),
-                    deleted: false,
-                };
-
-                self.couchdb.save_file(&mut doc).await?;
-                debug!("[UPLOAD] Saved doc, new rev: {:?}", doc.rev);
-
-                if !old_chunk_ids.is_empty() {
-                    debug!("[UPLOAD] Deleting {} old chunks", old_chunk_ids.len());
-                    self.couchdb.delete_chunks(&old_chunk_ids).await?;
-                }
-
-                let new_rev = doc.rev.clone();
-                let hash = compute_file_hash(&file_path)?;
-                let state = FileState {
-                    path: change.path.clone(),
-                    hash,
-                    size: metadata.len(),
-                    modified_at: metadata.modified()?.into(),
-                    couch_rev: new_rev.clone(),
-                    last_sync_at: Utc::now(),
-                };
-                self.local_db.save_file_state(&state)?;
-                debug!("[UPLOAD] Updated local state with rev: {:?}", new_rev);
-
+                let (bytes_uploaded, new_rev) =
+                    self.upload_local_file(&change.path, &remote_path).await?;
                 info!(
                     "[UPLOAD] SUCCESS: {} -> {} ({} bytes, rev: {:?})",
                     change.path,
                     remote_path,
-                    content.len(),
+                    bytes_uploaded,
                     new_rev
                 );
             }
@@ -699,57 +708,11 @@ impl SyncEngine {
         match strategy {
             ResolutionStrategy::KeepLocal => {
                 // Force upload local version to remote
-                let file_path = self.root_dir.join(local_path);
-                let metadata = std::fs::metadata(&file_path)?;
-                let mtime = metadata
-                    .modified()?
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-
-                // Read local file content and upload as chunks
-                let content = tokio::fs::read(&file_path).await?;
-                let new_chunk_ids = self.couchdb.upload_file_content(&content).await?;
-
-                // Get existing revision and old chunks
-                let (existing_rev, existing_ctime, old_chunk_ids) =
-                    match self.couchdb.get_file(&remote_path).await? {
-                        Some(existing) => (existing.rev, existing.ctime, existing.children),
-                        None => (None, mtime, Vec::new()),
-                    };
-
-                let mut doc = crate::models::FileDoc {
-                    id: remote_path.clone(),
-                    rev: existing_rev,
-                    children: new_chunk_ids,
-                    path: remote_path.clone(),
-                    ctime: existing_ctime,
-                    mtime,
-                    size: metadata.len(),
-                    doc_type: "plain".to_string(),
-                    deleted: false,
-                };
-
-                self.couchdb.save_file(&mut doc).await?;
-
-                // Delete old chunks
-                if !old_chunk_ids.is_empty() {
-                    self.couchdb.delete_chunks(&old_chunk_ids).await?;
-                }
-
-                // Update local state with new revision
-                let hash = compute_file_hash(&file_path)?;
-                let state = FileState {
-                    path: local_path.to_string(),
-                    hash,
-                    size: metadata.len(),
-                    modified_at: metadata.modified()?.into(),
-                    couch_rev: doc.rev.clone(),
-                    last_sync_at: Utc::now(),
-                };
-                self.local_db.save_file_state(&state)?;
-
-                info!("Resolved conflict (keep-local): {} - uploaded to remote", local_path);
+                self.upload_local_file(local_path, &remote_path).await?;
+                info!(
+                    "Resolved conflict (keep-local): {} - uploaded to remote",
+                    local_path
+                );
             }
             ResolutionStrategy::KeepRemote => {
                 // Force download remote version
