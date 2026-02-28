@@ -147,26 +147,36 @@ async fn main() -> Result<()> {
         Commands::Sync { path, dry_run } => {
             let paths = resolve_paths(path, &config);
             if paths.is_empty() {
-                anyhow::bail!("No sync paths configured. Specify a path or add paths to couchfs.yaml");
+                anyhow::bail!(
+                    "No sync paths configured. Specify a path or add paths to couchfs.yaml"
+                );
             }
             for sync_path in paths {
                 let mut path_config = config.clone();
                 path_config.couchdb.remote_path = sync_path.remote;
-                info!("Syncing: {} -> {}", sync_path.local.display(), path_config.couchdb.remote_path);
+                info!(
+                    "Syncing: {} -> {}",
+                    sync_path.local.display(),
+                    path_config.couchdb.remote_path
+                );
                 cli::sync(sync_path.local, path_config, dry_run).await?;
             }
         }
         Commands::Daemon { path, interval } => {
             let paths = resolve_paths(path, &config);
             if paths.is_empty() {
-                anyhow::bail!("No sync paths configured. Specify a path or add paths to couchfs.yaml");
+                anyhow::bail!(
+                    "No sync paths configured. Specify a path or add paths to couchfs.yaml"
+                );
             }
             cli::daemon(paths, config, interval).await?;
         }
         Commands::Conflicts { path, json } => {
             let paths = resolve_paths(path, &config);
             if paths.is_empty() {
-                anyhow::bail!("No sync paths configured. Specify a path or add paths to couchfs.yaml");
+                anyhow::bail!(
+                    "No sync paths configured. Specify a path or add paths to couchfs.yaml"
+                );
             }
             let multi = paths.len() > 1;
             for sync_path in &paths {
@@ -179,7 +189,9 @@ async fn main() -> Result<()> {
         Commands::Resolve { path } => {
             let paths = resolve_paths(path, &config);
             if paths.is_empty() {
-                anyhow::bail!("No sync paths configured. Specify a path or add paths to couchfs.yaml");
+                anyhow::bail!(
+                    "No sync paths configured. Specify a path or add paths to couchfs.yaml"
+                );
             }
             let multi = paths.len() > 1;
             for sync_path in &paths {
@@ -194,7 +206,9 @@ async fn main() -> Result<()> {
         Commands::Status { path, json } => {
             let paths = resolve_paths(path, &config);
             if paths.is_empty() {
-                anyhow::bail!("No sync paths configured. Specify a path or add paths to couchfs.yaml");
+                anyhow::bail!(
+                    "No sync paths configured. Specify a path or add paths to couchfs.yaml"
+                );
             }
             let multi = paths.len() > 1;
             for sync_path in &paths {
