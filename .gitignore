@@ -8,3 +8,4 @@ Cargo.lock
 _docker/
 move-test-local/
 _testdata/
+couchfs.yaml
