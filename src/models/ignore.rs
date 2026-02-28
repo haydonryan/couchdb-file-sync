@@ -1,12 +1,11 @@
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{Glob, GlobMatcher};
 use std::path::Path;
 use tracing::{debug, warn};
 
 /// Manages ignore patterns from .sync-ignore files
 #[derive(Debug, Clone)]
 pub struct IgnoreMatcher {
-    glob_set: GlobSet,
-    patterns: Vec<(String, bool)>, // (pattern, is_negation)
+    patterns: Vec<(GlobMatcher, bool)>, // (matcher, is_negation)
 }
 
 impl Default for IgnoreMatcher {
@@ -19,7 +18,6 @@ impl IgnoreMatcher {
     /// Create an empty matcher (ignores nothing)
     pub fn empty() -> Self {
         Self {
-            glob_set: GlobSetBuilder::new().build().unwrap(),
             patterns: Vec::new(),
         }
     }
@@ -32,7 +30,6 @@ impl IgnoreMatcher {
 
     /// Parse patterns from string content
     pub fn from_content(content: &str) -> Self {
-        let mut builder = GlobSetBuilder::new();
         let mut patterns = Vec::new();
 
         for line in content.lines() {
@@ -61,20 +58,11 @@ impl IgnoreMatcher {
                 }
             };
 
-            builder.add(glob);
-            patterns.push((line.to_string(), is_negation));
+            patterns.push((glob.compile_matcher(), is_negation));
             debug!("Added ignore pattern: {} (negation: {})", line, is_negation);
         }
 
-        let glob_set = match builder.build() {
-            Ok(set) => set,
-            Err(e) => {
-                warn!("Failed to build glob set: {}", e);
-                GlobSetBuilder::new().build().unwrap()
-            }
-        };
-
-        Self { glob_set, patterns }
+        Self { patterns }
     }
 
     /// Convert a gitignore-style pattern to a glob pattern
@@ -108,17 +96,8 @@ impl IgnoreMatcher {
     pub fn is_ignored(&self, path: &str, _is_dir: bool) -> bool {
         let mut ignored = false;
 
-        for (pattern, is_negation) in &self.patterns {
-            // Extract the pattern without negation prefix for matching
-            let _pattern_to_match = if *is_negation {
-                &pattern[1..].trim()
-            } else {
-                pattern.as_str()
-            };
-
-            let matches = self.glob_set.is_match(path);
-
-            if matches {
+        for (matcher, is_negation) in &self.patterns {
+            if matcher.is_match(path) {
                 ignored = !is_negation;
             }
         }
