@@ -5,3 +5,6 @@ Cargo.lock
 *.db
 *.remote
 .DS_Store
+_docker/
+move-test-local/
+_testdata/
