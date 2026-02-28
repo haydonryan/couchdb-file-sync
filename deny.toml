@@ -1,0 +1,19 @@
+[advisories]
+# Allow unmaintained advisory for instant until upstream moves off it.
+ignore = ["RUSTSEC-2024-0384"]
+
+[licenses]
+allow = [
+  "Apache-2.0",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "CC0-1.0",
+  "ISC",
+  "MPL-2.0",
+  "Zlib",
+  "Unicode-3.0",
+  "0BSD",
+  "Unlicense",
+]
+confidence-threshold = 0.8
