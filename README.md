@@ -7,15 +7,17 @@ A Rust-based filesystem-to-CouchDB synchronization engine with bidirectional syn
 
 ## Features
 
-- **Bidirectional Sync**: Changes on either side propagate to the other
-- **Conflict Detection**: Automatically detects when files change on both sides
-- **Conflict Resolution**: CLI commands to resolve conflicts with multiple strategies
-- **Smart Ignore Patterns**: Gitignore-style `.sync-ignore` file support
-- **Telegram Notifications**: Get notified when conflicts are detected
-- **Flexible Configuration**: CLI args, YAML config, and environment variables
-- **Conflict File Preservation (optional)**: Keep-both resolution saves remote file as `filename.remote`
-- **Live Mode**: Optional filesystem watcher + CouchDB changes feed for low-latency sync
-- **Detailed Sync Logs**: `sync` and `daemon` write detailed logs to `/tmp/couchfs.logs` (override via `logging.file`)
+| Status | Feature | Description |
+| --- | --- | --- |
+| ✅ | **Bidirectional Sync** | Changes on either side propagate to the other |
+| ✅ | **Conflict Detection** | Automatically detects when files change on both sides |
+| ⚠️ | **Conflict Resolution** | CLI commands to resolve conflicts with multiple strategies |
+| ✅ | **Smart Ignore Patterns** | Gitignore-style `.sync-ignore` file support |
+| ✅ | **Telegram Notifications** | Get notified when conflicts are detected |
+| ⚠️ | **Flexible Configuration** | CLI args, YAML config, and environment variables |
+| ⚠️ | **Conflict File Preservation (optional)** | Keep-both resolution saves remote file as `filename.remote` |
+| ❌ | **Live Mode** | Optional filesystem watcher + CouchDB changes feed for low-latency sync |
+| ⚠️ | **Detailed Sync Logs** | `sync` and `daemon` write detailed logs to `/tmp/couchfs.logs` (override via `logging.file`) |
 
 ## Installation
 
