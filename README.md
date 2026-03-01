@@ -11,6 +11,7 @@ A Rust-based filesystem-to-CouchDB synchronization engine with bidirectional syn
 - **Telegram Notifications**: Get notified when conflicts are detected
 - **Flexible Configuration**: CLI args, YAML config, and environment variables
 - **Conflict File Preservation**: Remote file saved as `filename.remote` during conflicts
+- **Live Mode**: Optional filesystem watcher + CouchDB changes feed for low-latency sync
 
 ## Installation
 
@@ -55,6 +56,13 @@ couchfs sync
 
 ```bash
 couchfs daemon --interval 60
+```
+
+For low-latency sync using a filesystem watcher and CouchDB changes feed:
+
+```bash
+couchfs sync
+couchfs daemon --live
 ```
 
 ## Configuration
@@ -121,6 +129,13 @@ Run continuous sync daemon.
 
 ```bash
 couchfs daemon ~/documents --interval 60
+```
+
+For live mode (watcher + changes feed):
+
+```bash
+couchfs sync
+couchfs daemon ~/documents --live
 ```
 
 ### `couchfs conflicts [PATH]`

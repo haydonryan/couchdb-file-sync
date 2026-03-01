@@ -3,6 +3,8 @@ use anyhow::Result;
 use couch_rs::database::Database;
 use couch_rs::Client;
 use reqwest::Client as HttpClient;
+use serde::Deserialize;
+use serde_json::Value;
 use tracing::{debug, warn};
 
 /// CouchDB client wrapper
@@ -12,9 +14,38 @@ pub struct CouchDb {
     db: Database,
     http_client: HttpClient,
     base_url: String,
+    db_name: String,
     auth: Option<(String, String)>,
     /// Remote path prefix to sync (e.g., "notes/" or "obsidian/")
     remote_path: String,
+}
+
+/// Entry from a CouchDB changes feed
+#[derive(Debug, Clone)]
+pub struct ChangeFeedEntry {
+    pub change: Change,
+    pub seq: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChangesResponse<T> {
+    results: Vec<ChangeRow<T>>,
+    last_seq: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChangeRow<T> {
+    id: String,
+    seq: Value,
+    deleted: Option<bool>,
+    doc: Option<T>,
+}
+
+fn seq_to_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        _ => value.to_string(),
+    }
 }
 
 impl CouchDb {
@@ -55,9 +86,75 @@ impl CouchDb {
             db,
             http_client: HttpClient::new(),
             base_url: url.to_string(),
+            db_name: db_name.to_string(),
             auth,
             remote_path,
         })
+    }
+
+    /// Fetch changes from CouchDB using the _changes feed (longpoll)
+    pub async fn get_changes_feed(
+        &self,
+        since: &str,
+        timeout_ms: u64,
+    ) -> Result<(Vec<ChangeFeedEntry>, String)> {
+        let base = self.base_url.trim_end_matches('/');
+        let url = format!("{}/{}/_changes", base, self.db_name);
+
+        let mut request = self.http_client.get(&url).query(&[
+            ("since", since),
+            ("include_docs", "true"),
+            ("feed", "longpoll"),
+            ("timeout", &timeout_ms.to_string()),
+        ]);
+
+        if let Some((username, password)) = &self.auth {
+            request = request.basic_auth(username, Some(password));
+        }
+
+        let response = request.send().await?.error_for_status()?;
+        let body = response.json::<ChangesResponse<FileDoc>>().await?;
+
+        let mut entries = Vec::new();
+        for row in body.results {
+            if !self.is_path_allowed(&row.id) {
+                continue;
+            }
+
+            if row.deleted.unwrap_or(false) {
+                entries.push(ChangeFeedEntry {
+                    change: Change::remote_deleted(row.id),
+                    seq: seq_to_string(&row.seq),
+                });
+                continue;
+            }
+
+            let doc = match row.doc {
+                Some(doc) => doc,
+                None => continue,
+            };
+
+            if !doc.is_file() {
+                continue;
+            }
+
+            if doc.deleted {
+                entries.push(ChangeFeedEntry {
+                    change: Change::remote_deleted(doc.id),
+                    seq: seq_to_string(&row.seq),
+                });
+                continue;
+            }
+
+            let mtime = doc.modified_at();
+            let rev = doc.rev.clone().unwrap_or_default();
+            entries.push(ChangeFeedEntry {
+                change: Change::remote_modified(doc.id, String::new(), doc.size, mtime, rev),
+                seq: seq_to_string(&row.seq),
+            });
+        }
+
+        Ok((entries, seq_to_string(&body.last_seq)))
     }
 
     /// Check if a path is within the configured remote path
