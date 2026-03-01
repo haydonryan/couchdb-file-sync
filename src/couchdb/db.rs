@@ -92,6 +92,11 @@ impl CouchDb {
         })
     }
 
+    async fn get_update_seq(&self) -> Result<String> {
+        let info = self.client.get_info(&self.db_name).await?;
+        Ok(info.update_seq)
+    }
+
     /// Fetch changes from CouchDB using the _changes feed (longpoll)
     pub async fn get_changes_feed(
         &self,
@@ -254,7 +259,7 @@ impl CouchDb {
         // The files will be handled as new files on the next sync
         if since.is_none() {
             debug!("No checkpoint found, returning empty changes list");
-            let seq = chrono::Utc::now().timestamp().to_string();
+            let seq = self.get_update_seq().await?;
             return Ok((Vec::new(), seq));
         }
 
@@ -290,8 +295,8 @@ impl CouchDb {
 
         debug!("Returning {} changes", changes.len());
 
-        // Return a simple sequence number (timestamp)
-        let seq = chrono::Utc::now().timestamp().to_string();
+        // Return the CouchDB update sequence so live sync can resume safely.
+        let seq = self.get_update_seq().await?;
         Ok((changes, seq))
     }
 
