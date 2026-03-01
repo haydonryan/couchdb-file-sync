@@ -111,9 +111,6 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize logging
-    init_logging(cli.verbose);
-
     // Load configuration
     let mut config = match AppConfig::load(cli.config) {
         Ok(c) => c,
@@ -138,6 +135,14 @@ async fn main() -> Result<()> {
     if let Some(name) = cli.db_name {
         config.couchdb.database = name;
     }
+
+    let enable_file_logging = matches!(
+        &cli.command,
+        Commands::Sync { .. } | Commands::Daemon { .. }
+    );
+
+    // Initialize logging
+    init_logging(cli.verbose, &config, enable_file_logging);
 
     // Execute command
     match cli.command {
@@ -257,8 +262,11 @@ fn resolve_paths(cli_path: Option<PathBuf>, config: &AppConfig) -> Vec<SyncPath>
 }
 
 /// Initialize logging based on verbosity or RUST_LOG env var
-fn init_logging(verbose: u8) {
+fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::Layer;
 
     // Prefer RUST_LOG if set, otherwise use verbosity flag
     let filter = if std::env::var("RUST_LOG").is_ok() {
@@ -272,5 +280,43 @@ fn init_logging(verbose: u8) {
         EnvFilter::new(format!("couchdb_file_sync={}", level))
     };
 
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let stdout_layer = tracing_subscriber::fmt::layer().with_filter(filter);
+
+    if enable_file_logging {
+        let log_path = config
+            .logging
+            .file
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/couchfs.logs"));
+        if let Some(parent) = log_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    eprintln!("Failed to create log directory {}: {}", parent.display(), e);
+                }
+            }
+        }
+        let file_name = log_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("couchfs.logs");
+        let dir = log_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/tmp"));
+        let file_appender = tracing_appender::rolling::never(dir, file_name);
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        Box::leak(Box::new(guard));
+
+        let file_filter = EnvFilter::new("couchdb_file_sync=trace");
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(non_blocking)
+            .with_filter(file_filter);
+
+        tracing_subscriber::registry()
+            .with(stdout_layer)
+            .with(file_layer)
+            .init();
+    } else {
+        tracing_subscriber::registry().with(stdout_layer).init();
+    }
 }

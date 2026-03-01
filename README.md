@@ -15,6 +15,7 @@ A Rust-based filesystem-to-CouchDB synchronization engine with bidirectional syn
 - **Flexible Configuration**: CLI args, YAML config, and environment variables
 - **Conflict File Preservation (optional)**: Keep-both resolution saves remote file as `filename.remote`
 - **Live Mode**: Optional filesystem watcher + CouchDB changes feed for low-latency sync
+- **Detailed Sync Logs**: `sync` and `daemon` write detailed logs to `/tmp/couchfs.logs` (override via `logging.file`)
 
 ## Installation
 
@@ -105,6 +106,11 @@ notifications:
     bot_token: "${TELEGRAM_BOT_TOKEN}"
     chat_id: "${TELEGRAM_CHAT_ID}"
   notify_on_conflict: true
+
+logging:
+  level: "info"      # error, warn, info, debug, trace
+  format: "pretty"   # pretty, json, compact
+  file: "/tmp/couchfs.logs"  # Optional file output (used by sync/daemon)
 ```
 
 ## CLI Commands
