@@ -1,4 +1,4 @@
-# CouchFS
+# CouchDB File Sync
 
 A Rust-based filesystem-to-CouchDB synchronization engine with bidirectional sync and conflict detection.
 
@@ -18,69 +18,69 @@ A Rust-based filesystem-to-CouchDB synchronization engine with bidirectional syn
 ### From Source
 
 ```bash
-git clone https://gitea.hnrglobal.com/HNR-Global/couchfs.git
-cd couchfs
+git clone https://gitea.hnrglobal.com/HNR-Global/couchdb-file-sync.git
+cd couchdb-file-sync
 cargo build --release
 ```
 
-The binary will be at `target/release/couchfs`.
+The binary will be at `target/release/couchdb-file-sync`.
 
 ## Quick Start
 
 ### 1. Initialize a Sync Directory
 
 ```bash
-couchfs init ~/my-documents
+couchdb-file-sync init ~/my-documents
 ```
 
 This creates:
-- `.couchfs/` directory for state storage
+- `.couchdb-file-sync/` directory for state storage
 - `.sync-ignore` file for ignore patterns
-- `couchfs.yaml.example` configuration template
+- `couchdb-file-sync.yaml.example` configuration template
 
 ### 2. Configure CouchDB Connection
 
 ```bash
 cd ~/my-documents
-cp couchfs.yaml.example couchfs.yaml
-# Edit couchfs.yaml with your CouchDB credentials
+cp .couchdb-file-sync/couchdb-file-sync.yaml.example .couchdb-file-sync/couchdb-file-sync.yaml
+# Edit .couchdb-file-sync/couchdb-file-sync.yaml with your CouchDB credentials
 ```
 
 ### 3. Run Initial Sync
 
 ```bash
-couchfs sync
+couchdb-file-sync sync
 ```
 
 ### 4. Run Continuous Sync (Daemon Mode)
 
 ```bash
-couchfs daemon --interval 60
+couchdb-file-sync daemon --interval 60
 ```
 
 For low-latency sync using a filesystem watcher and CouchDB changes feed:
 
 ```bash
-couchfs sync
-couchfs daemon --live
+couchdb-file-sync sync
+couchdb-file-sync daemon --live
 ```
 
 ## Configuration
 
 Configuration is loaded in this precedence order (highest to lowest):
 1. CLI arguments
-2. Environment variables (`COUCHFS_*`)
-3. YAML config file (`couchfs.yaml`)
+2. Environment variables (`COUCHDB_FILE_SYNC_*`)
+3. YAML config file (`couchdb-file-sync.yaml`)
 4. Default values
 
 ### Environment Variables
 
 ```bash
-export COUCHFS_DB_URL="http://localhost:5984"
-export COUCHFS_DB_USERNAME="admin"
-export COUCHFS_DB_PASSWORD="secret"
-export COUCHFS_DB_NAME="couchfs_files"
-export COUCHFS_SYNC__POLL_INTERVAL="60"
+export COUCHDB_FILE_SYNC_DB_URL="http://localhost:5984"
+export COUCHDB_FILE_SYNC_DB_USERNAME="admin"
+export COUCHDB_FILE_SYNC_DB_PASSWORD="secret"
+export COUCHDB_FILE_SYNC_DB_NAME="couchdb_file_sync_files"
+export COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL="60"
 ```
 
 ### YAML Config
@@ -90,7 +90,7 @@ couchdb:
   url: "http://localhost:5984"
   username: "admin"
   password: "${COUCHDB_PASSWORD}"
-  database: "couchfs_files"
+  database: "couchdb_file_sync_files"
 
 sync:
   poll_interval: 60
@@ -106,69 +106,69 @@ notifications:
 
 ## CLI Commands
 
-### `couchfs init [PATH]`
+### `couchdb-file-sync init [PATH]`
 
 Initialize a new sync directory.
 
 ```bash
-couchfs init ~/documents
+couchdb-file-sync init ~/documents
 ```
 
-### `couchfs sync [PATH]`
+### `couchdb-file-sync sync [PATH]`
 
 Run a one-time sync.
 
 ```bash
-couchfs sync ~/documents --dry-run
-couchfs sync ~/documents
+couchdb-file-sync sync ~/documents --dry-run
+couchdb-file-sync sync ~/documents
 ```
 
-### `couchfs daemon [PATH]`
+### `couchdb-file-sync daemon [PATH]`
 
 Run continuous sync daemon.
 
 ```bash
-couchfs daemon ~/documents --interval 60
+couchdb-file-sync daemon ~/documents --interval 60
 ```
 
 For live mode (watcher + changes feed):
 
 ```bash
-couchfs sync
-couchfs daemon ~/documents --live
+couchdb-file-sync sync
+couchdb-file-sync daemon ~/documents --live
 ```
 
-### `couchfs conflicts [PATH]`
+### `couchdb-file-sync conflicts [PATH]`
 
 List pending conflicts.
 
 ```bash
-couchfs conflicts
-couchfs conflicts --json
+couchdb-file-sync conflicts
+couchdb-file-sync conflicts --json
 ```
 
-### `couchfs resolve <PATH> --strategy <STRATEGY>`
+### `couchdb-file-sync resolve <PATH> --strategy <STRATEGY>`
 
 Resolve a conflict.
 
 ```bash
 # Keep local version
-couchfs resolve docs/report.pdf --strategy keep-local
+couchdb-file-sync resolve docs/report.pdf --strategy keep-local
 
 # Keep remote version
-couchfs resolve docs/report.pdf --strategy keep-remote
+couchdb-file-sync resolve docs/report.pdf --strategy keep-remote
 
 # Keep both (saves remote as .remote file)
-couchfs resolve docs/report.pdf --strategy keep-both
+couchdb-file-sync resolve docs/report.pdf --strategy keep-both
 ```
 
-### `couchfs status [PATH]`
+### `couchdb-file-sync status [PATH]`
 
 Show sync status.
 
 ```bash
-couchfs status
-couchfs status --json
+couchdb-file-sync status
+couchdb-file-sync status --json
 ```
 
 ## Ignore Patterns
@@ -196,7 +196,7 @@ secret-config.toml
 
 ## Conflict Resolution
 
-When a file is modified on both sides, CouchFS:
+When a file is modified on both sides, CouchDB File Sync:
 
 1. Detects the conflict
 2. Saves the remote version as `filename.remote`
@@ -207,8 +207,8 @@ When a file is modified on both sides, CouchFS:
 Resolve conflicts with:
 
 ```bash
-couchfs conflicts                    # List all conflicts
-couchfs resolve <path> --strategy <strategy>
+couchdb-file-sync conflicts                    # List all conflicts
+couchdb-file-sync resolve <path> --strategy <strategy>
 ```
 
 ### Resolution Strategies
@@ -220,7 +220,7 @@ couchfs resolve <path> --strategy <strategy>
 ## Project Structure
 
 ```
-couchfs/
+couchdb-file-sync/
 ├── src/
 │   ├── main.rs              # CLI entry point
 │   ├── lib.rs               # Library exports
@@ -232,7 +232,7 @@ couchfs/
 │   ├── models/              # Data models
 │   └── telegram/            # Telegram notifications
 ├── Cargo.toml
-├── couchfs.yaml.example
+├── couchdb-file-sync.yaml.example
 └── README.md
 ```
 
@@ -240,7 +240,7 @@ couchfs/
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        CouchFS Daemon                        │
+│                   CouchDB File Sync Daemon                   │
 ├─────────────────────────────────────────────────────────────┤
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
 │  │ File Watcher │  │ Sync Engine  │  │ CouchDB      │      │

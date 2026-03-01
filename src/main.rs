@@ -3,11 +3,11 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing::info;
 
-use couchfs::cli;
-use couchfs::config::{AppConfig, SyncPath};
+use couchdb_file_sync::cli;
+use couchdb_file_sync::config::{AppConfig, SyncPath};
 
 #[derive(Parser, Debug)]
-#[command(name = "couchfs")]
+#[command(name = "couchdb-file-sync")]
 #[command(about = "Filesystem-to-CouchDB sync engine")]
 #[command(version)]
 struct Cli {
@@ -20,19 +20,19 @@ struct Cli {
     verbose: u8,
 
     /// CouchDB URL
-    #[arg(long, global = true, env = "COUCHFS_DB_URL")]
+    #[arg(long, global = true, env = "COUCHDB_FILE_SYNC_DB_URL")]
     db_url: Option<String>,
 
     /// CouchDB username
-    #[arg(long, global = true, env = "COUCHFS_DB_USERNAME")]
+    #[arg(long, global = true, env = "COUCHDB_FILE_SYNC_DB_USERNAME")]
     db_user: Option<String>,
 
     /// CouchDB password
-    #[arg(long, global = true, env = "COUCHFS_DB_PASSWORD")]
+    #[arg(long, global = true, env = "COUCHDB_FILE_SYNC_DB_PASSWORD")]
     db_pass: Option<String>,
 
     /// CouchDB database name
-    #[arg(long, global = true, env = "COUCHFS_DB_NAME")]
+    #[arg(long, global = true, env = "COUCHDB_FILE_SYNC_DB_NAME")]
     db_name: Option<String>,
 
     #[command(subcommand)]
@@ -152,7 +152,7 @@ async fn main() -> Result<()> {
             let paths = resolve_paths(path, &config);
             if paths.is_empty() {
                 anyhow::bail!(
-                    "No sync paths configured. Specify a path or add paths to couchfs.yaml"
+                    "No sync paths configured. Specify a path or add paths to couchdb-file-sync.yaml"
                 );
             }
             for sync_path in paths {
@@ -174,7 +174,7 @@ async fn main() -> Result<()> {
             let paths = resolve_paths(path, &config);
             if paths.is_empty() {
                 anyhow::bail!(
-                    "No sync paths configured. Specify a path or add paths to couchfs.yaml"
+                    "No sync paths configured. Specify a path or add paths to couchdb-file-sync.yaml"
                 );
             }
             cli::daemon(paths, config, interval, live).await?;
@@ -183,7 +183,7 @@ async fn main() -> Result<()> {
             let paths = resolve_paths(path, &config);
             if paths.is_empty() {
                 anyhow::bail!(
-                    "No sync paths configured. Specify a path or add paths to couchfs.yaml"
+                    "No sync paths configured. Specify a path or add paths to couchdb-file-sync.yaml"
                 );
             }
             let multi = paths.len() > 1;
@@ -198,7 +198,7 @@ async fn main() -> Result<()> {
             let paths = resolve_paths(path, &config);
             if paths.is_empty() {
                 anyhow::bail!(
-                    "No sync paths configured. Specify a path or add paths to couchfs.yaml"
+                    "No sync paths configured. Specify a path or add paths to couchdb-file-sync.yaml"
                 );
             }
             let multi = paths.len() > 1;
@@ -215,7 +215,7 @@ async fn main() -> Result<()> {
             let paths = resolve_paths(path, &config);
             if paths.is_empty() {
                 anyhow::bail!(
-                    "No sync paths configured. Specify a path or add paths to couchfs.yaml"
+                    "No sync paths configured. Specify a path or add paths to couchdb-file-sync.yaml"
                 );
             }
             let multi = paths.len() > 1;
@@ -269,7 +269,7 @@ fn init_logging(verbose: u8) {
             1 => "debug",
             _ => "trace",
         };
-        EnvFilter::new(format!("couchfs={}", level))
+        EnvFilter::new(format!("couchdb_file_sync={}", level))
     };
 
     tracing_subscriber::fmt().with_env_filter(filter).init();

@@ -1,12 +1,12 @@
-# CouchFS Configuration Example
-# Copy this file to couchfs.yaml and customize for your setup
+# CouchDB File Sync Configuration Example
+# Copy this file to couchdb-file-sync.yaml and customize for your setup
 
 # CouchDB connection settings
 couchdb:
   url: "http://localhost:5984"
   username: "admin"
   password: "${COUCHDB_PASSWORD}"  # Can use environment variable substitution
-  database: "couchfs_files"
+  database: "couchdb_file_sync_files"
   # Remote path prefix to sync (e.g., "notes/" or "obsidian/")
   # Empty or "/" means sync the entire database
   remote_path: ""
@@ -67,4 +67,4 @@ notifications:
 logging:
   level: "info"      # error, warn, info, debug, trace
   format: "pretty"   # pretty, json, compact
-  # file: "/var/log/couchfs.log"  # Optional file output
+  # file: "/var/log/couchdb-file-sync.log"  # Optional file output

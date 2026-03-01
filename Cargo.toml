@@ -1,14 +1,14 @@
 [package]
-name = "couchfs"
+name = "couchdb-file-sync"
 version = "0.1.0"
 edition = "2021"
 description = "Filesystem-to-CouchDB sync engine with bidirectional sync and conflict detection"
 authors = ["Nina Těšková <nina.marie.teskova@gmail.com>"]
 license = "MIT"
-repository = "https://gitea.hnrglobal.com/HNR-Global/couchfs"
+repository = "https://gitea.hnrglobal.com/HNR-Global/couchdb-file-sync"
 
 [[bin]]
-name = "couchfs"
+name = "couchdb-file-sync"
 path = "src/main.rs"
 
 [dependencies]

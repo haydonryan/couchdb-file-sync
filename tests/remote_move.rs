@@ -1,5 +1,5 @@
 use anyhow::Result;
-use couchfs::{CouchDb, LocalDb, SyncEngine};
+use couchdb_file_sync::{CouchDb, LocalDb, SyncEngine};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -32,13 +32,13 @@ impl Drop for TestDir {
 }
 
 #[tokio::test]
-#[ignore = "requires a running CouchDB server (see COUCHFS_TEST_DB_* env vars)"]
+#[ignore = "requires a running CouchDB server (see COUCHDB_FILE_SYNC_TEST_DB_* env vars)"]
 async fn remote_move_deletes_old_local_path() -> Result<()> {
     let test_dir = TestDir::new("remote-move")?;
-    let couchfs_dir = test_dir.join(".couchfs");
-    fs::create_dir_all(&couchfs_dir)?;
+    let state_dir = test_dir.join(".couchdb-file-sync");
+    fs::create_dir_all(&state_dir)?;
 
-    let state_db = couchfs_dir.join("state.db");
+    let state_db = state_dir.join("state.db");
 
     let old_local = test_dir.join("old.txt");
     fs::write(&old_local, "hello\n")?;
@@ -136,16 +136,31 @@ async fn remote_move_deletes_old_local_path() -> Result<()> {
 }
 
 fn test_db_config() -> (String, String, Option<String>, Option<String>, String) {
-    let url = env_or("COUCHFS_TEST_DB_URL", "http://localhost:5984");
-    let db_name = env_or("COUCHFS_TEST_DB_NAME", "couchfs_move_test");
-    let mut remote_path = env::var("COUCHFS_TEST_REMOTE_PATH")
-        .unwrap_or_else(|_| format!("remote-move-test-{}", unique_suffix()));
+    let url = env_or_first(
+        &["COUCHDB_FILE_SYNC_TEST_DB_URL", "COUCHFS_TEST_DB_URL"],
+        "http://localhost:5984",
+    );
+    let db_name = env_or_first(
+        &["COUCHDB_FILE_SYNC_TEST_DB_NAME", "COUCHFS_TEST_DB_NAME"],
+        "couchdb_file_sync_move_test",
+    );
+    let mut remote_path = env_var_first(&[
+        "COUCHDB_FILE_SYNC_TEST_REMOTE_PATH",
+        "COUCHFS_TEST_REMOTE_PATH",
+    ])
+    .unwrap_or_else(|| format!("remote-move-test-{}", unique_suffix()));
     if !remote_path.is_empty() && !remote_path.ends_with('/') {
         remote_path.push('/');
     }
 
-    let user = env_opt("COUCHFS_TEST_DB_USER", Some("admin"));
-    let pass = env_opt("COUCHFS_TEST_DB_PASS", Some("password"));
+    let user = env_opt_first(
+        &["COUCHDB_FILE_SYNC_TEST_DB_USER", "COUCHFS_TEST_DB_USER"],
+        Some("admin"),
+    );
+    let pass = env_opt_first(
+        &["COUCHDB_FILE_SYNC_TEST_DB_PASS", "COUCHFS_TEST_DB_PASS"],
+        Some("password"),
+    );
     let (user, pass) = match (user, pass) {
         (Some(u), Some(p)) => (Some(u), Some(p)),
         _ => (None, None),
@@ -154,16 +169,21 @@ fn test_db_config() -> (String, String, Option<String>, Option<String>, String) 
     (url, db_name, user, pass, remote_path)
 }
 
-fn env_or(key: &str, default: &str) -> String {
-    env::var(key).unwrap_or_else(|_| default.to_string())
+fn env_or_first(keys: &[&str], default: &str) -> String {
+    env_var_first(keys).unwrap_or_else(|| default.to_string())
 }
 
-fn env_opt(key: &str, default: Option<&str>) -> Option<String> {
-    match env::var(key) {
-        Ok(v) if !v.is_empty() => Some(v),
-        Ok(_) => None,
-        Err(_) => default.map(|d| d.to_string()),
+fn env_var_first(keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Ok(v) = env::var(key) {
+            return if v.is_empty() { None } else { Some(v) };
+        }
     }
+    None
+}
+
+fn env_opt_first(keys: &[&str], default: Option<&str>) -> Option<String> {
+    env_var_first(keys).or_else(|| default.map(|d| d.to_string()))
 }
 
 fn unique_suffix() -> String {
