@@ -11,7 +11,7 @@ A Rust-based filesystem-to-CouchDB synchronization engine with bidirectional syn
 | --- | --- | --- |
 | ✅ | **Bidirectional Sync** | Changes on either side propagate to the other |
 | ✅ | **Conflict Detection** | Automatically detects when files change on both sides |
-| ⚠️ | **Conflict Resolution** | CLI commands to resolve conflicts with multiple strategies |
+| ✅ | **Conflict Resolution** | CLI commands to resolve conflicts with multiple strategies |
 | ✅ | **Smart Ignore Patterns** | Gitignore-style `.sync-ignore` file support |
 | ✅ | **Telegram Notifications** | Get notified when conflicts are detected |
 | ⚠️ | **Flexible Configuration** | CLI args, YAML config, and environment variables |
