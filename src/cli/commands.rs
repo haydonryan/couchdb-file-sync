@@ -6,6 +6,7 @@ use crate::sync::{SyncEngine, SyncReport};
 use crate::telegram::TelegramNotifier;
 use anyhow::Result;
 use dialoguer::{theme::ColorfulTheme, Select};
+use reqwest::StatusCode;
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -476,6 +477,19 @@ async fn run_remote_changes(
                 }
             }
             Err(e) => {
+                if let Some(status) = e
+                    .downcast_ref::<reqwest::Error>()
+                    .and_then(|err| err.status())
+                {
+                    if status == StatusCode::BAD_REQUEST {
+                        warn!(
+                            "Changes feed returned 400; resetting since to \"now\" and retrying"
+                        );
+                        since = "now".to_string();
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                }
                 error!("Changes feed error: {}", e);
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
