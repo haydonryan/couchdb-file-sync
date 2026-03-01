@@ -1,6 +1,7 @@
 use crate::models::{Change, ChangeType, Conflict, FileState};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use rusqlite::types::Type;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use tracing::info;
@@ -95,10 +96,11 @@ impl LocalDb {
 
         let state = stmt
             .query_row(params![path], |row| {
+                let size: i64 = row.get(2)?;
                 Ok(FileState {
                     path: row.get(0)?,
                     hash: row.get(1)?,
-                    size: row.get(2)?,
+                    size: i64_to_u64(size)?,
                     modified_at: row.get(3)?,
                     couch_rev: row.get(4)?,
                     last_sync_at: row.get(5)?,
@@ -121,7 +123,7 @@ impl LocalDb {
             params![
                 &state.path,
                 &state.hash,
-                state.size,
+                u64_to_i64(state.size)?,
                 state.modified_at.to_rfc3339(),
                 &state.couch_rev,
                 state.last_sync_at.to_rfc3339(),
@@ -154,10 +156,11 @@ impl LocalDb {
 
         let states = stmt
             .query_map([], |row| {
+                let size: i64 = row.get(2)?;
                 Ok(FileState {
                     path: row.get(0)?,
                     hash: row.get(1)?,
-                    size: row.get(2)?,
+                    size: i64_to_u64(size)?,
                     modified_at: row.get(3)?,
                     couch_rev: row.get(4)?,
                     last_sync_at: row.get(5)?,
@@ -181,7 +184,7 @@ impl LocalDb {
                 format!("{:?}", change.source),
                 change.timestamp.to_rfc3339(),
                 change.hash.as_ref(),
-                change.size,
+                opt_u64_to_i64(change.size)?,
             ],
         )?;
         Ok(())
@@ -199,13 +202,14 @@ impl LocalDb {
                 let change_type_str: String = row.get(1)?;
                 let source_str: String = row.get(2)?;
 
+                let size: Option<i64> = row.get(5)?;
                 Ok(Change {
                     path: row.get(0)?,
                     change_type: parse_change_type(&change_type_str),
                     source: parse_change_source(&source_str),
                     timestamp: row.get(3)?,
                     hash: row.get(4)?,
-                    size: row.get(5)?,
+                    size: size.map(i64_to_u64).transpose()?,
                     mtime: None,
                     rev: None,
                 })
@@ -417,4 +421,24 @@ fn parse_change_source(s: &str) -> crate::models::ChangeSource {
         "Remote" => crate::models::ChangeSource::Remote,
         _ => crate::models::ChangeSource::Local,
     }
+}
+
+fn u64_to_i64(value: u64) -> Result<i64> {
+    Ok(i64::try_from(value)?)
+}
+
+fn opt_u64_to_i64(value: Option<u64>) -> Result<Option<i64>> {
+    value.map(u64_to_i64).transpose()
+}
+
+fn i64_to_u64(value: i64) -> rusqlite::Result<u64> {
+    if value < 0 {
+        let err = std::io::Error::new(std::io::ErrorKind::InvalidData, "negative size");
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            Type::Integer,
+            Box::new(err),
+        ));
+    }
+    Ok(value as u64)
 }
