@@ -482,9 +482,7 @@ async fn run_remote_changes(
                     .and_then(|err| err.status())
                 {
                     if status == StatusCode::BAD_REQUEST {
-                        warn!(
-                            "Changes feed returned 400; resetting since to \"now\" and retrying"
-                        );
+                        warn!("Changes feed returned 400; resetting since to \"now\" and retrying");
                         since = "now".to_string();
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         continue;
