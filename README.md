@@ -2,6 +2,9 @@
 
 A Rust-based filesystem-to-CouchDB synchronization engine with bidirectional sync and conflict detection.
 
+> [!IMPORTANT]
+> This is very alpha software. Use at your own risk. It is in very early testing. You have been warned!
+
 ## Features
 
 - **Bidirectional Sync**: Changes on either side propagate to the other
