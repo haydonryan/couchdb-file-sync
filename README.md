@@ -13,7 +13,7 @@ A Rust-based filesystem-to-CouchDB synchronization engine with bidirectional syn
 - **Smart Ignore Patterns**: Gitignore-style `.sync-ignore` file support
 - **Telegram Notifications**: Get notified when conflicts are detected
 - **Flexible Configuration**: CLI args, YAML config, and environment variables
-- **Conflict File Preservation**: Remote file saved as `filename.remote` during conflicts
+- **Conflict File Preservation (optional)**: Keep-both resolution saves remote file as `filename.remote`
 - **Live Mode**: Optional filesystem watcher + CouchDB changes feed for low-latency sync
 
 ## Installation
@@ -202,10 +202,8 @@ secret-config.toml
 When a file is modified on both sides, CouchDB File Sync:
 
 1. Detects the conflict
-2. Saves the remote version as `filename.remote`
-3. Keeps the local version as-is
-4. Sends Telegram notification (if configured)
-5. Records the conflict in the database
+2. Records the conflict in the database
+3. Sends Telegram notification (if configured)
 
 Resolve conflicts with:
 
