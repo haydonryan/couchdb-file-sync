@@ -67,4 +67,4 @@ notifications:
 logging:
   level: "info"      # error, warn, info, debug, trace
   format: "pretty"   # pretty, json, compact
-  # file: "/var/log/couchdb-file-sync.log"  # Optional file output
+  # file: "/tmp/couchfs.logs"  # Optional file output (used by sync/daemon)
