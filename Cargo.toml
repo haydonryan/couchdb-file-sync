@@ -35,7 +35,6 @@ similar = "2.6"
 config = "0.15"
 
 # File watching
-notify = "7.0"
 notify-debouncer-full = "0.5"
 
 # SQLite

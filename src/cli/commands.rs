@@ -1,7 +1,7 @@
 use crate::config::{AppConfig, SyncPath};
-use crate::couchdb::CouchDb;
-use crate::local::LocalDb;
-use crate::models::{IgnoreMatcher, ResolutionStrategy};
+use crate::couchdb::{ChangeFeedEntry, CouchDb};
+use crate::local::{AsyncFileWatcher, LocalDb};
+use crate::models::{Change, ChangeType, IgnoreMatcher, ResolutionStrategy};
 use crate::sync::{SyncEngine, SyncReport};
 use crate::telegram::TelegramNotifier;
 use anyhow::Result;
@@ -9,6 +9,9 @@ use dialoguer::{theme::ColorfulTheme, Select};
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 /// Initialize a new sync directory
@@ -215,12 +218,43 @@ async fn notify_conflicts_telegram(
 }
 
 /// Run continuous sync daemon
-pub async fn daemon(paths: Vec<SyncPath>, config: AppConfig, interval: u64) -> Result<()> {
+pub async fn daemon(
+    paths: Vec<SyncPath>,
+    config: AppConfig,
+    interval: u64,
+    live: bool,
+) -> Result<()> {
     let path_list: Vec<_> = paths
         .iter()
         .map(|p| p.local.display().to_string())
         .collect();
     info!("Starting CouchFS daemon for: {}", path_list.join(", "));
+
+    if live {
+        println!("CouchFS daemon started (live mode)");
+        println!("Syncing {} path(s): {}", paths.len(), path_list.join(", "));
+        println!("Press Ctrl+C to stop");
+
+        let mut handles = Vec::new();
+        for sync_path in paths {
+            let mut path_config = config.clone();
+            path_config.couchdb.remote_path = sync_path.remote.clone();
+            let local_path = sync_path.local.clone();
+
+            handles.push(tokio::spawn(async move {
+                if let Err(e) = live_sync_path(local_path.clone(), path_config).await {
+                    error!("Live sync error for {}: {}", local_path.display(), e);
+                }
+            }));
+        }
+
+        tokio::signal::ctrl_c().await?;
+        for handle in handles {
+            handle.abort();
+        }
+        return Ok(());
+    }
+
     println!("CouchFS daemon started (interval: {}s)", interval);
     println!("Syncing {} path(s): {}", paths.len(), path_list.join(", "));
     println!("Press Ctrl+C to stop");
@@ -284,6 +318,269 @@ async fn daemon_sync(
     }
 
     Ok(report)
+}
+
+struct TouchTracker {
+    entries: Vec<(String, i64)>,
+}
+
+impl TouchTracker {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, path: &str, mtime: SystemTime) {
+        let bucket = Self::bucket(mtime);
+        self.entries.push((path.to_string(), bucket));
+        if self.entries.len() > 50 {
+            let drain = self.entries.len() - 50;
+            self.entries.drain(0..drain);
+        }
+    }
+
+    fn is_touched(&self, path: &str, mtime: SystemTime) -> bool {
+        let bucket = Self::bucket(mtime);
+        self.entries.iter().any(|(p, b)| p == path && *b == bucket)
+    }
+
+    fn bucket(mtime: SystemTime) -> i64 {
+        let millis = mtime
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        millis / 5000
+    }
+}
+
+async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
+    info!("Starting live sync in: {}", path.display());
+
+    let ignore_matcher = Arc::new(load_ignore_patterns(&path));
+
+    let db_path = path.join(".couchfs/state.db");
+    let local_db = LocalDb::open(&db_path)?;
+
+    let couchdb = CouchDb::new(
+        &config.couchdb.url,
+        config.couchdb.username.as_deref(),
+        config.couchdb.password.as_deref(),
+        &config.couchdb.database,
+        &config.couchdb.remote_path,
+    )
+    .await?;
+
+    let mut engine = SyncEngine::new(couchdb, local_db, path.clone());
+    let initial_since = match engine.get_checkpoint()? {
+        Some((seq, _)) => seq,
+        None => {
+            info!("No checkpoint found, starting changes feed from 'now'");
+            "now".to_string()
+        }
+    };
+
+    let (local_tx, mut local_rx) = mpsc::channel::<Change>(256);
+    let (remote_tx, mut remote_rx) = mpsc::channel::<ChangeFeedEntry>(256);
+
+    let watcher_root = path.clone();
+    let watcher_ignore = ignore_matcher.clone();
+    let debounce_ms = config.sync.debounce_ms;
+    tokio::spawn(async move {
+        if let Err(e) = run_local_watcher(watcher_root, watcher_ignore, debounce_ms, local_tx).await
+        {
+            error!("Local watcher error: {}", e);
+        }
+    });
+
+    let remote_config = config.clone();
+    tokio::spawn(async move {
+        if let Err(e) = run_remote_changes(remote_config, initial_since, remote_tx).await {
+            error!("Remote changes feed error: {}", e);
+        }
+    });
+
+    let mut touched = TouchTracker::new();
+
+    loop {
+        tokio::select! {
+            Some(change) = local_rx.recv() => {
+                if let Err(e) = handle_local_change(&mut engine, &mut touched, &change).await {
+                    warn!("Live local change error for {}: {}", change.path, e);
+                }
+            }
+            Some(entry) = remote_rx.recv() => {
+                if let Err(e) = handle_remote_change(&mut engine, &mut touched, &ignore_matcher, entry).await {
+                    warn!("Live remote change error: {}", e);
+                }
+            }
+        }
+    }
+}
+
+async fn run_local_watcher(
+    root: PathBuf,
+    ignore_matcher: Arc<IgnoreMatcher>,
+    debounce_ms: u64,
+    tx: mpsc::Sender<Change>,
+) -> Result<()> {
+    let mut watcher =
+        AsyncFileWatcher::start(root.clone(), (*ignore_matcher).clone(), debounce_ms)?;
+
+    loop {
+        if let Some(event) = watcher.next_event().await {
+            if let Some(change) = watcher.event_to_change(event) {
+                if tx.send(change).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_remote_changes(
+    config: AppConfig,
+    mut since: String,
+    tx: mpsc::Sender<ChangeFeedEntry>,
+) -> Result<()> {
+    let couchdb = CouchDb::new(
+        &config.couchdb.url,
+        config.couchdb.username.as_deref(),
+        config.couchdb.password.as_deref(),
+        &config.couchdb.database,
+        &config.couchdb.remote_path,
+    )
+    .await?;
+
+    loop {
+        match couchdb.get_changes_feed(&since, 25_000).await {
+            Ok((entries, last_seq)) => {
+                since = last_seq;
+                for entry in entries {
+                    if tx.send(entry).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Changes feed error: {}", e);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
+async fn handle_local_change(
+    engine: &mut SyncEngine,
+    touched: &mut TouchTracker,
+    change: &Change,
+) -> Result<()> {
+    let mtime = local_mtime(engine.root_dir(), &change.path);
+    if touched.is_touched(&change.path, mtime) {
+        return Ok(());
+    }
+
+    match change.change_type {
+        ChangeType::Created | ChangeType::Modified | ChangeType::Deleted => {
+            if let Err(e) = engine.apply_local_change(change).await {
+                warn!("Failed to apply local change {}: {}", change.path, e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_remote_change(
+    engine: &mut SyncEngine,
+    touched: &mut TouchTracker,
+    ignore_matcher: &IgnoreMatcher,
+    entry: ChangeFeedEntry,
+) -> Result<()> {
+    let change = entry.change;
+    let seq = entry.seq;
+
+    let local_path = engine.remote_to_local_path(&change.path);
+    let local_rel = local_path.trim_start_matches('/').to_string();
+
+    if ignore_matcher.should_ignore(Path::new(&local_rel)) {
+        engine.save_checkpoint(&seq)?;
+        return Ok(());
+    }
+
+    if let Some(state) = engine.get_file_state(&local_rel)? {
+        if let (Some(remote_rev), Some(local_rev)) =
+            (change.rev.as_deref(), state.couch_rev.as_deref())
+        {
+            if remote_rev == local_rev {
+                engine.save_checkpoint(&seq)?;
+                return Ok(());
+            }
+        }
+    }
+
+    match change.change_type {
+        ChangeType::Deleted => {
+            touched.mark(&local_rel, SystemTime::now());
+            engine.apply_remote_change(&change).await?;
+        }
+        ChangeType::Created | ChangeType::Modified => {
+            let file_path = engine.root_dir().join(&local_rel);
+            let local_meta = std::fs::metadata(&file_path).ok();
+            let local_exists = local_meta.is_some();
+            let local_mtime = local_meta
+                .and_then(|meta| meta.modified().ok())
+                .unwrap_or_else(SystemTime::now);
+            let remote_mtime = change
+                .mtime
+                .map(|dt| UNIX_EPOCH + Duration::from_millis(dt.timestamp_millis() as u64));
+
+            let apply_remote = match remote_mtime {
+                Some(remote) => {
+                    if !local_exists {
+                        true
+                    } else {
+                        let local_ms = local_mtime
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64;
+                        let remote_ms = remote
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64;
+                        let diff = local_ms - remote_ms;
+                        let tolerance_ms = 1000;
+                        if diff.abs() <= tolerance_ms {
+                            false
+                        } else {
+                            diff < 0
+                        }
+                    }
+                }
+                None => true,
+            };
+
+            if apply_remote {
+                touched.mark(&local_rel, SystemTime::now());
+                engine.apply_remote_change(&change).await?;
+            } else {
+                let local_change = Change::local_modified(local_rel.clone(), String::new(), 0);
+                engine.apply_local_change(&local_change).await?;
+            }
+        }
+    }
+
+    engine.save_checkpoint(&seq)?;
+    Ok(())
+}
+
+fn local_mtime(root: &Path, relative_path: &str) -> SystemTime {
+    let file_path = root.join(relative_path);
+    std::fs::metadata(&file_path)
+        .and_then(|meta| meta.modified())
+        .unwrap_or_else(|_| SystemTime::now())
 }
 
 /// List conflicts

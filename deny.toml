@@ -1,7 +1,3 @@
-[advisories]
-# Allow unmaintained advisory for instant until upstream moves off it.
-ignore = ["RUSTSEC-2024-0384"]
-
 [licenses]
 allow = [
   "Apache-2.0",

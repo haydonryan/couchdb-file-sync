@@ -35,13 +35,14 @@ impl FileWatcher {
         let ignore_matcher = Arc::new(ignore_matcher);
         let root = root_dir.clone();
 
+        let closure_matcher = ignore_matcher.clone();
         let mut debouncer = new_debouncer(
             Duration::from_millis(debounce_ms),
             None,
             move |result: DebounceEventResult| match result {
                 Ok(events) => {
                     for event in events {
-                        let _ = process_event(event, &event_tx, &ignore_matcher, &root);
+                        let _ = process_event(event, &event_tx, &closure_matcher, &root);
                     }
                 }
                 Err(errors) => {
@@ -62,7 +63,7 @@ impl FileWatcher {
 
         Ok(Self {
             root_dir,
-            ignore_matcher: Arc::new(IgnoreMatcher::empty()),
+            ignore_matcher,
             event_rx,
         })
     }
@@ -240,5 +241,10 @@ impl AsyncFileWatcher {
     /// Get next event
     pub async fn next_event(&mut self) -> Option<WatcherEvent> {
         self.inner.events().recv().await
+    }
+
+    /// Convert watcher events to changes
+    pub fn event_to_change(&self, event: WatcherEvent) -> Option<Change> {
+        self.inner.event_to_change(event)
     }
 }

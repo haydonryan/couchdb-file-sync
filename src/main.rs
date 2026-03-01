@@ -74,6 +74,10 @@ enum Commands {
         /// Poll interval in seconds
         #[arg(short, long, default_value = "60")]
         interval: u64,
+
+        /// Use live sync (filesystem watcher + CouchDB changes feed)
+        #[arg(long)]
+        live: bool,
     },
 
     /// List conflicts
@@ -162,14 +166,18 @@ async fn main() -> Result<()> {
                 cli::sync(sync_path.local, path_config, dry_run).await?;
             }
         }
-        Commands::Daemon { path, interval } => {
+        Commands::Daemon {
+            path,
+            interval,
+            live,
+        } => {
             let paths = resolve_paths(path, &config);
             if paths.is_empty() {
                 anyhow::bail!(
                     "No sync paths configured. Specify a path or add paths to couchfs.yaml"
                 );
             }
-            cli::daemon(paths, config, interval).await?;
+            cli::daemon(paths, config, interval, live).await?;
         }
         Commands::Conflicts { path, json } => {
             let paths = resolve_paths(path, &config);

@@ -706,6 +706,41 @@ impl SyncEngine {
         self.local_db.get_conflicts()
     }
 
+    /// Apply a local change immediately (live sync)
+    pub async fn apply_local_change(&mut self, change: &Change) -> Result<()> {
+        self.apply_to_couchdb(change).await
+    }
+
+    /// Apply a remote change immediately (live sync)
+    pub async fn apply_remote_change(&mut self, change: &Change) -> Result<()> {
+        self.apply_to_filesystem(change).await
+    }
+
+    /// Get local tracked file state
+    pub fn get_file_state(&self, path: &str) -> Result<Option<FileState>> {
+        self.local_db.get_file_state(path)
+    }
+
+    /// Save sync checkpoint
+    pub fn save_checkpoint(&self, seq: &str) -> Result<()> {
+        self.local_db.save_checkpoint(seq)
+    }
+
+    /// Get sync checkpoint
+    pub fn get_checkpoint(&self) -> Result<Option<(String, chrono::DateTime<chrono::Utc>)>> {
+        self.local_db.get_checkpoint()
+    }
+
+    /// Convert local path to remote path using the configured prefix
+    pub fn local_to_remote_path(&self, local_path: &str) -> String {
+        self.couchdb.get_remote_path(local_path)
+    }
+
+    /// Convert remote path to local path by stripping the configured prefix
+    pub fn remote_to_local_path(&self, remote_path: &str) -> String {
+        self.couchdb.get_local_path(remote_path)
+    }
+
     /// Get remote file content (converts local path to remote path)
     pub async fn get_remote_content(&self, local_path: &str) -> Result<Vec<u8>> {
         let remote_path = self.couchdb.get_remote_path(local_path);
