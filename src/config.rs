@@ -44,9 +44,9 @@ impl AppConfig {
             config_builder = config_builder.add_source(config::File::from(path));
         }
 
-        // Add environment variables with COUCHFS_ prefix
+        // Add environment variables with COUCHDB_FILE_SYNC_ prefix
         config_builder = config_builder.add_source(
-            config::Environment::with_prefix("COUCHFS")
+            config::Environment::with_prefix("COUCHDB_FILE_SYNC")
                 .separator("__")
                 .try_parsing(true),
         );
@@ -61,6 +61,11 @@ impl AppConfig {
     /// Find config file in current directory or parent directories
     fn find_config_file() -> Option<PathBuf> {
         let filenames = [
+            "couchdb-file-sync.yaml",
+            "couchdb-file-sync.yml",
+            ".couchdb-file-sync.yaml",
+            ".couchdb-file-sync.yml",
+            ".couchdb-file-sync/couchdb-file-sync.yaml",
             "couchfs.yaml",
             "couchfs.yml",
             ".couchfs.yaml",
@@ -227,7 +232,7 @@ fn default_db_url() -> String {
 }
 
 fn default_db_name() -> String {
-    "couchfs_files".to_string()
+    "couchdb_file_sync_files".to_string()
 }
 
 fn default_timeout() -> u64 {

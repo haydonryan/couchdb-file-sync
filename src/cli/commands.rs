@@ -16,29 +16,37 @@ use tracing::{error, info, warn};
 
 /// Initialize a new sync directory
 pub async fn init(path: PathBuf, _db_url: Option<String>, _db_name: Option<String>) -> Result<()> {
-    info!("Initializing CouchFS directory: {}", path.display());
+    info!(
+        "Initializing CouchDB File Sync directory: {}",
+        path.display()
+    );
 
     // Create directory if it doesn't exist
     if !path.exists() {
         std::fs::create_dir_all(&path)?;
     }
 
-    // Create .couchfs subdirectory for state
-    let couchfs_dir = path.join(".couchfs");
-    std::fs::create_dir_all(&couchfs_dir)?;
+    // Create .couchdb-file-sync subdirectory for state
+    let state_dir = path.join(".couchdb-file-sync");
+    std::fs::create_dir_all(&state_dir)?;
 
-    // Create couchfs.yaml.example in .couchfs directory
-    let config_example = couchfs_dir.join("couchfs.yaml.example");
-    std::fs::write(&config_example, include_str!("../../couchfs.yaml.example"))?;
+    // Create couchdb-file-sync.yaml.example in .couchdb-file-sync directory
+    let config_example = state_dir.join("couchdb-file-sync.yaml.example");
+    std::fs::write(
+        &config_example,
+        include_str!("../../couchdb-file-sync.yaml.example"),
+    )?;
 
     // Create .sync-ignore if it doesn't exist
     let sync_ignore = path.join(".sync-ignore");
     if !sync_ignore.exists() {
-        let default_ignore = r#"# CouchFS ignore patterns
+        let default_ignore = r#"# CouchDB File Sync ignore patterns
 # Add files/directories to ignore (gitignore-style syntax)
 
-# CouchFS internal files
+# CouchDB File Sync internal files
+.couchdb-file-sync/
 .couchfs/
+couchdb-file-sync.yaml
 couchfs.yaml
 
 # Common build artifacts
@@ -67,19 +75,19 @@ target/
     }
 
     // Create initial database
-    let db_path = couchfs_dir.join("state.db");
+    let db_path = state_dir.join("state.db");
     let local_db = LocalDb::open(&db_path)?;
     drop(local_db);
 
-    println!("✓ Initialized CouchFS in {}", path.display());
+    println!("✓ Initialized CouchDB File Sync in {}", path.display());
     println!("  State database: {}", db_path.display());
     println!("  Config example: {}", config_example.display());
     println!("  Ignore file: {}", sync_ignore.display());
     println!();
     println!("Next steps:");
-    println!("  1. Copy .couchfs/couchfs.yaml.example to .couchfs/couchfs.yaml");
-    println!("  2. Edit .couchfs/couchfs.yaml with your CouchDB credentials");
-    println!("  3. Run: couchfs sync {}", path.display());
+    println!("  1. Copy .couchdb-file-sync/couchdb-file-sync.yaml.example to .couchdb-file-sync/couchdb-file-sync.yaml");
+    println!("  2. Edit .couchdb-file-sync/couchdb-file-sync.yaml with your CouchDB credentials");
+    println!("  3. Run: couchdb-file-sync sync {}", path.display());
 
     Ok(())
 }
@@ -92,7 +100,7 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
     let _ignore_matcher = load_ignore_patterns(&path);
 
     // Open local database
-    let db_path = path.join(".couchfs/state.db");
+    let db_path = state_db_path(&path);
     let local_db = LocalDb::open(&db_path)?;
 
     // Connect to CouchDB
@@ -228,10 +236,13 @@ pub async fn daemon(
         .iter()
         .map(|p| p.local.display().to_string())
         .collect();
-    info!("Starting CouchFS daemon for: {}", path_list.join(", "));
+    info!(
+        "Starting CouchDB File Sync daemon for: {}",
+        path_list.join(", ")
+    );
 
     if live {
-        println!("CouchFS daemon started (live mode)");
+        println!("CouchDB File Sync daemon started (live mode)");
         println!("Syncing {} path(s): {}", paths.len(), path_list.join(", "));
         println!("Press Ctrl+C to stop");
 
@@ -255,7 +266,7 @@ pub async fn daemon(
         return Ok(());
     }
 
-    println!("CouchFS daemon started (interval: {}s)", interval);
+    println!("CouchDB File Sync daemon started (interval: {}s)", interval);
     println!("Syncing {} path(s): {}", paths.len(), path_list.join(", "));
     println!("Press Ctrl+C to stop");
 
@@ -293,7 +304,7 @@ async fn daemon_sync(
     let _ignore_matcher = load_ignore_patterns(path);
 
     // Open local database
-    let db_path = path.join(".couchfs/state.db");
+    let db_path = state_db_path(path);
     let local_db = LocalDb::open(&db_path)?;
 
     // Connect to CouchDB
@@ -359,7 +370,7 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
 
     let ignore_matcher = Arc::new(load_ignore_patterns(&path));
 
-    let db_path = path.join(".couchfs/state.db");
+    let db_path = state_db_path(&path);
     let local_db = LocalDb::open(&db_path)?;
 
     let couchdb = CouchDb::new(
@@ -585,7 +596,7 @@ fn local_mtime(root: &Path, relative_path: &str) -> SystemTime {
 
 /// List conflicts
 pub async fn conflicts(path: PathBuf, json: bool) -> Result<()> {
-    let db_path = path.join(".couchfs/state.db");
+    let db_path = state_db_path(&path);
     let local_db = LocalDb::open(&db_path)?;
 
     let conflicts = local_db.get_conflicts()?;
@@ -610,7 +621,7 @@ pub async fn conflicts(path: PathBuf, json: bool) -> Result<()> {
             );
             println!();
         }
-        println!("Resolve with: couchfs resolve");
+        println!("Resolve with: couchdb-file-sync resolve");
     }
 
     Ok(())
@@ -618,7 +629,7 @@ pub async fn conflicts(path: PathBuf, json: bool) -> Result<()> {
 
 /// Resolve conflicts interactively
 pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
-    let db_path = path.join(".couchfs/state.db");
+    let db_path = state_db_path(&path);
     let local_db = LocalDb::open(&db_path)?;
 
     let conflicts = local_db.get_conflicts()?;
@@ -792,7 +803,7 @@ fn truncate_str(s: &str, max_width: usize) -> String {
 
 /// Show sync status
 pub async fn status(path: PathBuf, json: bool, _config: &AppConfig) -> Result<()> {
-    let db_path = path.join(".couchfs/state.db");
+    let db_path = state_db_path(&path);
     let local_db = LocalDb::open(&db_path)?;
 
     let file_states = local_db.get_all_file_states()?;
@@ -816,7 +827,7 @@ pub async fn status(path: PathBuf, json: bool, _config: &AppConfig) -> Result<()
         });
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
-        println!("CouchFS Status");
+        println!("CouchDB File Sync Status");
         println!("==============");
         println!("Sync directory: {}", path.display());
         println!("Local files:    {}", file_count);
@@ -858,6 +869,24 @@ fn load_ignore_patterns(root: &Path) -> IgnoreMatcher {
     }
 }
 
+fn state_dir(root: &Path) -> PathBuf {
+    let new_dir = root.join(".couchdb-file-sync");
+    if new_dir.exists() {
+        return new_dir;
+    }
+
+    let old_dir = root.join(".couchfs");
+    if old_dir.exists() {
+        return old_dir;
+    }
+
+    new_dir
+}
+
+fn state_db_path(root: &Path) -> PathBuf {
+    state_dir(root).join("state.db")
+}
+
 /// Helper to print sync report
 fn print_sync_report(report: &SyncReport) {
     println!();
@@ -870,7 +899,7 @@ fn print_sync_report(report: &SyncReport) {
     if report.conflicts > 0 {
         println!("  Conflicts: {} ⚠️", report.conflicts);
         println!();
-        println!("Run 'couchfs conflicts' to see details");
+        println!("Run 'couchdb-file-sync conflicts' to see details");
     }
 
     if !report.errors.is_empty() {

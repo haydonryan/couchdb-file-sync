@@ -113,7 +113,7 @@ impl IgnoreMatcher {
         if path.file_name() == Some(std::ffi::OsStr::new(".sync-ignore")) {
             return true;
         }
-        if path_str.contains(".couchfs/") {
+        if path_str.contains(".couchdb-file-sync/") || path_str.contains(".couchfs/") {
             return true;
         }
 
@@ -174,7 +174,7 @@ mod tests {
     fn test_dotfiles_ignored() {
         let matcher = IgnoreMatcher::empty();
         assert!(matcher.should_ignore(Path::new(".hidden")));
-        assert!(matcher.should_ignore(Path::new(".couchfs2")));
+        assert!(matcher.should_ignore(Path::new(".couchdb-file-sync2")));
         assert!(matcher.should_ignore(Path::new(".git")));
         assert!(matcher.should_ignore(Path::new("folder/.hidden")));
         assert!(matcher.should_ignore(Path::new(".dotdir/file.txt")));

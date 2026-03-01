@@ -37,11 +37,11 @@ impl TelegramNotifier {
             .join("\n");
 
         let message = format!(
-            "⚠️ <b>CouchFS: {} New Conflict{}</b>\n\n\
+            "⚠️ <b>CouchDB File Sync: {} New Conflict{}</b>\n\n\
              📂 Location: <code>{}</code>\n\n\
              📁 <b>Files in conflict:</b>\n\
              {}\n\n\
-             Run <code>couchfs resolve</code> to resolve interactively.",
+             Run <code>couchdb-file-sync resolve</code> to resolve interactively.",
             conflicts.len(),
             if conflicts.len() == 1 { "" } else { "s" },
             escape_html(sync_dir),
@@ -59,7 +59,7 @@ impl TelegramNotifier {
     /// Send sync error notification
     pub async fn notify_error(&self, error: &str) -> Result<()> {
         let message = format!(
-            "❌ <b>CouchFS Sync Error</b>\n\n{}\n\nTimestamp: {}",
+            "❌ <b>CouchDB File Sync Error</b>\n\n{}\n\nTimestamp: {}",
             escape_html(error),
             chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
         );
