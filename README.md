@@ -42,15 +42,16 @@ couchdb-file-sync init ~/my-documents
 This creates:
 - `.couchdb-file-sync/` directory for state storage
 - `.sync-ignore` file for ignore patterns
-- `couchdb-file-sync.yaml.example` configuration template
 
 ### 2. Configure CouchDB Connection
 
 ```bash
 cd ~/my-documents
-cp .couchdb-file-sync/couchdb-file-sync.yaml.example .couchdb-file-sync/couchdb-file-sync.yaml
+cp /path/to/couchdb-file-sync.yaml.example .couchdb-file-sync/couchdb-file-sync.yaml
 # Edit .couchdb-file-sync/couchdb-file-sync.yaml with your CouchDB credentials
 ```
+
+Use the `couchdb-file-sync.yaml.example` in the repository as a starting point if you installed from source.
 
 ### 3. Run Initial Sync
 
