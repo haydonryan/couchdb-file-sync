@@ -31,13 +31,6 @@ pub async fn init(path: PathBuf, _db_url: Option<String>, _db_name: Option<Strin
     let state_dir = path.join(".couchdb-file-sync");
     std::fs::create_dir_all(&state_dir)?;
 
-    // Create couchdb-file-sync.yaml.example in .couchdb-file-sync directory
-    let config_example = state_dir.join("couchdb-file-sync.yaml.example");
-    std::fs::write(
-        &config_example,
-        include_str!("../../couchdb-file-sync.yaml.example"),
-    )?;
-
     // Create .sync-ignore if it doesn't exist
     let sync_ignore = path.join(".sync-ignore");
     if !sync_ignore.exists() {
@@ -82,7 +75,6 @@ target/
 
     println!("✓ Initialized CouchDB File Sync in {}", path.display());
     println!("  State database: {}", db_path.display());
-    println!("  Config example: {}", config_example.display());
     println!("  Ignore file: {}", sync_ignore.display());
     println!();
     println!("Next steps:");
