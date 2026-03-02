@@ -13,7 +13,7 @@ pub struct CouchDb {
     client: Client,
     db: Database,
     http_client: HttpClient,
-    base_url: String,
+    base_db_url: String,
     db_name: String,
     auth: Option<(String, String)>,
     /// Remote path prefix to sync (e.g., "notes/" or "obsidian/")
@@ -81,11 +81,18 @@ impl CouchDb {
             path
         };
 
+        let base = url.trim_end_matches('/');
+        let base_db_url = if base.ends_with(&format!("/{}", db_name)) {
+            base.to_string()
+        } else {
+            format!("{}/{}", base, db_name)
+        };
+
         Ok(Self {
             client,
             db,
             http_client: HttpClient::new(),
-            base_url: url.to_string(),
+            base_db_url,
             db_name: db_name.to_string(),
             auth,
             remote_path,
@@ -103,8 +110,7 @@ impl CouchDb {
         since: &str,
         timeout_ms: u64,
     ) -> Result<(Vec<ChangeFeedEntry>, String)> {
-        let base = self.base_url.trim_end_matches('/');
-        let url = format!("{}/{}/_changes", base, self.db_name);
+        let url = format!("{}/_changes", self.base_db_url);
 
         let mut request = self.http_client.get(&url).query(&[
             ("since", since),
@@ -354,8 +360,7 @@ impl CouchDb {
     /// Attachments are stored at /{db}/{docid}/{attname}
     #[allow(dead_code)]
     pub async fn get_attachment(&self, doc_id: &str, attachment_name: &str) -> Result<Vec<u8>> {
-        // Note: base_url may already include the database path
-        let url = format!("{}/{}/{}", self.base_url, doc_id, attachment_name);
+        let url = format!("{}/{}/{}", self.base_db_url, doc_id, attachment_name);
 
         let mut request = self.http_client.get(&url);
 
@@ -379,9 +384,7 @@ impl CouchDb {
 
     /// Get a chunk document by ID
     async fn get_chunk(&self, chunk_id: &str) -> Result<Option<ChunkDoc>> {
-        // Note: base_url may already include the database path (e.g., /obsidian)
-        // so we try without db_name first
-        let url = format!("{}/{}", self.base_url, chunk_id);
+        let url = format!("{}/{}", self.base_db_url, chunk_id);
 
         let mut request = self.http_client.get(&url);
         if let Some((username, password)) = &self.auth {
@@ -444,7 +447,7 @@ impl CouchDb {
 
     /// Save a chunk document to CouchDB
     async fn save_chunk(&self, chunk: &ChunkDoc) -> Result<()> {
-        let url = format!("{}/{}", self.base_url, chunk.id);
+        let url = format!("{}/{}", self.base_db_url, chunk.id);
 
         let mut request = self.http_client.put(&url);
         if let Some((username, password)) = &self.auth {
@@ -491,7 +494,7 @@ impl CouchDb {
         for chunk_id in chunk_ids {
             if let Some(chunk) = self.get_chunk(chunk_id).await? {
                 if let Some(rev) = chunk.rev {
-                    let url = format!("{}/{}?rev={}", self.base_url, chunk_id, rev);
+                    let url = format!("{}/{}?rev={}", self.base_db_url, chunk_id, rev);
                     let mut request = self.http_client.delete(&url);
                     if let Some((username, password)) = &self.auth {
                         request = request.basic_auth(username, Some(password));
