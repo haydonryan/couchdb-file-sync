@@ -118,6 +118,11 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
 
     print_sync_report(&report);
 
+    if !report.errors.is_empty() {
+        let summary = format_sync_error_summary(&report.errors);
+        notify_sync_error_telegram(&config, Some(&path), &summary).await;
+    }
+
     // Send Telegram notifications for conflicts (one-time sync uses DB tracking)
     if report.conflicts > 0 {
         notify_conflicts_telegram(&config, &db_path, &path, None).await;
@@ -218,6 +223,62 @@ async fn notify_conflicts_telegram(
     }
 }
 
+fn telegram_error_notifier(config: &AppConfig) -> Option<TelegramNotifier> {
+    if !config.notifications.enabled || !config.notifications.notify_on_sync_error {
+        return None;
+    }
+
+    let (bot_token, chat_id) = match (
+        &config.notifications.telegram.bot_token,
+        &config.notifications.telegram.chat_id,
+    ) {
+        (Some(token), Some(id)) if !token.is_empty() && !id.is_empty() => {
+            (token.clone(), id.clone())
+        }
+        _ => {
+            info!("Telegram not configured, skipping error notifications");
+            return None;
+        }
+    };
+
+    Some(TelegramNotifier::new(bot_token, chat_id))
+}
+
+fn format_sync_error_summary(errors: &[String]) -> String {
+    let max_errors = 10;
+    let mut lines = Vec::new();
+
+    for error in errors.iter().take(max_errors) {
+        lines.push(format!("• {}", error));
+    }
+
+    if errors.len() > max_errors {
+        lines.push(format!("...and {} more", errors.len() - max_errors));
+    }
+
+    lines.join("\n")
+}
+
+async fn notify_sync_error_telegram(
+    config: &AppConfig,
+    sync_dir: Option<&Path>,
+    error_message: &str,
+) {
+    let notifier = match telegram_error_notifier(config) {
+        Some(notifier) => notifier,
+        None => return,
+    };
+
+    let message = match sync_dir {
+        Some(path) => format!("Sync path: {}\n{}", path.display(), error_message),
+        None => error_message.to_string(),
+    };
+
+    if let Err(e) = notifier.notify_error(&message).await {
+        warn!("Failed to send Telegram error notification: {}", e);
+    }
+}
+
 /// Run continuous sync daemon
 pub async fn daemon(
     paths: Vec<SyncPath>,
@@ -246,8 +307,14 @@ pub async fn daemon(
             let local_path = sync_path.local.clone();
 
             handles.push(tokio::spawn(async move {
-                if let Err(e) = live_sync_path(local_path.clone(), path_config).await {
+                if let Err(e) = live_sync_path(local_path.clone(), path_config.clone()).await {
                     error!("Live sync error for {}: {}", local_path.display(), e);
+                    notify_sync_error_telegram(
+                        &path_config,
+                        Some(&local_path),
+                        &format!("Live sync error: {}", e),
+                    )
+                    .await;
                 }
             }));
         }
@@ -279,6 +346,12 @@ pub async fn daemon(
                 Ok(_) => {}
                 Err(e) => {
                     error!("Sync error for {}: {}", sync_path.local.display(), e);
+                    notify_sync_error_telegram(
+                        &path_config,
+                        Some(&sync_path.local),
+                        &format!("Sync error: {}", e),
+                    )
+                    .await;
                 }
             }
         }
@@ -315,6 +388,11 @@ async fn daemon_sync(
     let report = engine.sync().await?;
 
     print_sync_report(&report);
+
+    if !report.errors.is_empty() {
+        let summary = format_sync_error_summary(&report.errors);
+        notify_sync_error_telegram(config, Some(path), &summary).await;
+    }
 
     // Send Telegram notifications for NEW conflicts only (session-based tracking)
     if report.conflicts > 0 {
@@ -390,17 +468,33 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
     let watcher_root = path.clone();
     let watcher_ignore = ignore_matcher.clone();
     let debounce_ms = config.sync.debounce_ms;
+    let watcher_config = config.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_local_watcher(watcher_root, watcher_ignore, debounce_ms, local_tx).await
+        if let Err(e) =
+            run_local_watcher(watcher_root.clone(), watcher_ignore, debounce_ms, local_tx).await
         {
             error!("Local watcher error: {}", e);
+            notify_sync_error_telegram(
+                &watcher_config,
+                Some(&watcher_root),
+                &format!("Local watcher error: {}", e),
+            )
+            .await;
         }
     });
 
     let remote_config = config.clone();
+    let remote_config_notify = config.clone();
+    let remote_root = path.clone();
     tokio::spawn(async move {
         if let Err(e) = run_remote_changes(remote_config, initial_since, remote_tx).await {
             error!("Remote changes feed error: {}", e);
+            notify_sync_error_telegram(
+                &remote_config_notify,
+                Some(&remote_root),
+                &format!("Remote changes feed error: {}", e),
+            )
+            .await;
         }
     });
 
@@ -411,11 +505,23 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
             Some(change) = local_rx.recv() => {
                 if let Err(e) = handle_local_change(&mut engine, &mut touched, &change).await {
                     warn!("Live local change error for {}: {}", change.path, e);
+                    notify_sync_error_telegram(
+                        &config,
+                        Some(&path),
+                        &format!("Live local change error for {}: {}", change.path, e),
+                    )
+                    .await;
                 }
             }
             Some(entry) = remote_rx.recv() => {
                 if let Err(e) = handle_remote_change(&mut engine, &mut touched, &ignore_matcher, entry).await {
                     warn!("Live remote change error: {}", e);
+                    notify_sync_error_telegram(
+                        &config,
+                        Some(&path),
+                        &format!("Live remote change error: {}", e),
+                    )
+                    .await;
                 }
             }
         }
@@ -481,6 +587,8 @@ async fn run_remote_changes(
                     }
                 }
                 error!("Changes feed error: {}", e);
+                notify_sync_error_telegram(&config, None, &format!("Changes feed error: {}", e))
+                    .await;
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }

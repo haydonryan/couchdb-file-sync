@@ -109,6 +109,7 @@ notifications:
     bot_token: "${TELEGRAM_BOT_TOKEN}"
     chat_id: "${TELEGRAM_CHAT_ID}"
   notify_on_conflict: true
+  notify_on_sync_error: true
 
 logging:
   level: "info"      # error, warn, info, debug, trace
