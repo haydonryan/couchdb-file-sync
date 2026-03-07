@@ -33,25 +33,34 @@ The binary will be at `target/release/couchdb-file-sync`.
 
 ## Quick Start
 
-### 1. Initialize a Sync Directory
+### 1. Configure CouchDB Connection and Paths
+
+Create a `couchdb-file-sync.yaml` (or use environment variables) and define your sync paths.
+
+```bash
+cp /path/to/couchdb-file-sync.yaml.example ./couchdb-file-sync.yaml
+# Edit couchdb-file-sync.yaml with your CouchDB credentials and paths
+```
+
+Use the `couchdb-file-sync.yaml.example` in the repository as a starting point if you installed from source.
+
+### 2. Initialize Sync Directories
+
+```bash
+couchdb-file-sync init
+```
+
+This initializes all `paths` defined in your config. You can also pass a single path:
 
 ```bash
 couchdb-file-sync init ~/my-documents
 ```
 
+If you pass a path that is not listed in your config, `init` will warn and you should add it to `paths` before syncing.
+
 This creates:
 - `.couchdb-file-sync/` directory for state storage
 - `.sync-ignore` file for ignore patterns
-
-### 2. Configure CouchDB Connection
-
-```bash
-cd ~/my-documents
-cp /path/to/couchdb-file-sync.yaml.example .couchdb-file-sync/couchdb-file-sync.yaml
-# Edit .couchdb-file-sync/couchdb-file-sync.yaml with your CouchDB credentials
-```
-
-Use the `couchdb-file-sync.yaml.example` in the repository as a starting point if you installed from source.
 
 ### 3. Run Initial Sync
 
@@ -99,6 +108,10 @@ couchdb:
   password: "${COUCHDB_PASSWORD}"
   database: "couchdb_file_sync_files"
 
+paths:
+  - local: "/absolute/or/relative/path"
+    remote: "notes/"
+
 sync:
   poll_interval: 60
   debounce_ms: 500
@@ -121,7 +134,8 @@ logging:
 
 ### `couchdb-file-sync init [PATH]`
 
-Initialize a new sync directory.
+Initialize a new sync directory. If `PATH` is omitted, all paths from the config are initialized.
+If you pass a path not listed in the config, `init` will warn so you can add it to `paths`.
 
 ```bash
 couchdb-file-sync init ~/documents
