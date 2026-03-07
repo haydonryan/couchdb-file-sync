@@ -43,9 +43,8 @@ struct Cli {
 enum Commands {
     /// Initialize a new sync directory
     Init {
-        /// Directory to initialize (default: current directory)
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Directory to initialize (uses paths from config if not specified)
+        path: Option<PathBuf>,
 
         /// CouchDB URL
         #[arg(long)]
@@ -151,7 +150,28 @@ async fn main() -> Result<()> {
             db_url,
             db_name,
         } => {
-            cli::init(path, db_url, db_name).await?;
+            let paths = resolve_paths(path, &config);
+            let cli_path = path.is_some();
+            for sync_path in paths {
+                let path_configured = if cli_path {
+                    config.paths.iter().any(|p| p.local == sync_path.local)
+                } else {
+                    true
+                };
+                if cli_path && !path_configured {
+                    println!(
+                        "Warning: {} is not listed in your config paths.",
+                        sync_path.local.display()
+                    );
+                }
+                cli::init(
+                    sync_path.local,
+                    db_url.clone(),
+                    db_name.clone(),
+                    path_configured,
+                )
+                .await?;
+            }
         }
         Commands::Sync { path, dry_run } => {
             let paths = resolve_paths(path, &config);
