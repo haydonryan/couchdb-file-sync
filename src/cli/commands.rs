@@ -27,9 +27,7 @@ pub async fn init(
         path.display()
     );
 
-    let new_db_path = path
-        .join(".couchdb-file-sync")
-        .join("state.db");
+    let new_db_path = path.join(".couchdb-file-sync").join("state.db");
     let old_db_path = path.join(".couchfs").join("state.db");
     if new_db_path.exists() || old_db_path.exists() {
         println!(
@@ -98,9 +96,7 @@ target/
     if path_configured {
         println!("  1. Run: couchdb-file-sync sync {}", path.display());
     } else {
-        println!(
-            "  1. Add this path to your config file (couchdb-file-sync.yaml) under `paths`"
-        );
+        println!("  1. Add this path to your config file (couchdb-file-sync.yaml) under `paths`");
         println!("  2. Run: couchdb-file-sync sync {}", path.display());
     }
 
