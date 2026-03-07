@@ -150,8 +150,8 @@ async fn main() -> Result<()> {
             db_url,
             db_name,
         } => {
-            let paths = resolve_paths(path, &config);
             let cli_path = path.is_some();
+            let paths = resolve_paths(path, &config);
             for sync_path in paths {
                 let path_configured = if cli_path {
                     config.paths.iter().any(|p| p.local == sync_path.local)
