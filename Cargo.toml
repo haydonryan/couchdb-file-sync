@@ -35,7 +35,7 @@ similar = "2.6"
 config = "0.15"
 
 # File watching
-notify-debouncer-full = "0.5"
+notify-debouncer-full = "0.7"
 
 # SQLite
 rusqlite = { version = "0.38", features = ["bundled", "chrono", "serde_json"] }
