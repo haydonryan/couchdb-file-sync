@@ -31,15 +31,24 @@ cargo build --release
 
 The binary will be at `target/release/couchdb-file-sync`.
 
+To install it for the current user and create a user-level systemd service:
+
+```bash
+./target/release/couchdb-file-sync install
+```
+
+This installs the binary to `~/.local/bin/couchdb-file-sync`, writes the config file to `~/.config/couchdb-file-sync/couchdb-file-sync.yaml` if it does not already exist, and enables `~/.config/systemd/user/couchdb-file-sync.service`.
+
 ## Quick Start
 
 ### 1. Configure CouchDB Connection and Paths
 
-Create a `couchdb-file-sync.yaml` (or use environment variables) and define your sync paths.
+Create `~/.config/couchdb-file-sync/couchdb-file-sync.yaml` (or use environment variables) and define your sync paths.
 
 ```bash
-cp /path/to/couchdb-file-sync.yaml.example ./couchdb-file-sync.yaml
-# Edit couchdb-file-sync.yaml with your CouchDB credentials and paths
+mkdir -p ~/.config/couchdb-file-sync
+cp /path/to/couchdb-file-sync.yaml.example ~/.config/couchdb-file-sync/couchdb-file-sync.yaml
+# Edit ~/.config/couchdb-file-sync/couchdb-file-sync.yaml with your CouchDB credentials and paths
 ```
 
 Use the `couchdb-file-sync.yaml.example` in the repository as a starting point if you installed from source.
@@ -86,7 +95,7 @@ couchdb-file-sync daemon --live
 Configuration is loaded in this precedence order (highest to lowest):
 1. CLI arguments
 2. Environment variables (`COUCHDB_FILE_SYNC_*`)
-3. YAML config file (`couchdb-file-sync.yaml`)
+3. YAML config file (`~/.config/couchdb-file-sync/couchdb-file-sync.yaml`, or a project-local config discovered from the current directory upward)
 4. Default values
 
 ### Environment Variables
@@ -196,6 +205,14 @@ Show sync status.
 ```bash
 couchdb-file-sync status
 couchdb-file-sync status --json
+```
+
+### `couchdb-file-sync install`
+
+Install the current binary to the standard user location, create a user-level systemd service, and point it at `~/.config/couchdb-file-sync/couchdb-file-sync.yaml`.
+
+```bash
+couchdb-file-sync install
 ```
 
 ## Ignore Patterns

@@ -1,19 +1,28 @@
-use crate::config::{AppConfig, SyncPath};
+use crate::config::{default_user_config_file, AppConfig, SyncPath};
 use crate::couchdb::{ChangeFeedEntry, CouchDb};
 use crate::local::{AsyncFileWatcher, LocalDb};
 use crate::models::{Change, ChangeType, IgnoreMatcher, ResolutionStrategy};
 use crate::sync::{SyncEngine, SyncReport};
 use crate::telegram::TelegramNotifier;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use dialoguer::{theme::ColorfulTheme, Select};
 use reqwest::StatusCode;
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashSet;
+use std::ffi::OsString;
+use std::fs;
+use std::io::ErrorKind;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+
+const EMBEDDED_CONFIG_TEMPLATE: &str = include_str!("../../couchdb-file-sync.yaml.example");
+const SYSTEMD_UNIT_NAME: &str = "couchdb-file-sync.service";
 
 /// Initialize a new sync directory
 pub async fn init(
@@ -101,6 +110,201 @@ target/
     }
 
     Ok(())
+}
+
+pub fn install_user_service() -> Result<()> {
+    let paths = InstallPaths::detect()?;
+
+    fs::create_dir_all(&paths.bin_dir)
+        .with_context(|| format!("Failed to create {}", paths.bin_dir.display()))?;
+    fs::create_dir_all(&paths.config_dir)
+        .with_context(|| format!("Failed to create {}", paths.config_dir.display()))?;
+    fs::create_dir_all(&paths.systemd_user_dir)
+        .with_context(|| format!("Failed to create {}", paths.systemd_user_dir.display()))?;
+
+    let current_exe = std::env::current_exe().context("Failed to locate the running executable")?;
+    install_binary(&current_exe, &paths.binary_path)?;
+    ensure_config_file(&paths.config_file)?;
+    write_service_file(&paths)?;
+    reload_and_enable_service()?;
+
+    println!("✓ Installed binary to {}", paths.binary_path.display());
+    println!("✓ Config file: {}", paths.config_file.display());
+    println!("✓ User service: {}", paths.service_file.display());
+    println!("✓ Enabled and started {}", SYSTEMD_UNIT_NAME);
+    println!();
+    println!(
+        "Edit {} to finish configuring sync paths and CouchDB access.",
+        paths.config_file.display()
+    );
+
+    Ok(())
+}
+
+fn install_binary(current_exe: &Path, target_binary: &Path) -> Result<()> {
+    if current_exe == target_binary {
+        return Ok(());
+    }
+
+    fs::copy(current_exe, target_binary).with_context(|| {
+        format!(
+            "Failed to copy {} to {}",
+            current_exe.display(),
+            target_binary.display()
+        )
+    })?;
+    set_mode(target_binary, 0o755)?;
+    Ok(())
+}
+
+fn ensure_config_file(config_file: &Path) -> Result<()> {
+    match fs::metadata(config_file) {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            fs::write(config_file, EMBEDDED_CONFIG_TEMPLATE)
+                .with_context(|| format!("Failed to write {}", config_file.display()))?;
+            set_mode(config_file, 0o644)
+        }
+        Err(err) => {
+            Err(err).with_context(|| format!("Failed to inspect {}", config_file.display()))
+        }
+    }
+}
+
+fn write_service_file(paths: &InstallPaths) -> Result<()> {
+    let service = render_systemd_service(paths);
+    fs::write(&paths.service_file, service)
+        .with_context(|| format!("Failed to write {}", paths.service_file.display()))?;
+    set_mode(&paths.service_file, 0o644)?;
+    Ok(())
+}
+
+fn reload_and_enable_service() -> Result<()> {
+    run_systemctl_user(&["daemon-reload"])?;
+    run_systemctl_user(&["enable", "--now", SYSTEMD_UNIT_NAME])?;
+    Ok(())
+}
+
+fn run_systemctl_user(args: &[&str]) -> Result<()> {
+    let status = Command::new("systemctl")
+        .args(["--user"])
+        .args(args)
+        .status()
+        .with_context(|| format!("Failed to run systemctl --user {}", args.join(" ")))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "systemctl --user {} exited with status {}",
+            args.join(" "),
+            status
+        );
+    }
+}
+
+fn render_systemd_service(paths: &InstallPaths) -> String {
+    format!(
+        "[Unit]
+Description=CouchDB File Sync daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={} --config {} daemon
+Restart=always
+RestartSec=5
+Environment=PATH={}
+
+[Install]
+WantedBy=default.target
+",
+        shell_quote(&paths.binary_path),
+        shell_quote(&paths.config_file),
+        shell_quote_path_list(&[
+            paths.bin_dir.clone(),
+            PathBuf::from("/usr/local/bin"),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+        ])
+    )
+}
+
+fn shell_quote(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"/._-:@".contains(&byte))
+    {
+        value.into_owned()
+    } else {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
+fn shell_quote_path_list(paths: &[PathBuf]) -> String {
+    let joined = std::env::join_paths(paths.iter().map(PathBuf::as_path))
+        .unwrap_or_else(|_| OsString::from("/usr/local/bin:/usr/bin:/bin"));
+    shell_quote(Path::new(&joined))
+}
+
+fn set_mode(path: &Path, mode: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(mode);
+        fs::set_permissions(path, permissions)?;
+    }
+
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct InstallPaths {
+    bin_dir: PathBuf,
+    binary_path: PathBuf,
+    config_dir: PathBuf,
+    config_file: PathBuf,
+    systemd_user_dir: PathBuf,
+    service_file: PathBuf,
+}
+
+impl InstallPaths {
+    fn detect() -> Result<Self> {
+        let home_dir = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .context("HOME is not set")?;
+        let bin_dir = std::env::var_os("XDG_BIN_HOME")
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| home_dir.join(".local/bin"));
+        let config_file = default_user_config_file()
+            .context("Could not determine the standard config location")?;
+        let config_dir = config_file
+            .parent()
+            .map(Path::to_path_buf)
+            .context("Config file path has no parent directory")?;
+        let systemd_config_home = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| home_dir.join(".config"));
+        let systemd_user_dir = systemd_config_home.join("systemd/user");
+        let binary_path = bin_dir.join("couchdb-file-sync");
+        let service_file = systemd_user_dir.join(SYSTEMD_UNIT_NAME);
+
+        Ok(Self {
+            bin_dir,
+            binary_path,
+            config_dir,
+            config_file,
+            systemd_user_dir,
+            service_file,
+        })
+    }
 }
 
 /// Run a one-time sync
