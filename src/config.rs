@@ -1,7 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tracing::debug;
 
 /// A sync path pair mapping local directory to remote path
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -37,21 +36,10 @@ impl AppConfig {
     /// Load configuration from file and environment
     pub fn load(config_path: Option<PathBuf>) -> Result<Self> {
         let mut config_builder = config::Config::builder();
-        let config_source = if let Some(path) = config_path {
-            debug!("Loading config file from {}", path.display());
-            config_builder = config_builder.add_source(config::File::from(path.clone()));
-            Some(path)
+        if let Some(path) = config_path {
+            config_builder = config_builder.add_source(config::File::from(path));
         } else if let Some(path) = Self::find_config_file() {
-            debug!("Loading config file from {}", path.display());
-            config_builder = config_builder.add_source(config::File::from(path.clone()));
-            Some(path)
-        } else {
-            debug!("No config file found; using defaults and environment overrides");
-            None
-        };
-
-        if let Some(path) = &config_source {
-            debug!("Resolved config source: {}", path.display());
+            config_builder = config_builder.add_source(config::File::from(path));
         }
 
         // Add environment variables with COUCHDB_FILE_SYNC_ prefix

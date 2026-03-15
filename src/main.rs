@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use tracing::info;
 
 use couchdb_file_sync::cli;
-use couchdb_file_sync::config::{AppConfig, SyncPath};
+use couchdb_file_sync::config::{default_user_config_file, AppConfig, SyncPath};
 
 #[derive(Parser, Debug)]
 #[command(name = "couchdb-file-sync")]
@@ -115,6 +115,15 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if cli.verbose > 0 {
+        match resolved_config_path(cli.config.clone()) {
+            Some((path, source)) => {
+                eprintln!("Using config file ({source}): {}", path.display())
+            }
+            None => eprintln!("No config file found; using defaults and environment overrides"),
+        }
+    }
 
     // Load configuration
     let mut config = match AppConfig::load(cli.config) {
@@ -266,6 +275,63 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn resolved_config_path(explicit_path: Option<PathBuf>) -> Option<(PathBuf, &'static str)> {
+    if let Some(path) = explicit_path {
+        return Some((path, "--config"));
+    }
+
+    find_project_config()
+        .map(|path| (path, "project discovery"))
+        .or_else(|| default_user_config_file_if_exists().map(|path| (path, "user config")))
+}
+
+fn find_project_config() -> Option<PathBuf> {
+    let filenames = [
+        "couchdb-file-sync.yaml",
+        "couchdb-file-sync.yml",
+        ".couchdb-file-sync.yaml",
+        ".couchdb-file-sync.yml",
+        ".couchdb-file-sync/couchdb-file-sync.yaml",
+        "couchfs.yaml",
+        "couchfs.yml",
+        ".couchfs.yaml",
+        ".couchfs.yml",
+        ".couchfs/couchfs.yaml",
+    ];
+
+    let mut current_dir = std::env::current_dir().ok()?;
+
+    loop {
+        for filename in filenames {
+            let path = current_dir.join(filename);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+
+        match current_dir.parent() {
+            Some(parent) => current_dir = parent.to_path_buf(),
+            None => break,
+        }
+    }
+
+    None
+}
+
+fn default_user_config_file_if_exists() -> Option<PathBuf> {
+    let yaml = default_user_config_file()?;
+    if yaml.exists() {
+        return Some(yaml);
+    }
+
+    let yml = yaml.with_extension("yml");
+    if yml.exists() {
+        return Some(yml);
+    }
+
+    None
 }
 
 /// Resolve sync paths from CLI argument or config
