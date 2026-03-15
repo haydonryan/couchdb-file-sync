@@ -141,6 +141,21 @@ pub fn install_user_service() -> Result<()> {
     Ok(())
 }
 
+pub fn uninstall_user_service() -> Result<()> {
+    let paths = InstallPaths::detect()?;
+
+    stop_and_disable_service()?;
+    remove_if_exists(&paths.service_file)?;
+    run_systemctl_user(&["daemon-reload"])?;
+    remove_if_exists(&paths.binary_path)?;
+
+    println!("✓ Removed user service {}", paths.service_file.display());
+    println!("✓ Removed installed binary {}", paths.binary_path.display());
+    println!("Config file left in place: {}", paths.config_file.display());
+
+    Ok(())
+}
+
 fn install_binary(current_exe: &Path, target_binary: &Path) -> Result<()> {
     if current_exe == target_binary {
         return Ok(());
@@ -185,6 +200,11 @@ fn reload_and_enable_service() -> Result<()> {
     Ok(())
 }
 
+fn stop_and_disable_service() -> Result<()> {
+    run_systemctl_user_ignore_missing(&["disable", "--now", SYSTEMD_UNIT_NAME])?;
+    Ok(())
+}
+
 fn run_systemctl_user(args: &[&str]) -> Result<()> {
     let status = Command::new("systemctl")
         .args(["--user"])
@@ -193,6 +213,38 @@ fn run_systemctl_user(args: &[&str]) -> Result<()> {
         .with_context(|| format!("Failed to run systemctl --user {}", args.join(" ")))?;
 
     if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "systemctl --user {} exited with status {}",
+            args.join(" "),
+            status
+        );
+    }
+}
+
+fn run_systemctl_user_ignore_missing(args: &[&str]) -> Result<()> {
+    let status = Command::new("systemctl")
+        .args(["--user"])
+        .args(args)
+        .status()
+        .with_context(|| format!("Failed to run systemctl --user {}", args.join(" ")))?;
+
+    if status.success() {
+        return Ok(());
+    }
+
+    let missing_status = Command::new("systemctl")
+        .args(["--user", "status", SYSTEMD_UNIT_NAME])
+        .status()
+        .with_context(|| {
+            format!(
+                "Failed to run systemctl --user status {}",
+                SYSTEMD_UNIT_NAME
+            )
+        })?;
+
+    if !missing_status.success() {
         Ok(())
     } else {
         anyhow::bail!(
@@ -261,6 +313,14 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
     let _ = (path, mode);
 
     Ok(())
+}
+
+fn remove_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("Failed to remove {}", path.display())),
+    }
 }
 
 #[derive(Debug, Clone)]
