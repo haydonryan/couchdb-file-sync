@@ -60,23 +60,11 @@ impl AppConfig {
 
     /// Find config file in current directory or parent directories
     fn find_config_file() -> Option<PathBuf> {
-        let filenames = [
-            "couchdb-file-sync.yaml",
-            "couchdb-file-sync.yml",
-            ".couchdb-file-sync.yaml",
-            ".couchdb-file-sync.yml",
-            ".couchdb-file-sync/couchdb-file-sync.yaml",
-            "couchfs.yaml",
-            "couchfs.yml",
-            ".couchfs.yaml",
-            ".couchfs.yml",
-            ".couchfs/couchfs.yaml",
-        ];
-
+        let filenames = config_search_filenames();
         let mut current_dir = std::env::current_dir().ok()?;
 
         loop {
-            for filename in &filenames {
+            for filename in filenames {
                 let path = current_dir.join(filename);
                 if path.exists() {
                     return Some(path);
@@ -90,8 +78,47 @@ impl AppConfig {
             }
         }
 
-        None
+        default_user_config_candidates()
+            .into_iter()
+            .find(|path| path.exists())
     }
+}
+
+pub fn default_user_config_dir() -> Option<PathBuf> {
+    let home_dir = std::env::var_os("HOME").map(PathBuf::from)?;
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| home_dir.join(".config"));
+    Some(config_home.join("couchdb-file-sync"))
+}
+
+pub fn default_user_config_file() -> Option<PathBuf> {
+    default_user_config_dir().map(|dir| dir.join("couchdb-file-sync.yaml"))
+}
+
+fn default_user_config_candidates() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(config_dir) = default_user_config_dir() {
+        paths.push(config_dir.join("couchdb-file-sync.yaml"));
+        paths.push(config_dir.join("couchdb-file-sync.yml"));
+    }
+    paths
+}
+
+fn config_search_filenames() -> &'static [&'static str] {
+    &[
+        "couchdb-file-sync.yaml",
+        "couchdb-file-sync.yml",
+        ".couchdb-file-sync.yaml",
+        ".couchdb-file-sync.yml",
+        ".couchdb-file-sync/couchdb-file-sync.yaml",
+        "couchfs.yaml",
+        "couchfs.yml",
+        ".couchfs.yaml",
+        ".couchfs.yml",
+        ".couchfs/couchfs.yaml",
+    ]
 }
 
 /// CouchDB connection configuration
@@ -277,4 +304,45 @@ fn default_log_level() -> String {
 
 fn default_log_format() -> String {
     "pretty".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn default_user_config_dir_uses_xdg_config_home_when_set() {
+        let dir = resolve_user_config_dir(
+            Some(Path::new("/home/tester")),
+            Some(Path::new("/tmp/xdg-config")),
+        )
+        .unwrap();
+
+        assert_eq!(dir, PathBuf::from("/tmp/xdg-config/couchdb-file-sync"));
+    }
+
+    #[test]
+    fn default_user_config_dir_falls_back_to_home_config() {
+        let dir = resolve_user_config_dir(Some(Path::new("/home/tester")), None).unwrap();
+
+        assert_eq!(dir, PathBuf::from("/home/tester/.config/couchdb-file-sync"));
+    }
+
+    #[test]
+    fn default_user_config_dir_requires_home() {
+        assert!(resolve_user_config_dir(None, Some(Path::new("/tmp/xdg-config"))).is_none());
+    }
+
+    fn resolve_user_config_dir(
+        home_dir: Option<&Path>,
+        xdg_config_home: Option<&Path>,
+    ) -> Option<PathBuf> {
+        let home_dir = home_dir?.to_path_buf();
+        let config_home = xdg_config_home
+            .map(Path::to_path_buf)
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| home_dir.join(".config"));
+        Some(config_home.join("couchdb-file-sync"))
+    }
 }

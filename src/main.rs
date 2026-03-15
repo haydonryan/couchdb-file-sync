@@ -104,6 +104,9 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Install the binary and set up a user-level systemd service
+    Install,
 }
 
 #[tokio::main]
@@ -250,6 +253,9 @@ async fn main() -> Result<()> {
                 }
                 cli::status(sync_path.local.clone(), json, &config).await?;
             }
+        }
+        Commands::Install => {
+            cli::install_user_service()?;
         }
     }
 
