@@ -215,6 +215,14 @@ Install the current binary to the standard user location, create a user-level sy
 couchdb-file-sync install
 ```
 
+### `couchdb-file-sync uninstall`
+
+Remove the user-level systemd service and the installed binary from `~/.local/bin`. The config file in `~/.config/couchdb-file-sync/couchdb-file-sync.yaml` is kept.
+
+```bash
+couchdb-file-sync uninstall
+```
+
 ## Ignore Patterns
 
 Create a `.sync-ignore` file in your sync root with gitignore-style patterns:

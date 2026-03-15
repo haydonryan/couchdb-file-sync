@@ -107,6 +107,9 @@ enum Commands {
 
     /// Install the binary and set up a user-level systemd service
     Install,
+
+    /// Remove the user-level systemd service and installed binary
+    Uninstall,
 }
 
 #[tokio::main]
@@ -256,6 +259,9 @@ async fn main() -> Result<()> {
         }
         Commands::Install => {
             cli::install_user_service()?;
+        }
+        Commands::Uninstall => {
+            cli::uninstall_user_service()?;
         }
     }
 
