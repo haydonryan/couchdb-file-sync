@@ -135,6 +135,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: [check, test, coverage, Lint, Security]
     if: github.actor == 'dependabot[bot]' && github.event_name == 'pull_request'
+    env:
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
     steps:
       - name: Dependabot metadata
         id: metadata
@@ -153,3 +156,13 @@ jobs:
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Post blocks to a Slack channel
+        if: ${{ env.SLACK_BOT_TOKEN != '' && env.SLACK_CHANNEL_ID != '' }}
+        uses: slackapi/slack-github-action@v3
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            channel: ${{ secrets.SLACK_CHANNEL_ID }}
+            text: "Dependabot auto-merge enabled: ${{ github.event.pull_request.html_url }}"
