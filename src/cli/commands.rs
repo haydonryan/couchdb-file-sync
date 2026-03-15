@@ -5,7 +5,7 @@ use crate::models::{Change, ChangeType, IgnoreMatcher, ResolutionStrategy};
 use crate::sync::{SyncEngine, SyncReport};
 use crate::telegram::TelegramNotifier;
 use anyhow::{Context, Result};
-use dialoguer::{theme::ColorfulTheme, Select};
+use dialoguer::{theme::ColorfulTheme, Confirm, Select};
 use reqwest::StatusCode;
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashSet;
@@ -124,19 +124,21 @@ pub fn install_user_service() -> Result<()> {
 
     let current_exe = std::env::current_exe().context("Failed to locate the running executable")?;
     install_binary(&current_exe, &paths.binary_path)?;
-    ensure_config_file(&paths.config_file)?;
+    let config_status = ensure_config_file(&paths.config_file)?;
     write_service_file(&paths)?;
     reload_and_enable_service()?;
 
     println!("✓ Installed binary to {}", paths.binary_path.display());
-    println!("✓ Config file: {}", paths.config_file.display());
+    match config_status {
+        ConfigStatus::Existing => {
+            println!("✓ Using existing config: {}", paths.config_file.display());
+        }
+        ConfigStatus::CreatedTemplate => {
+            println!("✓ Created config template: {}", paths.config_file.display());
+        }
+    }
     println!("✓ User service: {}", paths.service_file.display());
     println!("✓ Enabled and started {}", SYSTEMD_UNIT_NAME);
-    println!();
-    println!(
-        "Edit {} to finish configuring sync paths and CouchDB access.",
-        paths.config_file.display()
-    );
 
     Ok(())
 }
@@ -172,13 +174,30 @@ fn install_binary(current_exe: &Path, target_binary: &Path) -> Result<()> {
     Ok(())
 }
 
-fn ensure_config_file(config_file: &Path) -> Result<()> {
+fn ensure_config_file(config_file: &Path) -> Result<ConfigStatus> {
     match fs::metadata(config_file) {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(ConfigStatus::Existing),
         Err(err) if err.kind() == ErrorKind::NotFound => {
+            let should_create = Confirm::with_theme(&ColorfulTheme::default())
+                .with_prompt(format!(
+                    "No config found at {}. Create a template there?",
+                    config_file.display()
+                ))
+                .default(true)
+                .interact()
+                .context("Failed to read config creation prompt")?;
+
+            if !should_create {
+                anyhow::bail!(
+                    "Installation aborted: no config found at {}",
+                    config_file.display()
+                );
+            }
+
             fs::write(config_file, EMBEDDED_CONFIG_TEMPLATE)
                 .with_context(|| format!("Failed to write {}", config_file.display()))?;
-            set_mode(config_file, 0o644)
+            set_mode(config_file, 0o644)?;
+            Ok(ConfigStatus::CreatedTemplate)
         }
         Err(err) => {
             Err(err).with_context(|| format!("Failed to inspect {}", config_file.display()))
@@ -331,6 +350,12 @@ struct InstallPaths {
     config_file: PathBuf,
     systemd_user_dir: PathBuf,
     service_file: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ConfigStatus {
+    Existing,
+    CreatedTemplate,
 }
 
 impl InstallPaths {
