@@ -95,7 +95,7 @@ couchdb-file-sync daemon --live
 Configuration is loaded in this precedence order (highest to lowest):
 1. CLI arguments
 2. Environment variables (`COUCHDB_FILE_SYNC_*`)
-3. YAML config file (`~/.config/couchdb-file-sync/couchdb-file-sync.yaml`, or a project-local config discovered from the current directory upward)
+3. YAML config file (`~/.config/couchdb-file-sync/couchdb-file-sync.yaml`)
 4. Default values
 
 ### Environment Variables

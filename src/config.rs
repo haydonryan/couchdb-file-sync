@@ -58,24 +58,6 @@ impl AppConfig {
 
     /// Find config file in current directory or parent directories
     fn find_config_file() -> Option<PathBuf> {
-        let filenames = config_search_filenames();
-        let mut current_dir = std::env::current_dir().ok()?;
-
-        loop {
-            for filename in filenames {
-                let path = current_dir.join(filename);
-                if path.exists() {
-                    return Some(path);
-                }
-            }
-
-            // Go up one directory
-            match current_dir.parent() {
-                Some(parent) => current_dir = parent.to_path_buf(),
-                None => break,
-            }
-        }
-
         default_user_config_candidates()
             .into_iter()
             .find(|path| path.exists())
@@ -102,21 +84,6 @@ fn default_user_config_candidates() -> Vec<PathBuf> {
         paths.push(config_dir.join("couchdb-file-sync.yml"));
     }
     paths
-}
-
-fn config_search_filenames() -> &'static [&'static str] {
-    &[
-        "couchdb-file-sync.yaml",
-        "couchdb-file-sync.yml",
-        ".couchdb-file-sync.yaml",
-        ".couchdb-file-sync.yml",
-        ".couchdb-file-sync/couchdb-file-sync.yaml",
-        "couchfs.yaml",
-        "couchfs.yml",
-        ".couchfs.yaml",
-        ".couchfs.yml",
-        ".couchfs/couchfs.yaml",
-    ]
 }
 
 /// CouchDB connection configuration

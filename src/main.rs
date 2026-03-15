@@ -282,42 +282,7 @@ fn resolved_config_path(explicit_path: Option<PathBuf>) -> Option<(PathBuf, &'st
         return Some((path, "--config"));
     }
 
-    find_project_config()
-        .map(|path| (path, "project discovery"))
-        .or_else(|| default_user_config_file_if_exists().map(|path| (path, "user config")))
-}
-
-fn find_project_config() -> Option<PathBuf> {
-    let filenames = [
-        "couchdb-file-sync.yaml",
-        "couchdb-file-sync.yml",
-        ".couchdb-file-sync.yaml",
-        ".couchdb-file-sync.yml",
-        ".couchdb-file-sync/couchdb-file-sync.yaml",
-        "couchfs.yaml",
-        "couchfs.yml",
-        ".couchfs.yaml",
-        ".couchfs.yml",
-        ".couchfs/couchfs.yaml",
-    ];
-
-    let mut current_dir = std::env::current_dir().ok()?;
-
-    loop {
-        for filename in filenames {
-            let path = current_dir.join(filename);
-            if path.exists() {
-                return Some(path);
-            }
-        }
-
-        match current_dir.parent() {
-            Some(parent) => current_dir = parent.to_path_buf(),
-            None => break,
-        }
-    }
-
-    None
+    default_user_config_file_if_exists().map(|path| (path, "user config"))
 }
 
 fn default_user_config_file_if_exists() -> Option<PathBuf> {
