@@ -9,3 +9,4 @@ _docker/
 move-test-local/
 _testdata/
 couchfs.yaml
+testing/
