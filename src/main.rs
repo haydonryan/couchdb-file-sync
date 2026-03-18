@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use tracing::info;
 
 use couchdb_file_sync::cli;
-use couchdb_file_sync::config::{default_user_config_file, AppConfig, SyncPath};
+use couchdb_file_sync::config::{default_log_file, default_user_config_file, AppConfig, SyncPath};
+use couchdb_file_sync::logging::{AppLogWriter, RotationMode};
 
 #[derive(Parser, Debug)]
 #[command(name = "couchdb-file-sync")]
@@ -156,7 +157,8 @@ async fn main() -> Result<()> {
     );
 
     // Initialize logging
-    init_logging(cli.verbose, &config, enable_file_logging);
+    let daemon_mode = matches!(&cli.command, Commands::Daemon { .. });
+    init_logging(cli.verbose, &config, enable_file_logging, daemon_mode);
 
     // Execute command
     match cli.command {
@@ -325,7 +327,7 @@ fn resolve_paths(cli_path: Option<PathBuf>, config: &AppConfig) -> Vec<SyncPath>
 }
 
 /// Initialize logging based on verbosity or RUST_LOG env var
-fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool) {
+fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daemon_mode: bool) {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::EnvFilter;
@@ -350,23 +352,22 @@ fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool) {
             .logging
             .file
             .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/couchfs.logs"));
-        if let Some(parent) = log_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    eprintln!("Failed to create log directory {}: {}", parent.display(), e);
-                }
+            .or_else(default_log_file)
+            .unwrap_or_else(|| std::path::PathBuf::from("couchdb-file-sync.log"));
+        let rotation = if daemon_mode {
+            RotationMode::Daily
+        } else {
+            RotationMode::Never
+        };
+        let log_writer = AppLogWriter::new(log_path.clone(), rotation, config.logging.rotated_logs);
+        let (non_blocking, guard) = match log_writer {
+            Ok(writer) => tracing_appender::non_blocking(writer),
+            Err(err) => {
+                eprintln!("Failed to open log file {}: {}", log_path.display(), err);
+                tracing_subscriber::registry().with(stdout_layer).init();
+                return;
             }
-        }
-        let file_name = log_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("couchfs.logs");
-        let dir = log_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("/tmp"));
-        let file_appender = tracing_appender::rolling::never(dir, file_name);
-        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        };
         Box::leak(Box::new(guard));
 
         let file_filter = EnvFilter::new("couchdb_file_sync=trace");

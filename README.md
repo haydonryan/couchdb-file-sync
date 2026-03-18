@@ -17,7 +17,7 @@ A Rust-based filesystem-to-CouchDB synchronization engine with bidirectional syn
 | ⚠️ | **Flexible Configuration** | CLI args, YAML config, and environment variables |
 | ⚠️ | **Conflict File Preservation (optional)** | Keep-both resolution saves remote file as `filename.remote` |
 | ❌ | **Live Mode** | Optional filesystem watcher + CouchDB changes feed for low-latency sync |
-| ⚠️ | **Detailed Sync Logs** | `sync` and `daemon` write detailed logs to `/tmp/couchfs.logs` (override via `logging.file`) |
+| ⚠️ | **Detailed Sync Logs** | `sync` and `daemon` write detailed logs to `$XDG_STATE_HOME/couchdb-file-sync/couchdb-file-sync.log` by default (override via `logging.file`) |
 
 ## Installation
 
@@ -136,7 +136,8 @@ notifications:
 logging:
   level: "info"      # error, warn, info, debug, trace
   format: "pretty"   # pretty, json, compact
-  file: "/tmp/couchfs.logs"  # Optional file output (used by sync/daemon)
+  file: "~/.local/state/couchdb-file-sync/couchdb-file-sync.log"  # Optional file output (used by sync/daemon)
+  rotated_logs: "delete"  # delete, keep (daemon rotates every 24 hours)
 ```
 
 ## CLI Commands
