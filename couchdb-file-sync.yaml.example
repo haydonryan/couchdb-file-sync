@@ -67,4 +67,5 @@ notifications:
 logging:
   level: "info"      # error, warn, info, debug, trace
   format: "pretty"   # pretty, json, compact
-  # file: "/tmp/couchfs.logs"  # Optional file output (used by sync/daemon)
+  # file: "~/.local/state/couchdb-file-sync/couchdb-file-sync.log"  # Optional file output (used by sync/daemon)
+  rotated_logs: "delete"  # delete, keep (daemon rotates every 24 hours)

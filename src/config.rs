@@ -77,6 +77,19 @@ pub fn default_user_config_file() -> Option<PathBuf> {
     default_user_config_dir().map(|dir| dir.join("couchdb-file-sync.yaml"))
 }
 
+pub fn default_user_state_dir() -> Option<PathBuf> {
+    let home_dir = std::env::var_os("HOME").map(PathBuf::from)?;
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| home_dir.join(".local").join("state"));
+    Some(state_home.join("couchdb-file-sync"))
+}
+
+pub fn default_log_file() -> Option<PathBuf> {
+    default_user_state_dir().map(|dir| dir.join("couchdb-file-sync.log"))
+}
+
 fn default_user_config_candidates() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(config_dir) = default_user_config_dir() {
@@ -206,6 +219,8 @@ pub struct LoggingConfig {
     #[serde(default = "default_log_format")]
     pub format: String,
     pub file: Option<PathBuf>,
+    #[serde(default)]
+    pub rotated_logs: RotatedLogPolicy,
 }
 
 impl Default for LoggingConfig {
@@ -214,8 +229,17 @@ impl Default for LoggingConfig {
             level: default_log_level(),
             format: default_log_format(),
             file: None,
+            rotated_logs: RotatedLogPolicy::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum RotatedLogPolicy {
+    Keep,
+    #[default]
+    Delete,
 }
 
 // Default value functions
