@@ -39,6 +39,14 @@ To install it for the current user and create a user-level systemd service:
 
 This installs the binary to `~/.local/bin/couchdb-file-sync`, writes the config file to `~/.config/couchdb-file-sync/couchdb-file-sync.yaml` if it does not already exist, and enables `~/.config/systemd/user/couchdb-file-sync.service`.
 
+## Development
+
+Enable the repo's pre-commit hook to run formatting, clippy, and tests before each commit:
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ## Quick Start
 
 ### 1. Configure CouchDB Connection and Paths
