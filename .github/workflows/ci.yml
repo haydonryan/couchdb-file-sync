@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main, master]
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
@@ -123,21 +127,48 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: rustsec/audit-check@v1.4.1
+      - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check all
 
+  detect-release-tag:
+    name: Detect Release Tag
+    runs-on: ubuntu-latest
+    needs: [check, test, Lint, Security]
+    if: github.event_name == 'push'
+    outputs:
+      tag: ${{ steps.detect.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Fetch tags
+        run: git fetch --force --tags
+      - name: Detect release tag
+        id: detect
+        run: |
+          tag=$(git tag --points-at "${GITHUB_SHA}" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Release
+    needs: [detect-release-tag]
+    if: needs.detect-release-tag.outputs.tag != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      release_tag: ${{ needs.detect-release-tag.outputs.tag }}
+      release_sha: ${{ github.sha }}
+
   auto-merge:
     name: Auto-merge Dependabot PRs
     runs-on: ubuntu-latest
     needs: [check, test, coverage, Lint, Security]
     if: github.actor == 'dependabot[bot]' && github.event_name == 'pull_request'
-    env:
-      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-      SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
     steps:
       - name: Dependabot metadata
         id: metadata
@@ -156,13 +187,3 @@ jobs:
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Post blocks to a Slack channel
-        if: ${{ env.SLACK_BOT_TOKEN != '' && env.SLACK_CHANNEL_ID != '' }}
-        uses: slackapi/slack-github-action@v3
-        with:
-          method: chat.postMessage
-          token: ${{ secrets.SLACK_BOT_TOKEN }}
-          payload: |
-            channel: ${{ secrets.SLACK_CHANNEL_ID }}
-            text: "Dependabot auto-merge enabled: ${{ github.event.pull_request.html_url }}"
