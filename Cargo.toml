@@ -38,7 +38,7 @@ config = "0.15"
 notify-debouncer-full = "0.7"
 
 # SQLite
-rusqlite = { version = "0.38", features = ["bundled", "chrono", "serde_json"] }
+rusqlite = { version = "0.39", features = ["bundled", "chrono", "serde_json"] }
 
 # Hashing
 sha2 = "0.10"
