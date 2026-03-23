@@ -1,11 +1,12 @@
 use crate::couchdb::CouchDb;
 use crate::local::{compute_bytes_hash, compute_file_hash, LocalDb, Scanner};
 use crate::models::{
-    Change, ChangeType, Conflict, FileState, IgnoreMatcher, RemoteState, ResolutionStrategy,
+    Change, ChangeType, Conflict, FileDoc, FileState, IgnoreMatcher, RemoteState,
+    ResolutionStrategy,
 };
 use anyhow::Result;
 use chrono::Utc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
 
@@ -150,6 +151,79 @@ impl SyncEngine {
         info!(
             "========== SYNC COMPLETE: {} uploaded, {} downloaded, {} conflicts ==========",
             report.uploaded, report.downloaded, report.conflicts
+        );
+
+        Ok(report)
+    }
+
+    /// Rebuild the remote scope so it exactly matches the local filesystem.
+    pub async fn rebuild_remote_from_local(&mut self) -> Result<SyncReport> {
+        info!("========== REMOTE REBUILD STARTING ==========");
+
+        let scanner = Scanner::new(self.root_dir.clone(), self.ignore_matcher.clone());
+        let local_states = scanner.full_scan()?;
+        let remote_docs = self.couchdb.get_all_files().await?;
+        let (uploads, remote_deletes) =
+            plan_remote_rebuild(&local_states, &remote_docs, self.couchdb.remote_prefix());
+
+        self.local_db.reset_sync_state()?;
+
+        let mut report = SyncReport::default();
+
+        for local_path in uploads {
+            let remote_path = self.couchdb.get_remote_path(&local_path);
+            self.upload_local_file(&local_path, &remote_path).await?;
+            report.uploaded += 1;
+        }
+
+        for remote_path in remote_deletes {
+            self.couchdb.delete_file(&remote_path).await?;
+            report.deleted_remote += 1;
+        }
+
+        info!(
+            "========== REMOTE REBUILD COMPLETE: {} uploaded, {} remote deletes ==========",
+            report.uploaded, report.deleted_remote
+        );
+
+        Ok(report)
+    }
+
+    /// Rebuild the local filesystem so it exactly matches the remote scope.
+    pub async fn rebuild_local_from_remote(&mut self) -> Result<SyncReport> {
+        info!("========== LOCAL REBUILD STARTING ==========");
+
+        let scanner = Scanner::new(self.root_dir.clone(), self.ignore_matcher.clone());
+        let local_states = scanner.full_scan()?;
+        let remote_docs = self.couchdb.get_all_files().await?;
+        let (local_deletes, remote_downloads) = plan_local_rebuild(&local_states, &remote_docs);
+
+        self.local_db.reset_sync_state()?;
+
+        let mut report = SyncReport::default();
+
+        for local_path in local_deletes {
+            let file_path = self.root_dir.join(&local_path);
+            if file_path.exists() {
+                tokio::fs::remove_file(&file_path).await?;
+                report.deleted_local += 1;
+            }
+        }
+
+        for remote_path in remote_downloads {
+            let local_path = self.couchdb.get_local_path(&remote_path);
+            if self
+                .download_remote_file(&remote_path, &local_path, true)
+                .await?
+                .is_some()
+            {
+                report.downloaded += 1;
+            }
+        }
+
+        info!(
+            "========== LOCAL REBUILD COMPLETE: {} deleted locally, {} downloaded ==========",
+            report.deleted_local, report.downloaded
         );
 
         Ok(report)
@@ -868,10 +942,66 @@ fn is_polluted_state_path(path: &str, remote_prefix: &str) -> bool {
         && (path == remote_prefix || path.starts_with(&format!("{remote_prefix}/")))
 }
 
+fn plan_remote_rebuild(
+    local_states: &[FileState],
+    remote_docs: &[FileDoc],
+    remote_prefix: &str,
+) -> (Vec<String>, Vec<String>) {
+    let local_paths: HashSet<_> = local_states
+        .iter()
+        .map(|state| state.path.as_str())
+        .collect();
+    let uploads = local_states
+        .iter()
+        .map(|state| state.path.clone())
+        .collect::<Vec<_>>();
+    let remote_deletes = remote_docs
+        .iter()
+        .filter(|doc| !doc.deleted)
+        .filter_map(|doc| {
+            let local_path = remote_path_to_local_path(&doc.id, remote_prefix);
+            (!local_paths.contains(local_path.as_str())).then(|| doc.id.clone())
+        })
+        .collect::<Vec<_>>();
+
+    (uploads, remote_deletes)
+}
+
+fn plan_local_rebuild(
+    local_states: &[FileState],
+    remote_docs: &[FileDoc],
+) -> (Vec<String>, Vec<String>) {
+    let local_deletes = local_states
+        .iter()
+        .map(|state| state.path.clone())
+        .collect::<Vec<_>>();
+    let remote_downloads = remote_docs
+        .iter()
+        .filter(|doc| !doc.deleted)
+        .map(|doc| doc.id.clone())
+        .collect::<Vec<_>>();
+
+    (local_deletes, remote_downloads)
+}
+
+fn remote_path_to_local_path(remote_path: &str, remote_prefix: &str) -> String {
+    if remote_prefix.is_empty() {
+        remote_path.to_string()
+    } else {
+        remote_path
+            .strip_prefix(remote_prefix)
+            .unwrap_or(remote_path)
+            .to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_polluted_state_path, should_apply_remote_delete};
-    use crate::models::{FileState, IgnoreMatcher};
+    use super::{
+        is_polluted_state_path, plan_local_rebuild, plan_remote_rebuild, remote_path_to_local_path,
+        should_apply_remote_delete,
+    };
+    use crate::models::{FileDoc, FileState, IgnoreMatcher};
     use chrono::{Duration, TimeZone, Utc};
 
     fn file_state(last_sync_at: chrono::DateTime<Utc>) -> FileState {
@@ -936,5 +1066,84 @@ mod tests {
 
         assert!(matcher.should_ignore(std::path::Path::new("ross-coulthart/auth-profiles.json")));
         assert!(!matcher.should_ignore(std::path::Path::new("ross-coulthart/AGENT.md")));
+    }
+
+    #[test]
+    fn remote_rebuild_uploads_local_files_and_deletes_remote_orphans() {
+        let local_states = vec![
+            FileState::new(
+                "notes/a.md".to_string(),
+                "hash-a".to_string(),
+                10,
+                Utc::now(),
+            ),
+            FileState::new(
+                "notes/b.md".to_string(),
+                "hash-b".to_string(),
+                20,
+                Utc::now(),
+            ),
+        ];
+        let remote_docs = vec![
+            FileDoc::new("mirror/notes/a.md".to_string(), String::new(), 10),
+            FileDoc::new("mirror/notes/orphan.md".to_string(), String::new(), 30),
+            FileDoc {
+                deleted: true,
+                ..FileDoc::new("mirror/notes/deleted.md".to_string(), String::new(), 0)
+            },
+        ];
+
+        let (uploads, remote_deletes) = plan_remote_rebuild(&local_states, &remote_docs, "mirror/");
+
+        assert_eq!(
+            uploads,
+            vec!["notes/a.md".to_string(), "notes/b.md".to_string()]
+        );
+        assert_eq!(remote_deletes, vec!["mirror/notes/orphan.md".to_string()]);
+    }
+
+    #[test]
+    fn local_rebuild_deletes_local_files_and_downloads_live_remote_docs() {
+        let local_states = vec![
+            FileState::new(
+                "notes/old.md".to_string(),
+                "hash-old".to_string(),
+                10,
+                Utc::now(),
+            ),
+            FileState::new(
+                "notes/extra.md".to_string(),
+                "hash-extra".to_string(),
+                20,
+                Utc::now(),
+            ),
+        ];
+        let remote_docs = vec![
+            FileDoc::new("mirror/notes/new.md".to_string(), String::new(), 15),
+            FileDoc {
+                deleted: true,
+                ..FileDoc::new("mirror/notes/deleted.md".to_string(), String::new(), 0)
+            },
+        ];
+
+        let (local_deletes, remote_downloads) = plan_local_rebuild(&local_states, &remote_docs);
+
+        assert_eq!(
+            local_deletes,
+            vec!["notes/old.md".to_string(), "notes/extra.md".to_string()]
+        );
+        assert_eq!(remote_downloads, vec!["mirror/notes/new.md".to_string()]);
+    }
+
+    #[test]
+    fn remote_prefix_is_stripped_when_mapping_remote_paths_back_to_local() {
+        assert_eq!(
+            remote_path_to_local_path("Agents/ross-coulthart/AGENT.md", "Agents/"),
+            "ross-coulthart/AGENT.md"
+        );
+        assert_eq!(
+            remote_path_to_local_path("notes/test.md", ""),
+            "notes/test.md"
+        );
     }
 }
