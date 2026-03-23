@@ -170,6 +170,15 @@ impl SyncEngine {
                     state.path, remote_prefix
                 );
                 self.local_db.delete_file_state(&state.path)?;
+            } else if self
+                .ignore_matcher
+                .should_ignore(std::path::Path::new(&state.path))
+            {
+                info!(
+                    "Removing ignored state entry from local database: {}",
+                    state.path
+                );
+                self.local_db.delete_file_state(&state.path)?;
             } else {
                 valid_stored_states.push(state);
             }
@@ -862,7 +871,7 @@ fn is_polluted_state_path(path: &str, remote_prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{is_polluted_state_path, should_apply_remote_delete};
-    use crate::models::FileState;
+    use crate::models::{FileState, IgnoreMatcher};
     use chrono::{Duration, TimeZone, Utc};
 
     fn file_state(last_sync_at: chrono::DateTime<Utc>) -> FileState {
@@ -919,5 +928,13 @@ mod tests {
             "Agents/"
         ));
         assert!(!is_polluted_state_path("Agentsmith/profile.md", "Agents/"));
+    }
+
+    #[test]
+    fn ignore_matcher_marks_previously_tracked_ignored_files() {
+        let matcher = IgnoreMatcher::from_content("auth-profiles.json");
+
+        assert!(matcher.should_ignore(std::path::Path::new("ross-coulthart/auth-profiles.json")));
+        assert!(!matcher.should_ignore(std::path::Path::new("ross-coulthart/AGENT.md")));
     }
 }

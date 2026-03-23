@@ -346,41 +346,6 @@ fn paths_match(left: &std::path::Path, right: &std::path::Path) -> bool {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::resolve_paths;
-    use couchdb_file_sync::config::{AppConfig, SyncPath};
-    use std::path::PathBuf;
-
-    #[test]
-    fn cli_path_uses_matching_configured_remote_prefix() {
-        let mut config = AppConfig::default();
-        config.couchdb.remote_path = "global/".to_string();
-        config.paths = vec![SyncPath {
-            local: PathBuf::from("/tmp/agents"),
-            remote: "Agents".to_string(),
-        }];
-
-        let resolved = resolve_paths(Some(PathBuf::from("/tmp/agents")), &config);
-
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].local, PathBuf::from("/tmp/agents"));
-        assert_eq!(resolved[0].remote, "Agents");
-    }
-
-    #[test]
-    fn cli_path_falls_back_to_global_remote_when_unconfigured() {
-        let mut config = AppConfig::default();
-        config.couchdb.remote_path = "global/".to_string();
-
-        let resolved = resolve_paths(Some(PathBuf::from("/tmp/other")), &config);
-
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].local, PathBuf::from("/tmp/other"));
-        assert_eq!(resolved[0].remote, "global/");
-    }
-}
-
 /// Initialize logging based on verbosity or RUST_LOG env var
 fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daemon_mode: bool) {
     use tracing_subscriber::layer::SubscriberExt;
@@ -437,5 +402,40 @@ fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daem
             .init();
     } else {
         tracing_subscriber::registry().with(stdout_layer).init();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_paths;
+    use couchdb_file_sync::config::{AppConfig, SyncPath};
+    use std::path::PathBuf;
+
+    #[test]
+    fn cli_path_uses_matching_configured_remote_prefix() {
+        let mut config = AppConfig::default();
+        config.couchdb.remote_path = "global/".to_string();
+        config.paths = vec![SyncPath {
+            local: PathBuf::from("/tmp/agents"),
+            remote: "Agents".to_string(),
+        }];
+
+        let resolved = resolve_paths(Some(PathBuf::from("/tmp/agents")), &config);
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].local, PathBuf::from("/tmp/agents"));
+        assert_eq!(resolved[0].remote, "Agents");
+    }
+
+    #[test]
+    fn cli_path_falls_back_to_global_remote_when_unconfigured() {
+        let mut config = AppConfig::default();
+        config.couchdb.remote_path = "global/".to_string();
+
+        let resolved = resolve_paths(Some(PathBuf::from("/tmp/other")), &config);
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].local, PathBuf::from("/tmp/other"));
+        assert_eq!(resolved[0].remote, "global/");
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "couchdb-file-sync"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "Filesystem-to-CouchDB sync engine with bidirectional sync and conflict detection"
 authors = ["Nina Těšková <nina.marie.teskova@gmail.com>"]
