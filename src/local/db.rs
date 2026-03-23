@@ -171,6 +171,12 @@ impl LocalDb {
         Ok(states)
     }
 
+    /// Clear all tracked file state
+    pub fn clear_file_states(&self) -> Result<usize> {
+        let count = self.conn.execute("DELETE FROM file_states", [])?;
+        Ok(count)
+    }
+
     // === Change Queue Operations ===
 
     /// Add change to queue
@@ -402,6 +408,21 @@ impl LocalDb {
              VALUES (1, ?, ?)",
             params![seq, Utc::now().to_rfc3339()],
         )?;
+        Ok(())
+    }
+
+    /// Clear the sync checkpoint
+    pub fn clear_checkpoint(&self) -> Result<usize> {
+        let count = self.conn.execute("DELETE FROM sync_checkpoint", [])?;
+        Ok(count)
+    }
+
+    /// Remove tracked state that should not survive an authoritative rebuild.
+    pub fn reset_sync_state(&self) -> Result<()> {
+        self.clear_file_states()?;
+        self.conn.execute("DELETE FROM change_queue", [])?;
+        self.clear_conflicts()?;
+        self.clear_checkpoint()?;
         Ok(())
     }
 }

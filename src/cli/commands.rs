@@ -438,6 +438,52 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
     Ok(report)
 }
 
+/// Rebuild the remote scope from the local filesystem.
+pub async fn rebuild_remote(path: PathBuf, config: AppConfig) -> Result<SyncReport> {
+    info!("Rebuilding remote from local in: {}", path.display());
+
+    let ignore_matcher = load_ignore_patterns(&path);
+    let db_path = state_db_path(&path);
+    let local_db = LocalDb::open(&db_path)?;
+    let couchdb = CouchDb::new(
+        &config.couchdb.url,
+        config.couchdb.username.as_deref(),
+        config.couchdb.password.as_deref(),
+        &config.couchdb.database,
+        &config.couchdb.remote_path,
+    )
+    .await?;
+
+    let mut engine = SyncEngine::with_ignore(couchdb, local_db, path, ignore_matcher);
+    let report = engine.rebuild_remote_from_local().await?;
+    print_sync_report(&report);
+
+    Ok(report)
+}
+
+/// Rebuild the local filesystem from the remote scope.
+pub async fn rebuild_local(path: PathBuf, config: AppConfig) -> Result<SyncReport> {
+    info!("Rebuilding local from remote in: {}", path.display());
+
+    let ignore_matcher = load_ignore_patterns(&path);
+    let db_path = state_db_path(&path);
+    let local_db = LocalDb::open(&db_path)?;
+    let couchdb = CouchDb::new(
+        &config.couchdb.url,
+        config.couchdb.username.as_deref(),
+        config.couchdb.password.as_deref(),
+        &config.couchdb.database,
+        &config.couchdb.remote_path,
+    )
+    .await?;
+
+    let mut engine = SyncEngine::with_ignore(couchdb, local_db, path, ignore_matcher);
+    let report = engine.rebuild_local_from_remote().await?;
+    print_sync_report(&report);
+
+    Ok(report)
+}
+
 /// Send Telegram notifications for any unnotified conflicts
 /// If session_notified is provided, only notify about conflicts not in that set (daemon mode)
 /// If session_notified is None, notify about all conflicts not marked as notified in DB (one-time sync)

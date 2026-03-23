@@ -13,6 +13,7 @@ A Rust-based filesystem-to-CouchDB synchronization engine with bidirectional syn
 | ✅ | **Conflict Detection** | Automatically detects when files change on both sides |
 | ✅ | **Conflict Resolution** | CLI commands to resolve conflicts with multiple strategies |
 | ✅ | **Smart Ignore Patterns** | Gitignore-style `.sync-ignore` file support |
+| ✅ | **Authoritative Rebuilds** | Rebuild the remote from local or rebuild the local tree from remote |
 | ✅ | **Telegram Notifications** | Get notified when conflicts are detected |
 | ⚠️ | **Flexible Configuration** | CLI args, YAML config, and environment variables |
 | ⚠️ | **Conflict File Preservation (optional)** | Keep-both resolution saves remote file as `filename.remote` |
@@ -181,6 +182,22 @@ For live mode (watcher + changes feed):
 ```bash
 couchdb-file-sync sync
 couchdb-file-sync daemon ~/documents --live
+```
+
+### `couchdb-file-sync rebuild-remote [PATH]`
+
+Replace the remote scope with the current local filesystem for that path. Every non-ignored local file is uploaded, and remote files that no longer exist locally are deleted.
+
+```bash
+couchdb-file-sync rebuild-remote ~/documents
+```
+
+### `couchdb-file-sync rebuild-local [PATH]`
+
+Replace the local filesystem with the current remote scope for that path. Existing non-ignored local files are removed first, then live remote files are downloaded.
+
+```bash
+couchdb-file-sync rebuild-local ~/documents
 ```
 
 ### `couchdb-file-sync conflicts [PATH]`

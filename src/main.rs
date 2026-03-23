@@ -66,6 +66,18 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Rebuild the remote scope from the local filesystem
+    RebuildRemote {
+        /// Directory to sync (uses paths from config if not specified)
+        path: Option<PathBuf>,
+    },
+
+    /// Rebuild the local filesystem from the remote scope
+    RebuildLocal {
+        /// Directory to sync (uses paths from config if not specified)
+        path: Option<PathBuf>,
+    },
+
     /// Run continuous sync daemon
     Daemon {
         /// Directory to sync (uses paths from config if not specified)
@@ -153,7 +165,10 @@ async fn main() -> Result<()> {
 
     let enable_file_logging = matches!(
         &cli.command,
-        Commands::Sync { .. } | Commands::Daemon { .. }
+        Commands::Sync { .. }
+            | Commands::RebuildRemote { .. }
+            | Commands::RebuildLocal { .. }
+            | Commands::Daemon { .. }
     );
 
     // Initialize logging
@@ -206,6 +221,42 @@ async fn main() -> Result<()> {
                     path_config.couchdb.remote_path
                 );
                 cli::sync(sync_path.local, path_config, dry_run).await?;
+            }
+        }
+        Commands::RebuildRemote { path } => {
+            let paths = resolve_paths(path, &config);
+            if paths.is_empty() {
+                anyhow::bail!(
+                    "No sync paths configured. Specify a path or add paths to couchdb-file-sync.yaml"
+                );
+            }
+            for sync_path in paths {
+                let mut path_config = config.clone();
+                path_config.couchdb.remote_path = sync_path.remote;
+                info!(
+                    "Rebuilding remote: {} -> {}",
+                    sync_path.local.display(),
+                    path_config.couchdb.remote_path
+                );
+                cli::rebuild_remote(sync_path.local, path_config).await?;
+            }
+        }
+        Commands::RebuildLocal { path } => {
+            let paths = resolve_paths(path, &config);
+            if paths.is_empty() {
+                anyhow::bail!(
+                    "No sync paths configured. Specify a path or add paths to couchdb-file-sync.yaml"
+                );
+            }
+            for sync_path in paths {
+                let mut path_config = config.clone();
+                path_config.couchdb.remote_path = sync_path.remote;
+                info!(
+                    "Rebuilding local: {} <- {}",
+                    sync_path.local.display(),
+                    path_config.couchdb.remote_path
+                );
+                cli::rebuild_local(sync_path.local, path_config).await?;
             }
         }
         Commands::Daemon {
@@ -407,7 +458,8 @@ fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daem
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_paths;
+    use super::{resolve_paths, Cli, Commands};
+    use clap::Parser;
     use couchdb_file_sync::config::{AppConfig, SyncPath};
     use std::path::PathBuf;
 
@@ -437,5 +489,30 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].local, PathBuf::from("/tmp/other"));
         assert_eq!(resolved[0].remote, "global/");
+    }
+
+    #[test]
+    fn cli_parses_rebuild_remote_subcommand() {
+        let cli =
+            Cli::try_parse_from(["couchdb-file-sync", "rebuild-remote", "/tmp/docs"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Commands::RebuildRemote {
+                path: Some(ref path)
+            } if path == &PathBuf::from("/tmp/docs")
+        ));
+    }
+
+    #[test]
+    fn cli_parses_rebuild_local_subcommand() {
+        let cli = Cli::try_parse_from(["couchdb-file-sync", "rebuild-local", "/tmp/docs"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Commands::RebuildLocal {
+                path: Some(ref path)
+            } if path == &PathBuf::from("/tmp/docs")
+        ));
     }
 }
