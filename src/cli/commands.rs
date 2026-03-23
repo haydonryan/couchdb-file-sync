@@ -397,7 +397,7 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
     info!("Running sync in: {}", path.display());
 
     // Load ignore patterns
-    let _ignore_matcher = load_ignore_patterns(&path);
+    let ignore_matcher = load_ignore_patterns(&path);
 
     // Open local database
     let db_path = state_db_path(&path);
@@ -420,7 +420,7 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
     }
 
     // Run sync
-    let mut engine = SyncEngine::new(couchdb, local_db, path.clone());
+    let mut engine = SyncEngine::with_ignore(couchdb, local_db, path.clone(), ignore_matcher);
     let report = engine.sync().await?;
 
     print_sync_report(&report);
@@ -674,7 +674,7 @@ async fn daemon_sync(
     info!("Running sync in: {}", path.display());
 
     // Load ignore patterns
-    let _ignore_matcher = load_ignore_patterns(path);
+    let ignore_matcher = load_ignore_patterns(path);
 
     // Open local database
     let db_path = state_db_path(path);
@@ -691,7 +691,7 @@ async fn daemon_sync(
     .await?;
 
     // Run sync
-    let mut engine = SyncEngine::new(couchdb, local_db, path.to_path_buf());
+    let mut engine = SyncEngine::with_ignore(couchdb, local_db, path.to_path_buf(), ignore_matcher);
     let report = engine.sync().await?;
 
     print_sync_report(&report);
@@ -760,7 +760,8 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
     )
     .await?;
 
-    let mut engine = SyncEngine::new(couchdb, local_db, path.clone());
+    let mut engine =
+        SyncEngine::with_ignore(couchdb, local_db, path.clone(), (*ignore_matcher).clone());
     let initial_since = match engine.get_checkpoint()? {
         Some((seq, _)) => seq,
         None => {
@@ -1213,10 +1214,15 @@ fn print_side_by_side_diff(local: &str, remote: &str) {
 
 /// Truncate a string to fit within a given width
 fn truncate_str(s: &str, max_width: usize) -> String {
-    if s.len() <= max_width {
+    let char_count = s.chars().count();
+
+    if char_count <= max_width {
         s.to_string()
+    } else if max_width <= 3 {
+        ".".repeat(max_width)
     } else {
-        format!("{}...", &s[..max_width.saturating_sub(3)])
+        let truncated: String = s.chars().take(max_width - 3).collect();
+        format!("{truncated}...")
     }
 }
 
