@@ -1,6 +1,8 @@
 use crate::couchdb::CouchDb;
 use crate::local::{compute_bytes_hash, compute_file_hash, LocalDb, Scanner};
-use crate::models::{Change, ChangeType, Conflict, FileState, RemoteState, ResolutionStrategy};
+use crate::models::{
+    Change, ChangeType, Conflict, FileState, IgnoreMatcher, RemoteState, ResolutionStrategy,
+};
 use anyhow::Result;
 use chrono::Utc;
 use std::collections::HashMap;
@@ -12,6 +14,7 @@ pub struct SyncEngine {
     couchdb: CouchDb,
     local_db: LocalDb,
     root_dir: PathBuf,
+    ignore_matcher: IgnoreMatcher,
 }
 
 /// Report from a sync operation
@@ -28,10 +31,21 @@ pub struct SyncReport {
 impl SyncEngine {
     /// Create a new sync engine
     pub fn new(couchdb: CouchDb, local_db: LocalDb, root_dir: PathBuf) -> Self {
+        Self::with_ignore(couchdb, local_db, root_dir, IgnoreMatcher::empty())
+    }
+
+    /// Create a new sync engine with ignore patterns applied to full scans.
+    pub fn with_ignore(
+        couchdb: CouchDb,
+        local_db: LocalDb,
+        root_dir: PathBuf,
+        ignore_matcher: IgnoreMatcher,
+    ) -> Self {
         Self {
             couchdb,
             local_db,
             root_dir,
+            ignore_matcher,
         }
     }
 
@@ -143,16 +157,31 @@ impl SyncEngine {
 
     /// Scan for local changes
     async fn scan_local_changes(&self) -> Result<Vec<Change>> {
-        use crate::models::IgnoreMatcher;
-
-        let scanner = Scanner::new(self.root_dir.clone(), IgnoreMatcher::empty());
+        let scanner = Scanner::new(self.root_dir.clone(), self.ignore_matcher.clone());
         let current_states = scanner.full_scan()?;
         let stored_states = self.local_db.get_all_file_states()?;
+        let remote_prefix = self.couchdb.remote_prefix();
+        let mut valid_stored_states = Vec::with_capacity(stored_states.len());
+
+        for state in stored_states {
+            if is_polluted_state_path(&state.path, remote_prefix) {
+                warn!(
+                    "Removing invalid state entry for {}: local state includes remote prefix {}",
+                    state.path, remote_prefix
+                );
+                self.local_db.delete_file_state(&state.path)?;
+            } else {
+                valid_stored_states.push(state);
+            }
+        }
 
         debug!("Scanned {} files on disk", current_states.len());
-        debug!("Found {} files in local database", stored_states.len());
+        debug!(
+            "Found {} files in local database",
+            valid_stored_states.len()
+        );
 
-        let changes = scanner.detect_changes(&current_states, &stored_states);
+        let changes = scanner.detect_changes(&current_states, &valid_stored_states);
 
         debug!("Detected {} changes from local scan", changes.len());
         for change in &changes {
@@ -160,7 +189,7 @@ impl SyncEngine {
         }
 
         // Build a map of stored states to preserve couch_rev
-        let stored_map: HashMap<_, _> = stored_states.iter().map(|s| (&s.path, s)).collect();
+        let stored_map: HashMap<_, _> = valid_stored_states.iter().map(|s| (&s.path, s)).collect();
 
         // Only update stored states for files that haven't changed
         // (new and modified files will be updated after successful sync)
@@ -416,10 +445,12 @@ impl SyncEngine {
             if rc.change_type == ChangeType::Deleted {
                 let relative_path = local_path.trim_start_matches('/');
                 let file_path = self.root_dir.join(relative_path);
-                let has_state = self.local_db.get_file_state(&local_path)?.is_some();
-                if file_path.exists() || has_state {
-                    debug!("  Remote deleted, scheduling local delete");
+                let stored_state = self.local_db.get_file_state(&local_path)?;
+                if should_apply_remote_delete(stored_state.as_ref(), rc.mtime, file_path.exists()) {
+                    debug!("  Remote delete is newer than last sync, scheduling local delete");
                     remote_to_apply.push(rc.clone());
+                } else if file_path.exists() || stored_state.is_some() {
+                    debug!("  Remote delete is stale or file is untracked locally, skipping");
                 } else {
                     debug!("  Remote deleted, no local file/state, skipping");
                 }
@@ -805,5 +836,88 @@ impl SyncEngine {
         self.local_db.delete_conflict(local_path)?;
 
         Ok(())
+    }
+}
+
+fn should_apply_remote_delete(
+    stored_state: Option<&FileState>,
+    remote_mtime: Option<chrono::DateTime<Utc>>,
+    _file_exists: bool,
+) -> bool {
+    match stored_state {
+        Some(state) => match remote_mtime {
+            Some(remote_mtime) => remote_mtime > state.last_sync_at,
+            None => true,
+        },
+        None => false,
+    }
+}
+
+fn is_polluted_state_path(path: &str, remote_prefix: &str) -> bool {
+    let remote_prefix = remote_prefix.trim_end_matches('/');
+    !remote_prefix.is_empty()
+        && (path == remote_prefix || path.starts_with(&format!("{remote_prefix}/")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_polluted_state_path, should_apply_remote_delete};
+    use crate::models::FileState;
+    use chrono::{Duration, TimeZone, Utc};
+
+    fn file_state(last_sync_at: chrono::DateTime<Utc>) -> FileState {
+        FileState {
+            path: "example.txt".to_string(),
+            hash: "abc".to_string(),
+            size: 1,
+            modified_at: last_sync_at,
+            couch_rev: Some("1-abc".to_string()),
+            last_sync_at,
+        }
+    }
+
+    #[test]
+    fn stale_remote_delete_does_not_remove_tracked_local_file() {
+        let last_sync = Utc.with_ymd_and_hms(2026, 3, 23, 17, 12, 33).unwrap();
+        let remote_delete = last_sync - Duration::days(6);
+
+        assert!(!should_apply_remote_delete(
+            Some(&file_state(last_sync)),
+            Some(remote_delete),
+            true,
+        ));
+    }
+
+    #[test]
+    fn newer_remote_delete_removes_tracked_local_file() {
+        let last_sync = Utc.with_ymd_and_hms(2026, 3, 23, 17, 12, 33).unwrap();
+        let remote_delete = last_sync + Duration::seconds(1);
+
+        assert!(should_apply_remote_delete(
+            Some(&file_state(last_sync)),
+            Some(remote_delete),
+            true,
+        ));
+    }
+
+    #[test]
+    fn untracked_existing_local_file_is_not_deleted() {
+        let remote_delete = Utc.with_ymd_and_hms(2026, 3, 23, 17, 12, 33).unwrap();
+
+        assert!(!should_apply_remote_delete(None, Some(remote_delete), true));
+    }
+
+    #[test]
+    fn detects_state_entries_polluted_with_remote_prefix() {
+        assert!(is_polluted_state_path(
+            "Agents/ross-coulthart/AGENT.md",
+            "Agents/"
+        ));
+        assert!(is_polluted_state_path("Agents", "Agents/"));
+        assert!(!is_polluted_state_path(
+            "ross-coulthart/AGENT.md",
+            "Agents/"
+        ));
+        assert!(!is_polluted_state_path("Agentsmith/profile.md", "Agents/"));
     }
 }

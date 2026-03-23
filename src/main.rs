@@ -305,7 +305,16 @@ fn default_user_config_file_if_exists() -> Option<PathBuf> {
 fn resolve_paths(cli_path: Option<PathBuf>, config: &AppConfig) -> Vec<SyncPath> {
     match cli_path {
         Some(path) => {
-            // CLI path specified - use it with the config's remote_path
+            // CLI path specified - prefer the matching configured path mapping.
+            if let Some(sync_path) = config
+                .paths
+                .iter()
+                .find(|sync_path| paths_match(&sync_path.local, &path))
+            {
+                return vec![sync_path.clone()];
+            }
+
+            // No configured mapping matched - fall back to the global remote_path.
             vec![SyncPath {
                 local: path,
                 remote: config.couchdb.remote_path.clone(),
@@ -323,6 +332,52 @@ fn resolve_paths(cli_path: Option<PathBuf>, config: &AppConfig) -> Vec<SyncPath>
                 config.paths.clone()
             }
         }
+    }
+}
+
+fn paths_match(left: &std::path::Path, right: &std::path::Path) -> bool {
+    if left == right {
+        return true;
+    }
+
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_paths;
+    use couchdb_file_sync::config::{AppConfig, SyncPath};
+    use std::path::PathBuf;
+
+    #[test]
+    fn cli_path_uses_matching_configured_remote_prefix() {
+        let mut config = AppConfig::default();
+        config.couchdb.remote_path = "global/".to_string();
+        config.paths = vec![SyncPath {
+            local: PathBuf::from("/tmp/agents"),
+            remote: "Agents".to_string(),
+        }];
+
+        let resolved = resolve_paths(Some(PathBuf::from("/tmp/agents")), &config);
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].local, PathBuf::from("/tmp/agents"));
+        assert_eq!(resolved[0].remote, "Agents");
+    }
+
+    #[test]
+    fn cli_path_falls_back_to_global_remote_when_unconfigured() {
+        let mut config = AppConfig::default();
+        config.couchdb.remote_path = "global/".to_string();
+
+        let resolved = resolve_paths(Some(PathBuf::from("/tmp/other")), &config);
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].local, PathBuf::from("/tmp/other"));
+        assert_eq!(resolved[0].remote, "global/");
     }
 }
 

@@ -178,6 +178,11 @@ impl CouchDb {
         }
     }
 
+    /// Get the normalized remote path prefix used for this sync scope.
+    pub fn remote_prefix(&self) -> &str {
+        &self.remote_path
+    }
+
     /// Get the full remote path for a local file
     pub fn get_remote_path(&self, local_path: &str) -> String {
         if self.remote_path.is_empty() {
