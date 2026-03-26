@@ -48,6 +48,14 @@ Enable the repo's pre-commit hook to run formatting, clippy, and tests before ea
 git config core.hooksPath .githooks
 ```
 
+To measure scanner performance, run:
+
+```bash
+cargo run --bin scanner-perf --release
+```
+
+The helper creates a synthetic dataset, reports one cold scan, one initial warm scan, then repeats the warm scan `1000` times by default and prints min/median/avg/max timings. Override the dataset size or repeat count with `SCANNER_PERF_FILES`, `SCANNER_PERF_BYTES`, and `SCANNER_PERF_ITERATIONS`.
+
 ## Quick Start
 
 ### 1. Configure CouchDB Connection and Paths
