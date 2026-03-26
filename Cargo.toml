@@ -87,3 +87,7 @@ publish = false
 tag-name = "v{{version}}"
 tag-message = "release: v{{version}}"
 pre-release-commit-message = "release: v{{version}}"
+
+[[bin]]
+name = "scanner-perf"
+path = "src/bin/scanner_perf.rs"

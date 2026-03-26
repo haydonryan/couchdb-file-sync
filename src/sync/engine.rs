@@ -232,7 +232,6 @@ impl SyncEngine {
     /// Scan for local changes
     async fn scan_local_changes(&self) -> Result<Vec<Change>> {
         let scanner = Scanner::new(self.root_dir.clone(), self.ignore_matcher.clone());
-        let current_states = scanner.full_scan()?;
         let stored_states = self.local_db.get_all_file_states()?;
         let remote_prefix = self.couchdb.remote_prefix();
         let mut valid_stored_states = Vec::with_capacity(stored_states.len());
@@ -257,6 +256,8 @@ impl SyncEngine {
                 valid_stored_states.push(state);
             }
         }
+
+        let current_states = scanner.full_scan_with_previous(&valid_stored_states)?;
 
         debug!("Scanned {} files on disk", current_states.len());
         debug!(
