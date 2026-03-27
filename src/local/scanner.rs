@@ -2,6 +2,7 @@ use crate::models::{Change, FileState, IgnoreMatcher};
 use anyhow::Result;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, trace, warn};
 use walkdir::WalkDir;
@@ -23,7 +24,16 @@ impl Scanner {
 
     /// Perform a full scan of the directory
     pub fn full_scan(&self) -> Result<Vec<FileState>> {
+        self.full_scan_with_previous(&[])
+    }
+
+    /// Perform a full scan, reusing hashes for files whose metadata is unchanged.
+    pub fn full_scan_with_previous(&self, previous_states: &[FileState]) -> Result<Vec<FileState>> {
         let mut states = Vec::new();
+        let previous_map: HashMap<&str, &FileState> = previous_states
+            .iter()
+            .map(|state| (state.path.as_str(), state))
+            .collect();
 
         for entry in WalkDir::new(&self.root_dir).follow_links(false) {
             let entry = match entry {
@@ -52,8 +62,13 @@ impl Scanner {
                 continue;
             }
 
+            let relative_path_str = relative_path.to_string_lossy();
+
             // Get file metadata and hash
-            match self.scan_file(path) {
+            match self.scan_file_with_previous(
+                path,
+                previous_map.get(relative_path_str.as_ref()).copied(),
+            ) {
                 Ok(state) => {
                     debug!("Scanned file: {} (hash: {})", state.path, &state.hash[..8]);
                     states.push(state);
@@ -69,23 +84,36 @@ impl Scanner {
 
     /// Scan a single file
     pub fn scan_file(&self, path: &Path) -> Result<FileState> {
+        self.scan_file_with_previous(path, None)
+    }
+
+    fn scan_file_with_previous(
+        &self,
+        path: &Path,
+        previous: Option<&FileState>,
+    ) -> Result<FileState> {
         let metadata = std::fs::metadata(path)?;
         let relative_path = path.strip_prefix(&self.root_dir)?.to_path_buf();
         let path_str = relative_path.to_string_lossy().to_string();
-
-        // Compute hash
-        let hash = compute_file_hash(path)?;
-
-        // Get modification time
         let modified_at = metadata.modified()?.into();
+        let size = metadata.len();
+
+        let hash = match previous {
+            Some(previous) if previous.size == size && previous.modified_at == modified_at => {
+                previous.hash.clone()
+            }
+            _ => compute_file_hash(path)?,
+        };
 
         Ok(FileState {
             path: path_str,
             hash,
-            size: metadata.len(),
+            size,
             modified_at,
-            couch_rev: None,
-            last_sync_at: Utc::now(),
+            couch_rev: previous.and_then(|state| state.couch_rev.clone()),
+            last_sync_at: previous
+                .map(|state| state.last_sync_at)
+                .unwrap_or_else(Utc::now),
         })
     }
 
@@ -191,6 +219,7 @@ pub fn compute_bytes_hash(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -224,5 +253,43 @@ mod tests {
         let hash2 = compute_file_hash(&file_path).unwrap();
 
         assert_ne!(hash1, hash2, "Hash should change when content changes");
+    }
+
+    #[test]
+    fn test_full_scan_with_previous_reuses_hash_for_unchanged_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        std::fs::write(&file_path, "content").unwrap();
+
+        let scanner = Scanner::new(temp_dir.path().to_path_buf(), IgnoreMatcher::empty());
+        let initial = scanner.full_scan().unwrap();
+        let reused = scanner.full_scan_with_previous(&initial).unwrap();
+
+        assert_eq!(reused.len(), 1);
+        assert_eq!(reused[0].hash, initial[0].hash);
+        assert_eq!(reused[0].couch_rev, initial[0].couch_rev);
+        assert_eq!(reused[0].last_sync_at, initial[0].last_sync_at);
+    }
+
+    #[test]
+    fn test_full_scan_with_previous_rehashes_modified_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        std::fs::write(&file_path, "content").unwrap();
+
+        let scanner = Scanner::new(temp_dir.path().to_path_buf(), IgnoreMatcher::empty());
+        let mut initial = scanner.full_scan().unwrap();
+        initial[0].couch_rev = Some("1-test".to_string());
+        initial[0].last_sync_at += Duration::seconds(5);
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::fs::write(&file_path, "updated content").unwrap();
+
+        let rescanned = scanner.full_scan_with_previous(&initial).unwrap();
+
+        assert_eq!(rescanned.len(), 1);
+        assert_ne!(rescanned[0].hash, initial[0].hash);
+        assert_eq!(rescanned[0].couch_rev, initial[0].couch_rev);
+        assert_eq!(rescanned[0].last_sync_at, initial[0].last_sync_at);
     }
 }
