@@ -1,9 +1,8 @@
 use crate::models::{Change, IgnoreMatcher};
 use anyhow::Result;
 use notify_debouncer_full::{
-    new_debouncer,
+    DebounceEventResult, DebouncedEvent, new_debouncer,
     notify::{EventKind, RecursiveMode},
-    DebounceEventResult, DebouncedEvent,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

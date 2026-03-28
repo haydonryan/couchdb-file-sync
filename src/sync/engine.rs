@@ -1,5 +1,5 @@
 use crate::couchdb::CouchDb;
-use crate::local::{compute_bytes_hash, compute_file_hash, LocalDb, Scanner};
+use crate::local::{LocalDb, Scanner, compute_bytes_hash, compute_file_hash};
 use crate::models::{
     Change, ChangeType, Conflict, FileDoc, FileState, IgnoreMatcher, RemoteState,
     ResolutionStrategy,
@@ -388,7 +388,10 @@ impl SyncEngine {
                         changed
                     }
                     (None, _) => {
-                        info!("  [REMOTE CHANGE DETECTED] {} - no remote mtime available, assuming changed", lc.path);
+                        info!(
+                            "  [REMOTE CHANGE DETECTED] {} - no remote mtime available, assuming changed",
+                            lc.path
+                        );
                         if let Some(ref state) = stored_state {
                             info!(
                                 "    Stored rev: {:?} | Remote rev: {:?}",

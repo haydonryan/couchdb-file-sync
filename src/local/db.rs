@@ -2,7 +2,7 @@ use crate::models::{Change, ChangeType, Conflict, FileState};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use tracing::info;
 

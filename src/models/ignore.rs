@@ -119,12 +119,11 @@ impl IgnoreMatcher {
 
         // Ignore any file or directory that starts with '.'
         for component in path.components() {
-            if let std::path::Component::Normal(name) = component {
-                if let Some(name_str) = name.to_str() {
-                    if name_str.starts_with('.') {
-                        return true;
-                    }
-                }
+            if let std::path::Component::Normal(name) = component
+                && let Some(name_str) = name.to_str()
+                && name_str.starts_with('.')
+            {
+                return true;
             }
         }
 

@@ -1,7 +1,7 @@
 use crate::models::{Change, ChangeSource, ChangeType, ChunkDoc, FileDoc, RemoteState};
 use anyhow::Result;
-use couch_rs::database::Database;
 use couch_rs::Client;
+use couch_rs::database::Database;
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use serde_json::Value;
@@ -497,16 +497,16 @@ impl CouchDb {
     /// Delete old chunks that are no longer referenced
     pub async fn delete_chunks(&self, chunk_ids: &[String]) -> Result<()> {
         for chunk_id in chunk_ids {
-            if let Some(chunk) = self.get_chunk(chunk_id).await? {
-                if let Some(rev) = chunk.rev {
-                    let url = format!("{}/{}?rev={}", self.base_db_url, chunk_id, rev);
-                    let mut request = self.http_client.delete(&url);
-                    if let Some((username, password)) = &self.auth {
-                        request = request.basic_auth(username, Some(password));
-                    }
-                    let _ = request.send().await;
-                    debug!("Deleted old chunk: {}", chunk_id);
+            if let Some(chunk) = self.get_chunk(chunk_id).await?
+                && let Some(rev) = chunk.rev
+            {
+                let url = format!("{}/{}?rev={}", self.base_db_url, chunk_id, rev);
+                let mut request = self.http_client.delete(&url);
+                if let Some((username, password)) = &self.auth {
+                    request = request.basic_auth(username, Some(password));
                 }
+                let _ = request.send().await;
+                debug!("Deleted old chunk: {}", chunk_id);
             }
         }
         Ok(())

@@ -1,11 +1,11 @@
-use crate::config::{default_user_config_file, AppConfig, SyncPath};
+use crate::config::{AppConfig, SyncPath, default_user_config_file};
 use crate::couchdb::{ChangeFeedEntry, CouchDb};
 use crate::local::{AsyncFileWatcher, LocalDb};
 use crate::models::{Change, ChangeType, IgnoreMatcher, ResolutionStrategy};
 use crate::sync::{SyncEngine, SyncReport};
 use crate::telegram::TelegramNotifier;
 use anyhow::{Context, Result};
-use dialoguer::{theme::ColorfulTheme, Confirm, Select};
+use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use reqwest::StatusCode;
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashSet;
@@ -892,12 +892,11 @@ async fn run_local_watcher(
         AsyncFileWatcher::start(root.clone(), (*ignore_matcher).clone(), debounce_ms)?;
 
     loop {
-        if let Some(event) = watcher.next_event().await {
-            if let Some(change) = watcher.event_to_change(event) {
-                if tx.send(change).await.is_err() {
-                    break;
-                }
-            }
+        if let Some(event) = watcher.next_event().await
+            && let Some(change) = watcher.event_to_change(event)
+            && tx.send(change).await.is_err()
+        {
+            break;
         }
     }
 
@@ -932,13 +931,12 @@ async fn run_remote_changes(
                 if let Some(status) = e
                     .downcast_ref::<reqwest::Error>()
                     .and_then(|err| err.status())
+                    && status == StatusCode::BAD_REQUEST
                 {
-                    if status == StatusCode::BAD_REQUEST {
-                        warn!("Changes feed returned 400; resetting since to \"now\" and retrying");
-                        since = "now".to_string();
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
+                    warn!("Changes feed returned 400; resetting since to \"now\" and retrying");
+                    since = "now".to_string();
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
                 }
                 error!("Changes feed error: {}", e);
                 notify_sync_error_telegram(&config, None, &format!("Changes feed error: {}", e))
@@ -987,15 +985,13 @@ async fn handle_remote_change(
         return Ok(());
     }
 
-    if let Some(state) = engine.get_file_state(&local_rel)? {
-        if let (Some(remote_rev), Some(local_rev)) =
+    if let Some(state) = engine.get_file_state(&local_rel)?
+        && let (Some(remote_rev), Some(local_rev)) =
             (change.rev.as_deref(), state.couch_rev.as_deref())
-        {
-            if remote_rev == local_rev {
-                engine.save_checkpoint(&seq)?;
-                return Ok(());
-            }
-        }
+        && remote_rev == local_rev
+    {
+        engine.save_checkpoint(&seq)?;
+        return Ok(());
     }
 
     match change.change_type {

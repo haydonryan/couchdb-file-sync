@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use tracing::info;
 
 use couchdb_file_sync::cli;
-use couchdb_file_sync::config::{default_log_file, default_user_config_file, AppConfig, SyncPath};
+use couchdb_file_sync::config::{AppConfig, SyncPath, default_log_file, default_user_config_file};
 use couchdb_file_sync::logging::{AppLogWriter, RotationMode};
 
 #[derive(Parser, Debug)]
@@ -399,10 +399,10 @@ fn paths_match(left: &std::path::Path, right: &std::path::Path) -> bool {
 
 /// Initialize logging based on verbosity or RUST_LOG env var
 fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daemon_mode: bool) {
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
 
     // Prefer RUST_LOG if set, otherwise use verbosity flag
     let filter = if std::env::var("RUST_LOG").is_ok() {
@@ -458,7 +458,7 @@ fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daem
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_paths, Cli, Commands};
+    use super::{Cli, Commands, resolve_paths};
     use clap::Parser;
     use couchdb_file_sync::config::{AppConfig, SyncPath};
     use std::path::PathBuf;
