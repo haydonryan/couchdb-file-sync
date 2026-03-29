@@ -78,3 +78,71 @@ pub struct ConflictStats {
     pub notified: usize,
     pub unresolved: usize,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // Tests for ResolutionStrategy parsing and display
+    // =========================================================================
+
+    #[test]
+    fn resolution_strategy_from_str_keep_local() {
+        assert_eq!(
+            "keep-local".parse::<ResolutionStrategy>().unwrap(),
+            ResolutionStrategy::KeepLocal
+        );
+    }
+
+    #[test]
+    fn resolution_strategy_from_str_keep_remote() {
+        assert_eq!(
+            "keep-remote".parse::<ResolutionStrategy>().unwrap(),
+            ResolutionStrategy::KeepRemote
+        );
+    }
+
+    #[test]
+    fn resolution_strategy_from_str_keep_both() {
+        assert_eq!(
+            "keep-both".parse::<ResolutionStrategy>().unwrap(),
+            ResolutionStrategy::KeepBoth
+        );
+    }
+
+    #[test]
+    fn resolution_strategy_from_str_skip() {
+        assert_eq!(
+            "skip".parse::<ResolutionStrategy>().unwrap(),
+            ResolutionStrategy::Skip
+        );
+    }
+
+    #[test]
+    fn resolution_strategy_from_str_invalid() {
+        let result = "invalid".parse::<ResolutionStrategy>();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unknown resolution strategy"));
+    }
+
+    #[test]
+    fn resolution_strategy_display_keep_local() {
+        assert_eq!(format!("{}", ResolutionStrategy::KeepLocal), "keep-local");
+    }
+
+    #[test]
+    fn resolution_strategy_display_keep_remote() {
+        assert_eq!(format!("{}", ResolutionStrategy::KeepRemote), "keep-remote");
+    }
+
+    #[test]
+    fn resolution_strategy_display_keep_both() {
+        assert_eq!(format!("{}", ResolutionStrategy::KeepBoth), "keep-both");
+    }
+
+    #[test]
+    fn resolution_strategy_display_skip() {
+        assert_eq!(format!("{}", ResolutionStrategy::Skip), "skip");
+    }
+}
