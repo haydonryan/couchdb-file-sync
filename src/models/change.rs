@@ -255,4 +255,61 @@ mod tests {
         assert!(change.mtime.is_none());
         assert!(change.rev.is_none());
     }
+
+    // =========================================================================
+    // Tests for remote Change factory methods
+    // =========================================================================
+
+    #[test]
+    fn change_remote_created_sets_correct_fields() {
+        let mtime = Utc::now();
+        let change = Change::remote_created(
+            "remote.txt".to_string(),
+            "hash789".to_string(),
+            300,
+            mtime,
+            "1-abc".to_string(),
+        );
+
+        assert_eq!(change.path, "remote.txt");
+        assert_eq!(change.change_type, ChangeType::Created);
+        assert!(matches!(change.source, ChangeSource::Remote));
+        assert_eq!(change.hash, Some("hash789".to_string()));
+        assert_eq!(change.size, Some(300));
+        assert_eq!(change.mtime, Some(mtime));
+        assert_eq!(change.rev, Some("1-abc".to_string()));
+    }
+
+    #[test]
+    fn change_remote_modified_sets_correct_fields() {
+        let mtime = Utc::now();
+        let change = Change::remote_modified(
+            "modified.txt".to_string(),
+            "hash000".to_string(),
+            400,
+            mtime,
+            "2-def".to_string(),
+        );
+
+        assert_eq!(change.path, "modified.txt");
+        assert_eq!(change.change_type, ChangeType::Modified);
+        assert!(matches!(change.source, ChangeSource::Remote));
+        assert_eq!(change.hash, Some("hash000".to_string()));
+        assert_eq!(change.size, Some(400));
+        assert_eq!(change.mtime, Some(mtime));
+        assert_eq!(change.rev, Some("2-def".to_string()));
+    }
+
+    #[test]
+    fn change_remote_deleted_sets_correct_fields() {
+        let change = Change::remote_deleted("deleted-remote.txt".to_string());
+
+        assert_eq!(change.path, "deleted-remote.txt");
+        assert_eq!(change.change_type, ChangeType::Deleted);
+        assert!(matches!(change.source, ChangeSource::Remote));
+        assert!(change.hash.is_none());
+        assert!(change.size.is_none());
+        assert!(change.mtime.is_none());
+        assert!(change.rev.is_none());
+    }
 }
