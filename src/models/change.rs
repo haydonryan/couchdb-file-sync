@@ -312,4 +312,99 @@ mod tests {
         assert!(change.mtime.is_none());
         assert!(change.rev.is_none());
     }
+
+    // =========================================================================
+    // Tests for ChangeBatch operations
+    // =========================================================================
+
+    #[test]
+    fn change_batch_new_is_empty() {
+        let batch = ChangeBatch::new();
+        assert!(batch.is_empty());
+        assert_eq!(batch.len(), 0);
+    }
+
+    #[test]
+    fn change_batch_default_is_empty() {
+        let batch: ChangeBatch = Default::default();
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn change_batch_push_increases_len() {
+        let mut batch = ChangeBatch::new();
+        batch.push(Change::local_created(
+            "a.txt".to_string(),
+            "h1".to_string(),
+            10,
+        ));
+        assert!(!batch.is_empty());
+        assert_eq!(batch.len(), 1);
+
+        batch.push(Change::local_modified(
+            "b.txt".to_string(),
+            "h2".to_string(),
+            20,
+        ));
+        assert_eq!(batch.len(), 2);
+    }
+
+    #[test]
+    fn change_batch_local_changes_filters_correctly() {
+        let mut batch = ChangeBatch::new();
+        batch.push(Change::local_created(
+            "local.txt".to_string(),
+            "h1".to_string(),
+            10,
+        ));
+        batch.push(Change::remote_created(
+            "remote.txt".to_string(),
+            "h2".to_string(),
+            20,
+            Utc::now(),
+            "1-abc".to_string(),
+        ));
+        batch.push(Change::local_deleted("deleted.txt".to_string()));
+
+        let local = batch.local_changes();
+        assert_eq!(local.len(), 2);
+        assert!(
+            local
+                .iter()
+                .all(|c| matches!(c.source, ChangeSource::Local))
+        );
+    }
+
+    #[test]
+    fn change_batch_remote_changes_filters_correctly() {
+        let mut batch = ChangeBatch::new();
+        batch.push(Change::local_created(
+            "local.txt".to_string(),
+            "h1".to_string(),
+            10,
+        ));
+        batch.push(Change::remote_modified(
+            "remote.txt".to_string(),
+            "h2".to_string(),
+            20,
+            Utc::now(),
+            "1-abc".to_string(),
+        ));
+        batch.push(Change::remote_deleted("deleted.txt".to_string()));
+
+        let remote = batch.remote_changes();
+        assert_eq!(remote.len(), 2);
+        assert!(
+            remote
+                .iter()
+                .all(|c| matches!(c.source, ChangeSource::Remote))
+        );
+    }
+
+    #[test]
+    fn change_batch_empty_filters_return_empty() {
+        let batch = ChangeBatch::new();
+        assert!(batch.local_changes().is_empty());
+        assert!(batch.remote_changes().is_empty());
+    }
 }
