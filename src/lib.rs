@@ -4,6 +4,7 @@ pub mod couchdb;
 pub mod local;
 pub mod logging;
 pub mod models;
+pub mod slack;
 pub mod sync;
 pub mod telegram;
 

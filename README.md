@@ -147,6 +147,8 @@ notifications:
   telegram:
     bot_token: "${TELEGRAM_BOT_TOKEN}"
     chat_id: "${TELEGRAM_CHAT_ID}"
+  slack:
+    webhook_url: "${SLACK_WEBHOOK_URL}"
   notify_on_conflict: true
   notify_on_sync_error: true
 
@@ -184,6 +186,8 @@ Run continuous sync daemon.
 ```bash
 couchdb-file-sync daemon ~/documents --interval 60
 ```
+
+If the process panics, the binary attempts to send a Slack alert through `notifications.slack.webhook_url`. This uses the config already loaded from YAML or environment variables and is separate from the normal sync/conflict Telegram notifications.
 
 For live mode (watcher + changes feed):
 

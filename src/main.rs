@@ -1,11 +1,13 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::info;
 
 use couchdb_file_sync::cli;
 use couchdb_file_sync::config::{AppConfig, SyncPath, default_log_file, default_user_config_file};
 use couchdb_file_sync::logging::{AppLogWriter, RotationMode};
+use couchdb_file_sync::slack::SlackNotifier;
 
 #[derive(Parser, Debug)]
 #[command(name = "couchdb-file-sync")]
@@ -128,9 +130,10 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let cli_config = cli.config.clone();
 
     if cli.verbose > 0 {
-        match resolved_config_path(cli.config.clone()) {
+        match resolved_config_path(cli_config.clone()) {
             Some((path, source)) => {
                 eprintln!("Using config file ({source}): {}", path.display())
             }
@@ -139,7 +142,7 @@ async fn main() -> Result<()> {
     }
 
     // Load configuration
-    let mut config = match AppConfig::load(cli.config) {
+    let mut config = match AppConfig::load(cli_config.clone()) {
         Ok(c) => c,
         Err(e) => {
             if cli.verbose > 0 {
@@ -174,6 +177,11 @@ async fn main() -> Result<()> {
     // Initialize logging
     let daemon_mode = matches!(&cli.command, Commands::Daemon { .. });
     init_logging(cli.verbose, &config, enable_file_logging, daemon_mode);
+    install_panic_hook(
+        config.notifications.enabled,
+        config.notifications.slack.webhook_url.clone(),
+        resolved_config_path(cli_config).map(|(path, _)| path),
+    );
 
     // Execute command
     match cli.command {
@@ -397,6 +405,64 @@ fn paths_match(left: &std::path::Path, right: &std::path::Path) -> bool {
     }
 }
 
+fn install_panic_hook(
+    notifications_enabled: bool,
+    slack_webhook_url: Option<String>,
+    config_path: Option<PathBuf>,
+) {
+    let previous_hook = std::panic::take_hook();
+    let slack_webhook_url = Arc::new(slack_webhook_url);
+    let config_path = Arc::new(config_path);
+
+    std::panic::set_hook(Box::new(move |panic_info| {
+        previous_hook(panic_info);
+
+        if !notifications_enabled {
+            return;
+        }
+
+        let Some(webhook_url) = slack_webhook_url.as_deref() else {
+            return;
+        };
+
+        let location = panic_info
+            .location()
+            .map(|location| format!("{}:{}", location.file(), location.line()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let config_path = config_path
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "defaults/environment only".to_string());
+        let message = format!(
+            ":rotating_light: couchdb-file-sync panic\n\
+Timestamp: {}\n\
+Location: {}\n\
+Config: {}\n\
+Payload: {}",
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+            location,
+            config_path,
+            panic_payload(panic_info)
+        );
+
+        if let Err(err) = SlackNotifier::notify_text_blocking(webhook_url, &message) {
+            eprintln!("Failed to send panic notification to Slack: {err}");
+        }
+    }));
+}
+
+fn panic_payload(panic_info: &std::panic::PanicHookInfo<'_>) -> String {
+    if let Some(message) = panic_info.payload().downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+
+    if let Some(message) = panic_info.payload().downcast_ref::<String>() {
+        return message.clone();
+    }
+
+    "non-string panic payload".to_string()
+}
+
 /// Initialize logging based on verbosity or RUST_LOG env var
 fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daemon_mode: bool) {
     use tracing_subscriber::EnvFilter;
@@ -564,5 +630,20 @@ mod tests {
         let resolved = resolve_paths(None, &config);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].local, PathBuf::from("."));
+    }
+
+    #[test]
+    fn panic_payload_handles_string_payloads() {
+        let panic = std::panic::catch_unwind(|| panic!("boom")).unwrap_err();
+        let panic = panic.downcast::<&str>().unwrap();
+        assert_eq!(*panic, "boom");
+    }
+
+    #[test]
+    fn panic_payload_handles_owned_string_payloads() {
+        let panic =
+            std::panic::catch_unwind(|| std::panic::panic_any(String::from("owned"))).unwrap_err();
+        let panic = panic.downcast::<String>().unwrap();
+        assert_eq!(*panic, "owned".to_string());
     }
 }

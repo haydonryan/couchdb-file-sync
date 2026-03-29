@@ -197,6 +197,8 @@ pub struct NotificationConfig {
     #[serde(default)]
     pub telegram: TelegramConfig,
     #[serde(default)]
+    pub slack: SlackConfig,
+    #[serde(default)]
     pub notify_on_conflict: bool,
     #[serde(default)]
     pub notify_on_sync_error: bool,
@@ -209,6 +211,12 @@ pub struct NotificationConfig {
 pub struct TelegramConfig {
     pub bot_token: Option<String>,
     pub chat_id: Option<String>,
+}
+
+/// Slack notification configuration
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SlackConfig {
+    pub webhook_url: Option<String>,
 }
 
 /// Logging configuration

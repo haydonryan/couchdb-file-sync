@@ -59,6 +59,8 @@ notifications:
   telegram:
     bot_token: "${TELEGRAM_BOT_TOKEN}"  # From @BotFather
     chat_id: "${TELEGRAM_CHAT_ID}"      # Your chat ID
+  slack:
+    webhook_url: "${SLACK_WEBHOOK_URL}" # Incoming webhook URL for panic alerts
   notify_on_conflict: true
   notify_on_sync_error: true
   notify_summary: false
