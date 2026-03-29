@@ -145,4 +145,67 @@ mod tests {
     fn resolution_strategy_display_skip() {
         assert_eq!(format!("{}", ResolutionStrategy::Skip), "skip");
     }
+
+    // =========================================================================
+    // Tests for Conflict struct
+    // =========================================================================
+
+    #[test]
+    fn conflict_new_sets_fields_correctly() {
+        use crate::models::file::FileState;
+        use chrono::Utc;
+
+        let local_state =
+            FileState::new("test.txt".to_string(), "hash1".to_string(), 100, Utc::now());
+        let remote_state = RemoteState {
+            path: "test.txt".to_string(),
+            hash: "hash2".to_string(),
+            size: 200,
+            modified_at: Utc::now(),
+            couch_rev: "1-abc".to_string(),
+            deleted: false,
+        };
+
+        let conflict = Conflict::new("test.txt".to_string(), local_state, remote_state);
+
+        assert_eq!(conflict.path, "test.txt");
+        assert!(!conflict.notified);
+        assert_eq!(conflict.local_state.size, 100);
+        assert_eq!(conflict.remote_state.size, 200);
+    }
+
+    #[test]
+    fn conflict_mark_notified_sets_flag() {
+        use crate::models::file::FileState;
+        use chrono::Utc;
+
+        let local_state =
+            FileState::new("test.txt".to_string(), "hash1".to_string(), 100, Utc::now());
+        let remote_state = RemoteState {
+            path: "test.txt".to_string(),
+            hash: "hash2".to_string(),
+            size: 200,
+            modified_at: Utc::now(),
+            couch_rev: "1-abc".to_string(),
+            deleted: false,
+        };
+
+        let mut conflict = Conflict::new("test.txt".to_string(), local_state, remote_state);
+        assert!(!conflict.notified);
+
+        conflict.mark_notified();
+        assert!(conflict.notified);
+    }
+
+    // =========================================================================
+    // Tests for ConflictStats
+    // =========================================================================
+
+    #[test]
+    fn conflict_stats_default_is_zero() {
+        let stats: ConflictStats = Default::default();
+        assert_eq!(stats.total, 0);
+        assert_eq!(stats.notified, 0);
+        assert_eq!(stats.unresolved, 0);
+    }
 }
