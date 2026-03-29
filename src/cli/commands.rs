@@ -1377,3 +1377,341 @@ fn print_sync_report(report: &SyncReport) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    // =========================================================================
+    // Tests for shell_quote
+    // =========================================================================
+
+    #[test]
+    fn shell_quote_simple_path() {
+        let path = Path::new("/home/user/file.txt");
+        assert_eq!(shell_quote(path), "/home/user/file.txt");
+    }
+
+    #[test]
+    fn shell_quote_path_with_spaces() {
+        let path = Path::new("/home/user/my documents/file.txt");
+        assert_eq!(shell_quote(path), "\"/home/user/my documents/file.txt\"");
+    }
+
+    #[test]
+    fn shell_quote_path_with_quotes() {
+        let path = Path::new("/home/user/file\"name.txt");
+        assert_eq!(shell_quote(path), "\"/home/user/file\\\"name.txt\"");
+    }
+
+    #[test]
+    fn shell_quote_path_with_backslashes() {
+        let path = Path::new("/home/user/file\\name.txt");
+        assert_eq!(shell_quote(path), "\"/home/user/file\\\\name.txt\"");
+    }
+
+    #[test]
+    fn shell_quote_path_with_special_chars() {
+        let path = Path::new("/path/with-special@chars:here");
+        // Special chars @ : - are allowed without quoting
+        assert_eq!(shell_quote(path), "/path/with-special@chars:here");
+    }
+
+    #[test]
+    fn shell_quote_empty_path() {
+        let path = Path::new("");
+        assert_eq!(shell_quote(path), "");
+    }
+
+    // =========================================================================
+    // Tests for shell_quote_path_list
+    // =========================================================================
+
+    #[test]
+    fn shell_quote_path_list_simple() {
+        let paths = vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")];
+        let result = shell_quote_path_list(&paths);
+        // Result should be a quoted string containing the joined paths
+        assert!(result.starts_with('"') || result.starts_with('/'));
+    }
+
+    // =========================================================================
+    // Tests for truncate_str
+    // =========================================================================
+
+    #[test]
+    fn truncate_str_no_truncation_needed() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_str_exact_width() {
+        assert_eq!(truncate_str("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_str_truncates_with_ellipsis() {
+        assert_eq!(truncate_str("hello world", 8), "hello...");
+    }
+
+    #[test]
+    fn truncate_str_unicode() {
+        // Each Chinese character is 1 char width
+        // "你好世界" has 4 chars
+        // If char_count <= max_width, the string is returned as-is
+        assert_eq!(truncate_str("你好世界", 4), "你好世界");
+        assert_eq!(truncate_str("你好世界", 5), "你好世界");
+
+        // When char_count > max_width, truncation with "..." happens
+        // For a longer unicode string: "你好世界你好世界" has 8 chars
+        // When max_width=7, we need 8>7 so truncate happens: take 7-3=4 chars + "..."
+        let long_unicode = "你好世界你好世界";
+        assert_eq!(truncate_str(long_unicode, 7), "你好世界...");
+        // When max_width=8, we need 8>8 false, so no truncation
+        assert_eq!(truncate_str(long_unicode, 8), "你好世界你好世界");
+
+        // Test with width exactly 3 (edge case - just ellipsis)
+        assert_eq!(truncate_str("你好世界", 3), "...");
+    }
+
+    #[test]
+    fn truncate_str_small_width() {
+        assert_eq!(truncate_str("hello", 2), "..");
+    }
+
+    #[test]
+    fn truncate_str_width_one() {
+        assert_eq!(truncate_str("hello", 1), ".");
+    }
+
+    #[test]
+    fn truncate_str_empty() {
+        assert_eq!(truncate_str("", 10), "");
+    }
+
+    // =========================================================================
+    // Tests for TouchTracker
+    // =========================================================================
+
+    #[test]
+    fn touch_tracker_mark_and_check() {
+        let mut tracker = TouchTracker::new();
+        let mtime = UNIX_EPOCH + Duration::from_millis(10000);
+
+        assert!(!tracker.is_touched("test.txt", mtime));
+        tracker.mark("test.txt", mtime);
+        assert!(tracker.is_touched("test.txt", mtime));
+    }
+
+    #[test]
+    fn touch_tracker_different_paths() {
+        let mut tracker = TouchTracker::new();
+        let mtime = UNIX_EPOCH + Duration::from_millis(10000);
+
+        tracker.mark("file1.txt", mtime);
+        assert!(tracker.is_touched("file1.txt", mtime));
+        assert!(!tracker.is_touched("file2.txt", mtime));
+    }
+
+    #[test]
+    fn touch_tracker_different_buckets() {
+        let mut tracker = TouchTracker::new();
+        // bucket = millis / 5000
+        // mtime1 = 10000 ms -> bucket 2
+        // mtime2 = 14999 ms -> bucket 2 (same bucket)
+        // mtime3 = 15000 ms -> bucket 3 (different bucket)
+        let mtime1 = UNIX_EPOCH + Duration::from_millis(10000);
+        let mtime2 = UNIX_EPOCH + Duration::from_millis(14999);
+        let mtime3 = UNIX_EPOCH + Duration::from_millis(15000);
+
+        tracker.mark("test.txt", mtime1);
+        assert!(tracker.is_touched("test.txt", mtime1));
+        assert!(tracker.is_touched("test.txt", mtime2)); // Same bucket (2)
+        assert!(!tracker.is_touched("test.txt", mtime3)); // Different bucket (3)
+    }
+
+    #[test]
+    fn touch_tracker_bucket_calculation() {
+        let mtime = UNIX_EPOCH + Duration::from_millis(12345);
+        let bucket = TouchTracker::bucket(mtime);
+        assert_eq!(bucket, 12345 / 5000); // 2
+    }
+
+    #[test]
+    fn touch_tracker_capacity_limit() {
+        let mut tracker = TouchTracker::new();
+        let mtime = UNIX_EPOCH + Duration::from_millis(10000);
+
+        // Add more than 50 entries
+        for i in 0..60 {
+            tracker.mark(&format!("file{}.txt", i), mtime);
+        }
+
+        // Should only keep the last 50
+        assert_eq!(tracker.entries.len(), 50);
+
+        // First entries should have been removed
+        assert!(!tracker.is_touched("file0.txt", mtime));
+        assert!(!tracker.is_touched("file9.txt", mtime));
+
+        // Last entries should still be there
+        assert!(tracker.is_touched("file59.txt", mtime));
+        assert!(tracker.is_touched("file50.txt", mtime));
+    }
+
+    // =========================================================================
+    // Tests for format_sync_error_summary
+    // =========================================================================
+
+    #[test]
+    fn format_sync_error_summary_empty() {
+        let errors: Vec<String> = vec![];
+        let summary = format_sync_error_summary(&errors);
+        assert_eq!(summary, "");
+    }
+
+    #[test]
+    fn format_sync_error_summary_single_error() {
+        let errors = vec!["Error one".to_string()];
+        let summary = format_sync_error_summary(&errors);
+        assert_eq!(summary, "• Error one");
+    }
+
+    #[test]
+    fn format_sync_error_summary_multiple_errors() {
+        let errors = vec![
+            "Error one".to_string(),
+            "Error two".to_string(),
+            "Error three".to_string(),
+        ];
+        let summary = format_sync_error_summary(&errors);
+        assert_eq!(summary, "• Error one\n• Error two\n• Error three");
+    }
+
+    #[test]
+    fn format_sync_error_summary_max_errors() {
+        let errors: Vec<String> = (0..15).map(|i| format!("Error {}", i)).collect();
+        let summary = format_sync_error_summary(&errors);
+        assert!(summary.contains("Error 0"));
+        assert!(summary.contains("Error 9"));
+        assert!(!summary.contains("Error 10")); // Truncated
+        assert!(summary.contains("...and 5 more"));
+    }
+
+    // =========================================================================
+    // Tests for state_dir and state_db_path
+    // =========================================================================
+
+    #[test]
+    fn state_dir_prefers_new_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        // Create new directory
+        let new_dir = root.join(".couchdb-file-sync");
+        fs::create_dir(&new_dir).unwrap();
+
+        let result = state_dir(root);
+        assert_eq!(result, new_dir);
+    }
+
+    #[test]
+    fn state_dir_falls_back_to_old_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        // Create old directory
+        let old_dir = root.join(".couchfs");
+        fs::create_dir(&old_dir).unwrap();
+
+        let result = state_dir(root);
+        assert_eq!(result, old_dir);
+    }
+
+    #[test]
+    fn state_dir_returns_new_when_neither_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        let result = state_dir(root);
+        assert_eq!(result, root.join(".couchdb-file-sync"));
+    }
+
+    #[test]
+    fn state_db_path_returns_correct_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        let result = state_db_path(root);
+        assert!(result.to_string_lossy().contains("state.db"));
+    }
+
+    // =========================================================================
+    // Tests for remove_if_exists
+    // =========================================================================
+
+    #[test]
+    fn remove_if_exists_deletes_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("test.txt");
+        fs::write(&file, "content").unwrap();
+
+        assert!(file.exists());
+        remove_if_exists(&file).unwrap();
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn remove_if_exists_succeeds_when_not_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("nonexistent.txt");
+
+        assert!(!file.exists());
+        remove_if_exists(&file).unwrap(); // Should not error
+    }
+
+    // Note: InstallPaths::detect tests are skipped because they interact
+    // with the global environment and call functions that may block on
+    // filesystem operations. These would be better tested as integration tests.
+
+    // =========================================================================
+    // Tests for InstallPaths struct itself
+    // =========================================================================
+
+    #[test]
+    fn install_paths_struct_creation() {
+        // Test that InstallPaths can be created directly
+        let paths = InstallPaths {
+            bin_dir: PathBuf::from("/home/user/.local/bin"),
+            binary_path: PathBuf::from("/home/user/.local/bin/couchdb-file-sync"),
+            config_dir: PathBuf::from("/home/user/.config/couchdb-file-sync"),
+            config_file: PathBuf::from(
+                "/home/user/.config/couchdb-file-sync/couchdb-file-sync.yaml",
+            ),
+            systemd_user_dir: PathBuf::from("/home/user/.config/systemd/user"),
+            service_file: PathBuf::from(
+                "/home/user/.config/systemd/user/couchdb-file-sync.service",
+            ),
+        };
+
+        assert_eq!(paths.bin_dir, PathBuf::from("/home/user/.local/bin"));
+        assert_eq!(
+            paths.service_file.file_name().unwrap(),
+            "couchdb-file-sync.service"
+        );
+    }
+
+    // =========================================================================
+    // Tests for ConfigStatus
+    // =========================================================================
+
+    #[test]
+    fn config_status_debug_format() {
+        let existing = ConfigStatus::Existing;
+        let created = ConfigStatus::CreatedTemplate;
+
+        assert!(format!("{:?}", existing).contains("Existing"));
+        assert!(format!("{:?}", created).contains("CreatedTemplate"));
+    }
+}
