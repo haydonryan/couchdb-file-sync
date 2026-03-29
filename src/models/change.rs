@@ -189,3 +189,27 @@ impl ChangeBatch {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // Tests for ChangeType Display
+    // =========================================================================
+
+    #[test]
+    fn change_type_display_created() {
+        assert_eq!(format!("{}", ChangeType::Created), "created");
+    }
+
+    #[test]
+    fn change_type_display_modified() {
+        assert_eq!(format!("{}", ChangeType::Modified), "modified");
+    }
+
+    #[test]
+    fn change_type_display_deleted() {
+        assert_eq!(format!("{}", ChangeType::Deleted), "deleted");
+    }
+}
