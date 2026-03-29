@@ -458,10 +458,10 @@ fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daem
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, resolve_paths};
+    use super::{Cli, Commands, paths_match, resolve_paths};
     use clap::Parser;
     use couchdb_file_sync::config::{AppConfig, SyncPath};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn cli_path_uses_matching_configured_remote_prefix() {
@@ -514,5 +514,55 @@ mod tests {
                 path: Some(ref path)
             } if path == &PathBuf::from("/tmp/docs")
         ));
+    }
+
+    // =========================================================================
+    // Tests for paths_match
+    // =========================================================================
+
+    #[test]
+    fn paths_match_equal_paths() {
+        assert!(paths_match(Path::new("/tmp/test"), Path::new("/tmp/test")));
+    }
+
+    #[test]
+    fn paths_match_different_paths() {
+        assert!(!paths_match(
+            Path::new("/tmp/test1"),
+            Path::new("/tmp/test2")
+        ));
+    }
+
+    // =========================================================================
+    // Tests for resolve_paths edge cases
+    // =========================================================================
+
+    #[test]
+    fn resolve_paths_no_cli_path_uses_config_paths() {
+        let config = AppConfig {
+            paths: vec![
+                SyncPath {
+                    local: PathBuf::from("/path1"),
+                    remote: "remote1/".to_string(),
+                },
+                SyncPath {
+                    local: PathBuf::from("/path2"),
+                    remote: "remote2/".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let resolved = resolve_paths(None, &config);
+        assert_eq!(resolved.len(), 2);
+    }
+
+    #[test]
+    fn resolve_paths_no_cli_path_empty_config_uses_current_dir() {
+        let config = AppConfig::default();
+
+        let resolved = resolve_paths(None, &config);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].local, PathBuf::from("."));
     }
 }
