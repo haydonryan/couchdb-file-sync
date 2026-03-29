@@ -517,3 +517,50 @@ impl CouchDb {
 pub fn build_couch_url(host: &str, port: u16) -> String {
     format!("http://{}:{}", host, port)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // Tests for seq_to_string helper
+    // =========================================================================
+
+    #[test]
+    fn seq_to_string_from_string() {
+        let value = Value::String("123-abc".to_string());
+        assert_eq!(seq_to_string(&value), "123-abc");
+    }
+
+    #[test]
+    fn seq_to_string_from_number() {
+        let value = Value::Number(12345.into());
+        assert_eq!(seq_to_string(&value), "12345");
+    }
+
+    #[test]
+    fn seq_to_string_from_array() {
+        let value = Value::Array(vec![
+            Value::String("a".to_string()),
+            Value::Number(1.into()),
+        ]);
+        assert_eq!(seq_to_string(&value), "[\"a\",1]");
+    }
+
+    // =========================================================================
+    // Tests for build_couch_url
+    // =========================================================================
+
+    #[test]
+    fn build_couch_url_standard_port() {
+        assert_eq!(build_couch_url("localhost", 5984), "http://localhost:5984");
+    }
+
+    #[test]
+    fn build_couch_url_custom_port() {
+        assert_eq!(
+            build_couch_url("couch.example.com", 8080),
+            "http://couch.example.com:8080"
+        );
+    }
+}
