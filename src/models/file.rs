@@ -148,3 +148,70 @@ impl From<FileDoc> for RemoteState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // Tests for FileDoc
+    // =========================================================================
+
+    #[test]
+    fn file_doc_new_sets_fields_correctly() {
+        let doc = FileDoc::new("test.txt".to_string(), "ignored_hash".to_string(), 100);
+
+        assert_eq!(doc.id, "test.txt");
+        assert_eq!(doc.path, "test.txt");
+        assert_eq!(doc.size, 100);
+        assert_eq!(doc.doc_type, "plain");
+        assert!(!doc.deleted);
+        assert!(doc.rev.is_none());
+        assert!(doc.children.is_empty());
+        // ctime and mtime should be set to approximately now
+        assert!(doc.ctime > 0);
+        assert!(doc.mtime > 0);
+    }
+
+    #[test]
+    fn file_doc_is_file_with_plain_type() {
+        let doc = FileDoc::new("test.txt".to_string(), "hash".to_string(), 100);
+        assert!(doc.is_file());
+    }
+
+    #[test]
+    fn file_doc_is_file_with_chunk_id() {
+        let mut doc = FileDoc::new("h:chunk123".to_string(), "hash".to_string(), 50);
+        doc.doc_type = "".to_string();
+        // IDs starting with "h:" are chunks, not files
+        assert!(!doc.is_file());
+    }
+
+    #[test]
+    fn file_doc_is_file_with_empty_type_and_plain_id() {
+        let mut doc = FileDoc::new("test.txt".to_string(), "hash".to_string(), 100);
+        doc.doc_type = "".to_string();
+        // Empty type with non-chunk ID should be treated as file
+        assert!(doc.is_file());
+    }
+
+    #[test]
+    fn file_doc_modified_at_from_valid_mtime() {
+        let now = Utc::now().timestamp_millis() as u64;
+        let mut doc = FileDoc::new("test.txt".to_string(), "hash".to_string(), 100);
+        doc.mtime = now;
+
+        let modified = doc.modified_at();
+        assert_eq!(modified.timestamp_millis() as u64, now);
+    }
+
+    #[test]
+    fn file_doc_modified_at_with_zero() {
+        // Zero is a valid timestamp (Unix epoch)
+        let mut doc = FileDoc::new("test.txt".to_string(), "hash".to_string(), 100);
+        doc.mtime = 0;
+
+        let modified = doc.modified_at();
+        assert_eq!(modified.timestamp(), 0);
+    }
+}
