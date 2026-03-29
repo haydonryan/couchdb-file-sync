@@ -212,4 +212,47 @@ mod tests {
     fn change_type_display_deleted() {
         assert_eq!(format!("{}", ChangeType::Deleted), "deleted");
     }
+
+    // =========================================================================
+    // Tests for local Change factory methods
+    // =========================================================================
+
+    #[test]
+    fn change_local_created_sets_correct_fields() {
+        let change = Change::local_created("test.txt".to_string(), "abc123".to_string(), 100);
+
+        assert_eq!(change.path, "test.txt");
+        assert_eq!(change.change_type, ChangeType::Created);
+        assert!(matches!(change.source, ChangeSource::Local));
+        assert_eq!(change.hash, Some("abc123".to_string()));
+        assert_eq!(change.size, Some(100));
+        assert!(change.mtime.is_none());
+        assert!(change.rev.is_none());
+    }
+
+    #[test]
+    fn change_local_modified_sets_correct_fields() {
+        let change = Change::local_modified("doc.md".to_string(), "def456".to_string(), 200);
+
+        assert_eq!(change.path, "doc.md");
+        assert_eq!(change.change_type, ChangeType::Modified);
+        assert!(matches!(change.source, ChangeSource::Local));
+        assert_eq!(change.hash, Some("def456".to_string()));
+        assert_eq!(change.size, Some(200));
+        assert!(change.mtime.is_none());
+        assert!(change.rev.is_none());
+    }
+
+    #[test]
+    fn change_local_deleted_sets_correct_fields() {
+        let change = Change::local_deleted("old.txt".to_string());
+
+        assert_eq!(change.path, "old.txt");
+        assert_eq!(change.change_type, ChangeType::Deleted);
+        assert!(matches!(change.source, ChangeSource::Local));
+        assert!(change.hash.is_none());
+        assert!(change.size.is_none());
+        assert!(change.mtime.is_none());
+        assert!(change.rev.is_none());
+    }
 }
