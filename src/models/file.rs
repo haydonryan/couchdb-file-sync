@@ -214,4 +214,71 @@ mod tests {
         let modified = doc.modified_at();
         assert_eq!(modified.timestamp(), 0);
     }
+
+    // =========================================================================
+    // Tests for FileState
+    // =========================================================================
+
+    #[test]
+    fn file_state_new_sets_correct_fields() {
+        use chrono::Utc;
+
+        let modified = Utc::now();
+        let state = FileState::new("test.txt".to_string(), "abc123".to_string(), 100, modified);
+
+        assert_eq!(state.path, "test.txt");
+        assert_eq!(state.hash, "abc123");
+        assert_eq!(state.size, 100);
+        assert_eq!(state.modified_at, modified);
+        assert!(state.couch_rev.is_none());
+        // last_sync_at should be set to approximately now
+        let now = Utc::now();
+        let diff = (now - state.last_sync_at).num_milliseconds().abs();
+        assert!(diff < 1000); // Within 1 second
+    }
+
+    // =========================================================================
+    // Tests for RemoteState
+    // =========================================================================
+
+    #[test]
+    fn remote_state_from_file_doc_maps_fields() {
+        use chrono::Utc;
+
+        let now_ms = Utc::now().timestamp_millis() as u64;
+        let doc = FileDoc {
+            id: "test.txt".to_string(),
+            rev: Some("1-abc".to_string()),
+            children: vec!["chunk1".to_string()],
+            path: "test.txt".to_string(),
+            ctime: now_ms,
+            mtime: now_ms,
+            size: 200,
+            doc_type: "plain".to_string(),
+            deleted: false,
+        };
+
+        let remote: RemoteState = doc.into();
+
+        assert_eq!(remote.path, "test.txt");
+        assert_eq!(remote.size, 200);
+        assert_eq!(remote.couch_rev, "1-abc");
+        assert!(!remote.deleted);
+        // Hash is always empty string (computed locally, not stored in CouchDB)
+        assert_eq!(remote.hash, "");
+        // mtime should be converted correctly
+        assert_eq!(remote.modified_at.timestamp_millis() as u64, now_ms);
+    }
+
+    #[test]
+    fn remote_state_from_file_doc_handles_deleted() {
+        let mut doc = FileDoc::new("deleted.txt".to_string(), "hash".to_string(), 0);
+        doc.deleted = true;
+        doc.rev = Some("2-deleted".to_string());
+
+        let remote: RemoteState = doc.into();
+
+        assert!(remote.deleted);
+        assert_eq!(remote.couch_rev, "2-deleted");
+    }
 }
