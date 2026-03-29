@@ -41,7 +41,7 @@ notify-debouncer-full = "0.7"
 rusqlite = { version = "0.39", features = ["bundled", "chrono", "serde_json"] }
 
 # Hashing
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 
 # Time handling
