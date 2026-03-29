@@ -35,13 +35,14 @@ impl FileWatcher {
         let root = root_dir.clone();
 
         let closure_matcher = ignore_matcher.clone();
+        let event_tx_clone = event_tx.clone();
         let mut debouncer = new_debouncer(
             Duration::from_millis(debounce_ms),
             None,
             move |result: DebounceEventResult| match result {
                 Ok(events) => {
                     for event in events {
-                        let _ = process_event(event, &event_tx, &closure_matcher, &root);
+                        let _ = process_event(event, &event_tx_clone, &closure_matcher, &root);
                     }
                 }
                 Err(errors) => {
@@ -245,5 +246,152 @@ impl AsyncFileWatcher {
     /// Convert watcher events to changes
     pub fn event_to_change(&self, event: WatcherEvent) -> Option<Change> {
         self.inner.event_to_change(event)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{ChangeSource, ChangeType};
+
+    // =========================================================================
+    // Tests for should_ignore helper
+    // =========================================================================
+
+    #[test]
+    fn should_ignore_path_outside_root() {
+        let root = Path::new("/home/user/docs");
+        let matcher = IgnoreMatcher::empty();
+        let outside_path = Path::new("/etc/passwd");
+
+        assert!(should_ignore(outside_path, &matcher, root));
+    }
+
+    #[test]
+    fn should_ignore_respects_matcher() {
+        let root = Path::new("/home/user/docs");
+        let matcher = IgnoreMatcher::from_content("*.log");
+        let ignored_path = Path::new("/home/user/docs/debug.log");
+
+        assert!(should_ignore(ignored_path, &matcher, root));
+    }
+
+    #[test]
+    fn should_not_ignore_normal_file() {
+        let root = Path::new("/home/user/docs");
+        let matcher = IgnoreMatcher::from_content("*.log");
+        let normal_path = Path::new("/home/user/docs/readme.txt");
+
+        assert!(!should_ignore(normal_path, &matcher, root));
+    }
+
+    // =========================================================================
+    // Tests for relative_path
+    // =========================================================================
+
+    fn test_watcher(root: PathBuf) -> FileWatcher {
+        // Create a minimal FileWatcher for testing using a test directory
+        // We can't easily test FileWatcher::new() without actual file system setup,
+        // so we'll test the methods directly by creating a mock scenario
+        let (_event_tx, event_rx) = mpsc::channel(100);
+        let ignore_matcher = Arc::new(IgnoreMatcher::empty());
+
+        FileWatcher {
+            root_dir: root,
+            ignore_matcher,
+            event_rx,
+        }
+    }
+
+    #[test]
+    fn relative_path_extracts_subpath() {
+        let watcher = test_watcher(PathBuf::from("/home/user/docs"));
+        let full = Path::new("/home/user/docs/notes.txt");
+
+        let relative = watcher.relative_path(full);
+        assert_eq!(relative, Some(PathBuf::from("notes.txt")));
+    }
+
+    #[test]
+    fn relative_path_handles_nested_dirs() {
+        let watcher = test_watcher(PathBuf::from("/home/user/docs"));
+        let full = Path::new("/home/user/docs/subdir/nested.txt");
+
+        let relative = watcher.relative_path(full);
+        assert_eq!(relative, Some(PathBuf::from("subdir/nested.txt")));
+    }
+
+    #[test]
+    fn relative_path_returns_none_for_outside() {
+        let watcher = test_watcher(PathBuf::from("/home/user/docs"));
+        let outside = Path::new("/etc/passwd");
+
+        let relative = watcher.relative_path(outside);
+        assert_eq!(relative, None);
+    }
+
+    // =========================================================================
+    // Tests for event_to_change
+    // =========================================================================
+
+    #[test]
+    fn event_to_change_created() {
+        let watcher = test_watcher(PathBuf::from("/home/user/docs"));
+        let event = WatcherEvent::FileCreated(PathBuf::from("/home/user/docs/new.txt"));
+
+        let change = watcher.event_to_change(event);
+        assert!(change.is_some());
+        let change = change.unwrap();
+        assert_eq!(change.path, "new.txt");
+        assert!(matches!(change.change_type, ChangeType::Created));
+        assert!(matches!(change.source, ChangeSource::Local));
+    }
+
+    #[test]
+    fn event_to_change_modified() {
+        let watcher = test_watcher(PathBuf::from("/home/user/docs"));
+        let event = WatcherEvent::FileModified(PathBuf::from("/home/user/docs/existing.txt"));
+
+        let change = watcher.event_to_change(event);
+        assert!(change.is_some());
+        let change = change.unwrap();
+        assert_eq!(change.path, "existing.txt");
+        assert!(matches!(change.change_type, ChangeType::Modified));
+    }
+
+    #[test]
+    fn event_to_change_deleted() {
+        let watcher = test_watcher(PathBuf::from("/home/user/docs"));
+        let event = WatcherEvent::FileDeleted(PathBuf::from("/home/user/docs/old.txt"));
+
+        let change = watcher.event_to_change(event);
+        assert!(change.is_some());
+        let change = change.unwrap();
+        assert_eq!(change.path, "old.txt");
+        assert!(matches!(change.change_type, ChangeType::Deleted));
+    }
+
+    #[test]
+    fn event_to_change_renamed() {
+        let watcher = test_watcher(PathBuf::from("/home/user/docs"));
+        let event = WatcherEvent::FileRenamed(
+            PathBuf::from("/home/user/docs/old.txt"),
+            PathBuf::from("/home/user/docs/new.txt"),
+        );
+
+        let change = watcher.event_to_change(event);
+        assert!(change.is_some());
+        let change = change.unwrap();
+        assert_eq!(change.path, "new.txt");
+        assert!(matches!(change.change_type, ChangeType::Created));
+    }
+
+    #[test]
+    fn event_to_change_returns_none_for_outside_root() {
+        let watcher = test_watcher(PathBuf::from("/home/user/docs"));
+        let event = WatcherEvent::FileCreated(PathBuf::from("/etc/passwd"));
+
+        let change = watcher.event_to_change(event);
+        assert!(change.is_none());
     }
 }
