@@ -72,7 +72,7 @@ jobs:
         run: |
           if checks_output="$(gh pr checks "$PR_NUMBER" --required 2>&1)"; then
             echo "passed=true" >> "$GITHUB_OUTPUT"
-          elif echo "" | grep -q "no required checks reported"; then
+          elif echo "$checks_output" | grep -q "no required checks reported"; then
             echo "No required checks configured for this PR; treating as pass for automerge gating."
             echo "passed=true" >> "$GITHUB_OUTPUT"
           else
@@ -108,8 +108,8 @@ jobs:
           echo "touches_workflows=${{ steps.changed-files.outputs.touches_workflows || 'unknown' }}"
           gh auth status || true
           gh pr view "$PR_NUMBER" --repo "$REPO" \
-            --json number,author,draft,mergeableState,maintainerCanModify,state,autoMerge \
-            --jq '{number, author: .author.login, draft, mergeableState, maintainerCanModify, state, autoMerge: .autoMerge != null}'
+            --json number,author,isDraft,mergeStateStatus,maintainerCanModify,state,autoMergeRequest \
+            --jq '{number, author: .author.login, isDraft, mergeStateStatus, maintainerCanModify, state, autoMergeEnabled: (.autoMergeRequest != null)}'
 
       - name: Require dedicated token for workflow changes
         if: >
