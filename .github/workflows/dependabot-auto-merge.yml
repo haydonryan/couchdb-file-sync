@@ -109,7 +109,7 @@ jobs:
           gh auth status || true
           gh pr view "$PR_NUMBER" --repo "$REPO" \
             --json number,author,isDraft,mergeStateStatus,maintainerCanModify,state,autoMergeRequest \
-            --jq '{number, author: .author.login, isDraft, mergeStateStatus, maintainerCanModify, state, autoMergeEnabled: (.autoMergeRequest != null)}'
+            --jq '{number, author: .author.login, isDraft, mergeStateStatus, maintainerCanModify, state, autoMerge: .autoMergeRequest != null}'
 
       - name: Require dedicated token for workflow changes
         if: >
