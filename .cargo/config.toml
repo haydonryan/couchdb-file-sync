@@ -1,0 +1,2 @@
+[build]
+target-dir = "/home/claw/.cache/rust-targets/couchdb-file-sync"
