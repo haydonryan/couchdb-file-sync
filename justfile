@@ -1,3 +1,10 @@
+check:
+    cargo fmt --all -- --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo audit
+    cargo deny check all
+    cargo test
+
 test:
     cargo fmt --all -- --check
     cargo clippy --all-targets --all-features -- -D warnings

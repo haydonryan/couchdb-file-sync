@@ -5,6 +5,7 @@ use couch_rs::database::Database;
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use tracing::{debug, warn};
 
 /// CouchDB client wrapper
@@ -41,11 +42,74 @@ struct ChangeRow<T> {
     doc: Option<T>,
 }
 
+#[derive(Debug, Deserialize)]
+struct MetadataChangesResponse {
+    results: Vec<MetadataChangeRow>,
+    last_seq: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct MetadataChangeRow {
+    id: String,
+    seq: Value,
+    deleted: Option<bool>,
+    #[serde(default)]
+    changes: Vec<ChangeRev>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChangeRev {
+    rev: String,
+}
+
 fn seq_to_string(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
         _ => value.to_string(),
     }
+}
+
+fn is_file_like_doc_id(id: &str) -> bool {
+    !id.starts_with("h:") && !id.starts_with("_design/")
+}
+
+fn metadata_changes_to_changes(remote_path: &str, rows: Vec<MetadataChangeRow>) -> Vec<Change> {
+    let mut latest_by_id: HashMap<String, Change> = HashMap::new();
+
+    for row in rows {
+        let _seq = seq_to_string(&row.seq);
+        let id = row.id;
+        if !(remote_path.is_empty()
+            || id.starts_with(remote_path)
+            || id == remote_path.trim_end_matches('/'))
+            || !is_file_like_doc_id(&id)
+        {
+            continue;
+        }
+
+        let change = if row.deleted.unwrap_or(false) {
+            Change::remote_deleted(id.clone())
+        } else {
+            let rev = row
+                .changes
+                .last()
+                .map(|c| c.rev.clone())
+                .unwrap_or_default();
+            Change::new(
+                id.clone(),
+                ChangeType::Modified,
+                ChangeSource::Remote,
+                None,
+                None,
+                None,
+                Some(rev),
+            )
+        };
+
+        latest_by_id.insert(id, change);
+    }
+
+    latest_by_id.into_values().collect()
 }
 
 impl CouchDb {
@@ -260,12 +324,6 @@ impl CouchDb {
     pub async fn get_changes(&self, since: Option<&str>) -> Result<(Vec<Change>, String)> {
         debug!("get_changes called with since = {:?}", since);
 
-        let all_files = self.get_all_files().await?;
-        debug!(
-            "Total files in CouchDB (filtered by remote_path): {}",
-            all_files.len()
-        );
-
         // If no checkpoint exists (first run), return empty changes
         // The files will be handled as new files on the next sync
         if since.is_none() {
@@ -274,41 +332,26 @@ impl CouchDb {
             return Ok((Vec::new(), seq));
         }
 
-        debug!("Checkpoint found: {}, returning changes", since.unwrap());
+        let url = format!("{}/_changes", self.base_db_url);
+        let mut request = self
+            .http_client
+            .get(&url)
+            .query(&[("since", since.unwrap())]);
 
-        // Return all files (including deleted) as potential changes (sync will compare revs)
-        let changes: Vec<Change> = all_files
-            .into_iter()
-            .map(|doc| {
-                let mtime = doc.modified_at();
-                let rev = doc.rev.unwrap_or_default();
-                if doc.deleted {
-                    Change::new(
-                        doc.id,
-                        ChangeType::Deleted,
-                        ChangeSource::Remote,
-                        None,
-                        None,
-                        Some(mtime),
-                        Some(rev),
-                    )
-                } else {
-                    crate::models::Change::remote_modified(
-                        doc.id,
-                        String::new(),
-                        doc.size,
-                        mtime,
-                        rev,
-                    )
-                }
-            })
-            .collect();
+        if let Some((username, password)) = &self.auth {
+            request = request.basic_auth(username, Some(password));
+        }
 
-        debug!("Returning {} changes", changes.len());
+        let response = request.send().await?.error_for_status()?;
+        let body = response.json::<MetadataChangesResponse>().await?;
+        let changes = metadata_changes_to_changes(&self.remote_path, body.results);
 
-        // Return the CouchDB update sequence so live sync can resume safely.
-        let seq = self.get_update_seq().await?;
-        Ok((changes, seq))
+        debug!(
+            "Remote metadata changes fetched (filtered by remote_path): {}",
+            changes.len()
+        );
+
+        Ok((changes, seq_to_string(&body.last_seq)))
     }
 
     /// Get remote state for comparison
@@ -521,10 +564,8 @@ pub fn build_couch_url(host: &str, port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // =========================================================================
-    // Tests for seq_to_string helper
-    // =========================================================================
+    use crate::models::ChangeType;
+    use serde_json::json;
 
     #[test]
     fn seq_to_string_from_string() {
@@ -547,10 +588,6 @@ mod tests {
         assert_eq!(seq_to_string(&value), "[\"a\",1]");
     }
 
-    // =========================================================================
-    // Tests for build_couch_url
-    // =========================================================================
-
     #[test]
     fn build_couch_url_standard_port() {
         assert_eq!(build_couch_url("localhost", 5984), "http://localhost:5984");
@@ -562,5 +599,77 @@ mod tests {
             build_couch_url("couch.example.com", 8080),
             "http://couch.example.com:8080"
         );
+    }
+
+    #[test]
+    fn metadata_changes_only_keep_allowed_file_ids() {
+        let changes = metadata_changes_to_changes(
+            "Agents/",
+            vec![
+                MetadataChangeRow {
+                    id: "Agents/file.md".into(),
+                    seq: json!(1),
+                    deleted: None,
+                    changes: vec![ChangeRev { rev: "1-a".into() }],
+                },
+                MetadataChangeRow {
+                    id: "Agents/sub/file.md".into(),
+                    seq: json!(2),
+                    deleted: Some(true),
+                    changes: vec![],
+                },
+                MetadataChangeRow {
+                    id: "h:chunk123".into(),
+                    seq: json!(3),
+                    deleted: None,
+                    changes: vec![ChangeRev { rev: "1-b".into() }],
+                },
+                MetadataChangeRow {
+                    id: "Other/file.py".into(),
+                    seq: json!(4),
+                    deleted: None,
+                    changes: vec![ChangeRev { rev: "1-c".into() }],
+                },
+            ],
+        );
+
+        assert_eq!(changes.len(), 2);
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path == "Agents/file.md" && c.change_type == ChangeType::Modified)
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path == "Agents/sub/file.md" && c.change_type == ChangeType::Deleted)
+        );
+    }
+
+    #[test]
+    fn metadata_changes_deduplicate_to_latest_seq_per_id() {
+        let changes = metadata_changes_to_changes(
+            "",
+            vec![
+                MetadataChangeRow {
+                    id: "file.md".into(),
+                    seq: json!(1),
+                    deleted: None,
+                    changes: vec![ChangeRev { rev: "1-a".into() }],
+                },
+                MetadataChangeRow {
+                    id: "file.md".into(),
+                    seq: json!(2),
+                    deleted: None,
+                    changes: vec![ChangeRev { rev: "2-b".into() }],
+                },
+            ],
+        );
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].rev.as_deref(), Some("2-b"));
+        assert_eq!(changes[0].change_type, ChangeType::Modified);
+        assert!(changes[0].mtime.is_none());
+        assert!(changes[0].size.is_none());
     }
 }
