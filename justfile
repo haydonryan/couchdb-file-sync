@@ -1,3 +1,6 @@
+build:
+    cargo build
+
 check:
     cargo fmt --all -- --check
     cargo clippy --all-targets --all-features -- -D warnings
@@ -5,12 +8,8 @@ check:
     cargo deny check all
     cargo test
 
-test:
-    cargo fmt --all -- --check
-    cargo clippy --all-targets --all-features -- -D warnings
-    cargo audit
-    cargo deny check all
-    cargo test
+install:
+    cargo install --path .
 
 pre-commit:
     ./scripts/scan-staged-secrets.sh
@@ -24,5 +23,8 @@ release *args:
     git pull --rebase
     cargo release {{args}}
 
-install:
-    cargo install --path .
+run *args:
+    cargo run -- {{args}}
+
+test:
+    cargo test
