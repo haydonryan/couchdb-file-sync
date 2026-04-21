@@ -183,13 +183,11 @@ async fn local_edit_after_upload_should_upload_again_not_conflict() -> Result<()
 
         let second_report = engine.sync().await?;
         assert_eq!(
-            second_report.conflicts,
-            0,
+            second_report.conflicts, 0,
             "local edit after a successful upload should be re-uploaded, not conflicted",
         );
         assert_eq!(
-            second_report.uploaded,
-            1,
+            second_report.uploaded, 1,
             "local edit after a successful upload should upload one file",
         );
 
@@ -230,10 +228,10 @@ async fn local_edit_after_upload_should_upload_again_not_conflict() -> Result<()
                 eprintln!("cleanup delete {} failed: {}", remote_id, err);
             }
 
-            if !doc.children.is_empty() {
-                if let Err(err) = couchdb.delete_chunks(&doc.children).await {
-                    eprintln!("cleanup delete chunks for {} failed: {}", remote_id, err);
-                }
+            if !doc.children.is_empty()
+                && let Err(err) = couchdb.delete_chunks(&doc.children).await
+            {
+                eprintln!("cleanup delete chunks for {} failed: {}", remote_id, err);
             }
         }
     } else {

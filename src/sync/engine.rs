@@ -890,18 +890,20 @@ fn is_polluted_state_path(path: &str, remote_prefix: &str) -> bool {
 fn is_remote_change_newer(remote_change: &Change, stored_state: Option<&FileState>) -> bool {
     match (&remote_change.mtime, stored_state) {
         (Some(remote_mtime), Some(state)) => {
-            if let (Some(remote_rev), Some(local_rev)) = (&remote_change.rev, &state.couch_rev) {
-                if !remote_rev.is_empty() && remote_rev == local_rev {
-                    return false;
-                }
+            if let (Some(remote_rev), Some(local_rev)) = (&remote_change.rev, &state.couch_rev)
+                && !remote_rev.is_empty()
+                && remote_rev == local_rev
+            {
+                return false;
             }
             *remote_mtime > state.last_sync_at
         }
         (None, Some(state)) => {
-            if let (Some(remote_rev), Some(local_rev)) = (&remote_change.rev, &state.couch_rev) {
-                if !remote_rev.is_empty() && remote_rev == local_rev {
-                    return false;
-                }
+            if let (Some(remote_rev), Some(local_rev)) = (&remote_change.rev, &state.couch_rev)
+                && !remote_rev.is_empty()
+                && remote_rev == local_rev
+            {
+                return false;
             }
             true
         }
