@@ -352,66 +352,7 @@ impl SyncEngine {
             }
 
             let remote_changed = if let Some(rc) = remote_map.get(&remote_path) {
-                match (&rc.mtime, &stored_state) {
-                    (Some(remote_mtime), Some(state)) => {
-                        let changed = *remote_mtime > state.last_sync_at;
-                        if changed {
-                            info!("  [REMOTE CHANGE DETECTED] {}", lc.path);
-                            info!(
-                                "    Remote mtime: {} | Last sync: {} | Diff: +{}s",
-                                remote_mtime.format("%Y-%m-%d %H:%M:%S"),
-                                state.last_sync_at.format("%Y-%m-%d %H:%M:%S"),
-                                (*remote_mtime - state.last_sync_at).num_seconds()
-                            );
-                            if let Some(remote_rev) = &rc.rev {
-                                let stored_rev = state.couch_rev.as_deref().unwrap_or("none");
-                                info!(
-                                    "    Remote rev: {} | Stored rev: {}",
-                                    &remote_rev[..12.min(remote_rev.len())],
-                                    &stored_rev[..12.min(stored_rev.len())]
-                                );
-                            }
-                            if let Some(remote_size) = rc.size {
-                                info!(
-                                    "    Remote size: {} bytes | Local size: {} bytes",
-                                    remote_size, state.size
-                                );
-                            }
-                        } else {
-                            debug!(
-                                "    {} - remote_mtime ({}) <= last_sync_at ({}), no remote change",
-                                lc.path,
-                                remote_mtime.format("%Y-%m-%d %H:%M:%S"),
-                                state.last_sync_at.format("%Y-%m-%d %H:%M:%S")
-                            );
-                        }
-                        changed
-                    }
-                    (None, _) => {
-                        info!(
-                            "  [REMOTE CHANGE DETECTED] {} - no remote mtime available, assuming changed",
-                            lc.path
-                        );
-                        if let Some(ref state) = stored_state {
-                            info!(
-                                "    Stored rev: {:?} | Remote rev: {:?}",
-                                state.couch_rev, rc.rev
-                            );
-                        }
-                        true
-                    }
-                    (_, None) => {
-                        info!(
-                            "  [REMOTE CHANGE DETECTED] {} - no stored state (first sync)",
-                            lc.path
-                        );
-                        info!(
-                            "    Remote mtime: {:?} | Remote rev: {:?} | Remote size: {:?}",
-                            rc.mtime, rc.rev, rc.size
-                        );
-                        true
-                    }
-                }
+                is_remote_change_newer(rc, stored_state.as_ref())
             } else {
                 debug!("  {} - file not on remote yet", lc.path);
                 false
@@ -946,6 +887,28 @@ fn is_polluted_state_path(path: &str, remote_prefix: &str) -> bool {
         && (path == remote_prefix || path.starts_with(&format!("{remote_prefix}/")))
 }
 
+fn is_remote_change_newer(remote_change: &Change, stored_state: Option<&FileState>) -> bool {
+    match (&remote_change.mtime, stored_state) {
+        (Some(remote_mtime), Some(state)) => {
+            if let (Some(remote_rev), Some(local_rev)) = (&remote_change.rev, &state.couch_rev) {
+                if !remote_rev.is_empty() && remote_rev == local_rev {
+                    return false;
+                }
+            }
+            *remote_mtime > state.last_sync_at
+        }
+        (None, Some(state)) => {
+            if let (Some(remote_rev), Some(local_rev)) = (&remote_change.rev, &state.couch_rev) {
+                if !remote_rev.is_empty() && remote_rev == local_rev {
+                    return false;
+                }
+            }
+            true
+        }
+        (_, None) => true,
+    }
+}
+
 fn plan_remote_rebuild(
     local_states: &[FileState],
     remote_docs: &[FileDoc],
@@ -1002,10 +965,10 @@ fn remote_path_to_local_path(remote_path: &str, remote_prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_polluted_state_path, plan_local_rebuild, plan_remote_rebuild, remote_path_to_local_path,
-        should_apply_remote_delete,
+        is_polluted_state_path, is_remote_change_newer, plan_local_rebuild, plan_remote_rebuild,
+        remote_path_to_local_path, should_apply_remote_delete,
     };
-    use crate::models::{FileDoc, FileState, IgnoreMatcher};
+    use crate::models::{Change, FileDoc, FileState, IgnoreMatcher};
     use chrono::{Duration, TimeZone, Utc};
 
     fn file_state(last_sync_at: chrono::DateTime<Utc>) -> FileState {
@@ -1137,6 +1100,32 @@ mod tests {
             vec!["notes/old.md".to_string(), "notes/extra.md".to_string()]
         );
         assert_eq!(remote_downloads, vec!["mirror/notes/new.md".to_string()]);
+    }
+
+    #[test]
+    fn remote_change_with_matching_revision_is_not_treated_as_remote_update() {
+        let last_sync = Utc.with_ymd_and_hms(2026, 3, 23, 17, 12, 33).unwrap();
+        let mut state = FileState::new(
+            "notes/note.md".to_string(),
+            "hash-old".to_string(),
+            10,
+            Utc::now(),
+        );
+        state.couch_rev = Some("1-abc".to_string());
+        state.last_sync_at = last_sync;
+
+        let remote_change = Change::remote_modified(
+            "notes/note.md".to_string(),
+            "hash-new".to_string(),
+            20,
+            last_sync + chrono::Duration::seconds(10),
+            "1-abc".to_string(),
+        );
+
+        assert!(
+            !is_remote_change_newer(&remote_change, Some(&state)),
+            "same CouchDB revision should not be treated as remote update"
+        );
     }
 
     #[test]

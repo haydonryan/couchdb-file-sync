@@ -135,6 +135,114 @@ async fn remote_move_deletes_old_local_path() -> Result<()> {
     test_result
 }
 
+#[tokio::test]
+#[ignore = "requires a running CouchDB server (see COUCHDB_FILE_SYNC_TEST_DB_* env vars)"]
+async fn local_edit_after_upload_should_upload_again_not_conflict() -> Result<()> {
+    let test_dir = TestDir::new("local-reupload")?;
+    let state_dir = test_dir.join(".couchdb-file-sync");
+    fs::create_dir_all(&state_dir)?;
+
+    let state_db = state_dir.join("state.db");
+    let local_file = test_dir.join("note.md");
+    fs::write(&local_file, "first line\n")?;
+
+    let remote_id = {
+        let (_, _, _, _, remote_path) = test_db_config();
+        format!("{}note.md", remote_path)
+    };
+
+    let test_result: Result<()> = async {
+        let (url, db_name, user, pass, remote_path) = test_db_config();
+
+        let local_db = LocalDb::open(&state_db)?;
+        let couchdb = CouchDb::new(
+            &url,
+            user.as_deref(),
+            pass.as_deref(),
+            &db_name,
+            &remote_path,
+        )
+        .await?;
+        let mut engine = SyncEngine::new(couchdb, local_db, test_dir.path.clone());
+
+        let first_report = engine.sync().await?;
+        assert_eq!(first_report.uploaded, 1, "initial file should upload");
+
+        fs::write(&local_file, "second line\n")?;
+
+        let local_db = LocalDb::open(&state_db)?;
+        let couchdb = CouchDb::new(
+            &url,
+            user.as_deref(),
+            pass.as_deref(),
+            &db_name,
+            &remote_path,
+        )
+        .await?;
+        let mut engine = SyncEngine::new(couchdb, local_db, test_dir.path.clone());
+
+        let second_report = engine.sync().await?;
+        assert_eq!(
+            second_report.conflicts,
+            0,
+            "local edit after a successful upload should be re-uploaded, not conflicted",
+        );
+        assert_eq!(
+            second_report.uploaded,
+            1,
+            "local edit after a successful upload should upload one file",
+        );
+
+        let local_db = LocalDb::open(&state_db)?;
+        let conflicts = local_db.get_conflicts()?;
+        assert!(
+            conflicts.is_empty(),
+            "reupload path should not leave conflict entries"
+        );
+
+        let couchdb = CouchDb::new(
+            &url,
+            user.as_deref(),
+            pass.as_deref(),
+            &db_name,
+            &remote_path,
+        )
+        .await?;
+        let remote_content = couchdb.get_file_content(&remote_id).await?;
+        assert_eq!(String::from_utf8(remote_content)?, "second line\n");
+
+        Ok(())
+    }
+    .await;
+
+    let (url, db_name, user, pass, remote_path) = test_db_config();
+    if let Ok(couchdb) = CouchDb::new(
+        &url,
+        user.as_deref(),
+        pass.as_deref(),
+        &db_name,
+        &remote_path,
+    )
+    .await
+    {
+        if let Ok(Some(doc)) = couchdb.get_file(&remote_id).await {
+            if let Err(err) = couchdb.delete_file(&remote_id).await {
+                eprintln!("cleanup delete {} failed: {}", remote_id, err);
+            }
+
+            if !doc.children.is_empty() {
+                if let Err(err) = couchdb.delete_chunks(&doc.children).await {
+                    eprintln!("cleanup delete chunks for {} failed: {}", remote_id, err);
+                }
+            }
+        }
+    } else {
+        eprintln!("cleanup failed: could not connect to CouchDB");
+    }
+
+    test_result
+}
+
 fn test_db_config() -> (String, String, Option<String>, Option<String>, String) {
     let url = env_or_first(
         &["COUCHDB_FILE_SYNC_TEST_DB_URL", "COUCHFS_TEST_DB_URL"],
