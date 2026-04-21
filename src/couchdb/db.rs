@@ -672,4 +672,21 @@ mod tests {
         assert!(changes[0].mtime.is_none());
         assert!(changes[0].size.is_none());
     }
+
+    #[test]
+    fn metadata_changes_treats_missing_deleted_marker_as_deleted() {
+        let changes = metadata_changes_to_changes(
+            "",
+            vec![MetadataChangeRow {
+                id: "Agents/BACKLOG.md".into(),
+                seq: json!(1),
+                deleted: None,
+                changes: vec![],
+            }],
+        );
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "Agents/BACKLOG.md");
+        assert_eq!(changes[0].change_type, ChangeType::Deleted);
+    }
 }
