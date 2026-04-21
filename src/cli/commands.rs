@@ -653,11 +653,23 @@ pub async fn daemon(
         println!("Syncing {} path(s): {}", paths.len(), path_list.join(", "));
         println!("Press Ctrl+C to stop");
 
+        let mut session_notified: HashSet<String> = HashSet::new();
         let mut handles = Vec::new();
         for sync_path in paths {
             let mut path_config = config.clone();
             path_config.couchdb.remote_path = sync_path.remote.clone();
             let local_path = sync_path.local.clone();
+
+            if let Err(e) = daemon_sync(&local_path, &path_config, &mut session_notified).await {
+                error!("Startup sync error for {}: {}", local_path.display(), e);
+                notify_sync_error_telegram(
+                    &path_config,
+                    Some(&local_path),
+                    &format!("Startup sync error: {}", e),
+                )
+                .await;
+                continue;
+            }
 
             handles.push(tokio::spawn(async move {
                 if let Err(e) = live_sync_path(local_path.clone(), path_config.clone()).await {
@@ -1381,7 +1393,11 @@ fn print_sync_report(report: &SyncReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::SyncEngine;
+    use std::env;
+    use std::fs;
     use std::time::{Duration, UNIX_EPOCH};
+    use tempfile::tempdir;
 
     // =========================================================================
     // Tests for shell_quote
@@ -1647,6 +1663,109 @@ mod tests {
         assert!(result.to_string_lossy().contains("state.db"));
     }
 
+    #[tokio::test]
+    #[ignore = "requires a running CouchDB server (see COUCHDB_FILE_SYNC_TEST_DB_* env vars)"]
+    async fn live_startup_sync_reconciles_local_deletes_made_while_daemon_was_down() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().to_path_buf();
+        let state_dir = root.join(".couchdb-file-sync");
+        fs::create_dir_all(&state_dir)?;
+        let db_path = state_dir.join("state.db");
+
+        let relative_path = "agents/random/BACKLOG.md";
+        let local_file = root.join(relative_path);
+        fs::create_dir_all(local_file.parent().expect("test file should have a parent"))?;
+        fs::write(&local_file, "pending task\n")?;
+
+        let (url, db_name, user, pass, remote_path) = test_db_config();
+        let remote_id = format!("{}{}", remote_path, relative_path);
+
+        let test_result: Result<()> = async {
+            let local_db = LocalDb::open(&db_path)?;
+            let couchdb = CouchDb::new(
+                &url,
+                user.as_deref(),
+                pass.as_deref(),
+                &db_name,
+                &remote_path,
+            )
+            .await?;
+            let mut engine = SyncEngine::new(couchdb, local_db, root.clone());
+            let initial_report = engine.sync().await?;
+            assert_eq!(
+                initial_report.uploaded, 1,
+                "seed sync should upload the tracked file"
+            );
+
+            fs::remove_file(&local_file)?;
+
+            let mut session_notified = HashSet::new();
+            let report = daemon_sync(
+                &root,
+                &AppConfig {
+                    couchdb: crate::config::CouchDbConfig {
+                        url: url.clone(),
+                        username: user.clone(),
+                        password: pass.clone(),
+                        database: db_name.clone(),
+                        remote_path: remote_path.clone(),
+                        ..crate::config::CouchDbConfig::default()
+                    },
+                    ..AppConfig::default()
+                },
+                &mut session_notified,
+            )
+            .await?;
+            assert_eq!(
+                report.deleted_remote, 1,
+                "startup sync should push the offline local delete before live mode starts"
+            );
+
+            assert!(
+                !local_file.exists(),
+                "startup sync should keep the locally deleted file deleted"
+            );
+
+            let local_db = LocalDb::open(&db_path)?;
+            assert!(
+                local_db.get_file_state(relative_path)?.is_none(),
+                "startup sync should clear tracked state for the deleted file"
+            );
+
+            let couchdb = CouchDb::new(
+                &url,
+                user.as_deref(),
+                pass.as_deref(),
+                &db_name,
+                &remote_path,
+            )
+            .await?;
+            let remote_doc = couchdb
+                .get_file(&remote_id)
+                .await?
+                .expect("remote doc should still be queryable after delete");
+            assert!(
+                remote_doc.deleted,
+                "startup sync should propagate the offline local delete to CouchDB"
+            );
+
+            Ok(())
+        }
+        .await;
+
+        cleanup_remote_doc(
+            &url,
+            &db_name,
+            user.as_deref(),
+            pass.as_deref(),
+            &remote_path,
+            &remote_id,
+        )
+        .await;
+
+        test_result
+    }
+
     // =========================================================================
     // Tests for remove_if_exists
     // =========================================================================
@@ -1660,6 +1779,83 @@ mod tests {
         assert!(file.exists());
         remove_if_exists(&file).unwrap();
         assert!(!file.exists());
+    }
+
+    fn test_db_config() -> (String, String, Option<String>, Option<String>, String) {
+        let url = env_or_first(
+            &["COUCHDB_FILE_SYNC_TEST_DB_URL", "COUCHFS_TEST_DB_URL"],
+            "http://localhost:5984",
+        );
+        let db_name = env_or_first(
+            &["COUCHDB_FILE_SYNC_TEST_DB_NAME", "COUCHFS_TEST_DB_NAME"],
+            "couchdb_file_sync_live_restart_test",
+        );
+        let mut remote_path = env_var_first(&[
+            "COUCHDB_FILE_SYNC_TEST_REMOTE_PATH",
+            "COUCHFS_TEST_REMOTE_PATH",
+        ])
+        .unwrap_or_else(|| format!("live-restart-test-{}/", unique_suffix()));
+        if !remote_path.is_empty() && !remote_path.ends_with('/') {
+            remote_path.push('/');
+        }
+
+        let user = env_opt_first(
+            &["COUCHDB_FILE_SYNC_TEST_DB_USER", "COUCHFS_TEST_DB_USER"],
+            Some("admin"),
+        );
+        let pass = env_opt_first(
+            &["COUCHDB_FILE_SYNC_TEST_DB_PASS", "COUCHFS_TEST_DB_PASS"],
+            Some("password"),
+        );
+        let (user, pass) = match (user, pass) {
+            (Some(user), Some(pass)) => (Some(user), Some(pass)),
+            _ => (None, None),
+        };
+
+        (url, db_name, user, pass, remote_path)
+    }
+
+    fn env_or_first(keys: &[&str], default: &str) -> String {
+        env_var_first(keys).unwrap_or_else(|| default.to_string())
+    }
+
+    fn env_var_first(keys: &[&str]) -> Option<String> {
+        for key in keys {
+            if let Ok(value) = env::var(key) {
+                return if value.is_empty() { None } else { Some(value) };
+            }
+        }
+        None
+    }
+
+    fn env_opt_first(keys: &[&str], default: Option<&str>) -> Option<String> {
+        env_var_first(keys).or_else(|| default.map(|value| value.to_string()))
+    }
+
+    fn unique_suffix() -> String {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_string()
+    }
+
+    async fn cleanup_remote_doc(
+        url: &str,
+        db_name: &str,
+        user: Option<&str>,
+        pass: Option<&str>,
+        remote_path: &str,
+        doc_id: &str,
+    ) {
+        if let Ok(couchdb) = CouchDb::new(url, user, pass, db_name, remote_path).await
+            && let Ok(Some(doc)) = couchdb.get_file(doc_id).await
+        {
+            let _ = couchdb.delete_file(doc_id).await;
+            if !doc.children.is_empty() {
+                let _ = couchdb.delete_chunks(&doc.children).await;
+            }
+        }
     }
 
     #[test]

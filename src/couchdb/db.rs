@@ -53,8 +53,15 @@ struct MetadataChangeRow {
     id: String,
     seq: Value,
     deleted: Option<bool>,
+    doc: Option<MetadataChangeDoc>,
     #[serde(default)]
     changes: Vec<ChangeRev>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MetadataChangeDoc {
+    #[serde(default)]
+    deleted: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,7 +94,8 @@ fn metadata_changes_to_changes(remote_path: &str, rows: Vec<MetadataChangeRow>) 
             continue;
         }
 
-        let change = if row.deleted.unwrap_or(false) || row.changes.is_empty() {
+        let doc_deleted = row.doc.as_ref().map(|doc| doc.deleted).unwrap_or(false);
+        let change = if row.deleted.unwrap_or(false) || doc_deleted || row.changes.is_empty() {
             Change::remote_deleted(id.clone())
         } else {
             let rev = row
@@ -336,7 +344,7 @@ impl CouchDb {
         let mut request = self
             .http_client
             .get(&url)
-            .query(&[("since", since.unwrap())]);
+            .query(&[("since", since.unwrap()), ("include_docs", "true")]);
 
         if let Some((username, password)) = &self.auth {
             request = request.basic_auth(username, Some(password));
@@ -610,24 +618,28 @@ mod tests {
                     id: "Agents/file.md".into(),
                     seq: json!(1),
                     deleted: None,
+                    doc: None,
                     changes: vec![ChangeRev { rev: "1-a".into() }],
                 },
                 MetadataChangeRow {
                     id: "Agents/sub/file.md".into(),
                     seq: json!(2),
                     deleted: Some(true),
+                    doc: None,
                     changes: vec![],
                 },
                 MetadataChangeRow {
                     id: "h:chunk123".into(),
                     seq: json!(3),
                     deleted: None,
+                    doc: None,
                     changes: vec![ChangeRev { rev: "1-b".into() }],
                 },
                 MetadataChangeRow {
                     id: "Other/file.py".into(),
                     seq: json!(4),
                     deleted: None,
+                    doc: None,
                     changes: vec![ChangeRev { rev: "1-c".into() }],
                 },
             ],
@@ -655,12 +667,14 @@ mod tests {
                     id: "file.md".into(),
                     seq: json!(1),
                     deleted: None,
+                    doc: None,
                     changes: vec![ChangeRev { rev: "1-a".into() }],
                 },
                 MetadataChangeRow {
                     id: "file.md".into(),
                     seq: json!(2),
                     deleted: None,
+                    doc: None,
                     changes: vec![ChangeRev { rev: "2-b".into() }],
                 },
             ],
@@ -681,12 +695,33 @@ mod tests {
                 id: "Agents/BACKLOG.md".into(),
                 seq: json!(1),
                 deleted: None,
+                doc: None,
                 changes: vec![],
             }],
         );
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path, "Agents/BACKLOG.md");
+        assert_eq!(changes[0].change_type, ChangeType::Deleted);
+    }
+
+    #[test]
+    fn metadata_changes_treats_soft_deleted_docs_as_deleted() {
+        let changes = metadata_changes_to_changes(
+            "",
+            vec![MetadataChangeRow {
+                id: "Agents/COMPLETED.md".into(),
+                seq: json!(1),
+                deleted: None,
+                doc: Some(MetadataChangeDoc { deleted: true }),
+                changes: vec![ChangeRev {
+                    rev: "2-dead".into(),
+                }],
+            }],
+        );
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "Agents/COMPLETED.md");
         assert_eq!(changes[0].change_type, ChangeType::Deleted);
     }
 }
