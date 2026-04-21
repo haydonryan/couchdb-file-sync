@@ -9,7 +9,7 @@ check:
     cargo test
 
 install:
-    cargo install --path .
+    cargo install --path . --root "${XDG_BIN_HOME:-$HOME}/.local"
 
 pre-commit:
     ./scripts/scan-staged-secrets.sh
