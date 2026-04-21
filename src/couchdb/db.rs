@@ -87,7 +87,7 @@ fn metadata_changes_to_changes(remote_path: &str, rows: Vec<MetadataChangeRow>) 
             continue;
         }
 
-        let change = if row.deleted.unwrap_or(false) {
+        let change = if row.deleted.unwrap_or(false) || row.changes.is_empty() {
             Change::remote_deleted(id.clone())
         } else {
             let rev = row
