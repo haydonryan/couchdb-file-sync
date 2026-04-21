@@ -103,9 +103,10 @@ couchdb-file-sync daemon --interval 60
 For low-latency sync using a filesystem watcher and CouchDB changes feed:
 
 ```bash
-couchdb-file-sync sync
 couchdb-file-sync daemon --live
 ```
+
+Live mode runs a full startup sync before switching to watcher/changes-feed mode, so local edits or deletes made while the daemon was stopped are reconciled first.
 
 ## Configuration
 
@@ -192,9 +193,10 @@ If the process panics, the binary attempts to send a Slack alert through `notifi
 For live mode (watcher + changes feed):
 
 ```bash
-couchdb-file-sync sync
 couchdb-file-sync daemon ~/documents --live
 ```
+
+Live mode performs a startup sync before it begins watching for incremental changes.
 
 ### `couchdb-file-sync rebuild-remote [PATH]`
 
