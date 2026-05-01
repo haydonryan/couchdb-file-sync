@@ -42,10 +42,16 @@ This installs the binary to `~/.local/bin/couchdb-file-sync`, writes the config 
 
 ## Development
 
-Enable the repo's pre-commit hook to run formatting, clippy, and tests before each commit:
+Enable the repo's pre-commit hook to run `just pre-commit` before each commit:
 
 ```bash
 git config core.hooksPath .githooks
+```
+
+You can run the same suite manually with:
+
+```bash
+just pre-commit
 ```
 
 To measure scanner performance, run:
