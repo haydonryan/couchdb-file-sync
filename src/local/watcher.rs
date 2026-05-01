@@ -42,7 +42,12 @@ impl FileWatcher {
             move |result: DebounceEventResult| match result {
                 Ok(events) => {
                     for event in events {
-                        let _ = process_event(event, &event_tx_clone, &closure_matcher, &root);
+                        drop(process_event(
+                            event,
+                            &event_tx_clone,
+                            &closure_matcher,
+                            &root,
+                        ));
                     }
                 }
                 Err(errors) => {
@@ -133,7 +138,7 @@ fn process_event(
                     continue;
                 }
                 let event = WatcherEvent::FileCreated(path.to_path_buf());
-                let _ = tx.try_send(event);
+                drop(tx.try_send(event));
             }
         }
         EventKind::Modify(modify_kind) => {
@@ -149,7 +154,7 @@ fn process_event(
                                 if should_ignore(path, matcher, root) {
                                     continue;
                                 }
-                                let _ = tx.try_send(WatcherEvent::FileDeleted(path.to_path_buf()));
+                                drop(tx.try_send(WatcherEvent::FileDeleted(path.to_path_buf())));
                             }
                         }
                         RenameMode::To => {
@@ -158,18 +163,20 @@ fn process_event(
                                 if should_ignore(path, matcher, root) {
                                     continue;
                                 }
-                                let _ = tx.try_send(WatcherEvent::FileCreated(path.to_path_buf()));
+                                drop(tx.try_send(WatcherEvent::FileCreated(path.to_path_buf())));
                             }
                         }
                         RenameMode::Both if paths.len() >= 2 => {
                             // Both paths in one event - first is old, second is new
                             if !should_ignore(paths[0], matcher, root) {
-                                let _ =
-                                    tx.try_send(WatcherEvent::FileDeleted(paths[0].to_path_buf()));
+                                drop(
+                                    tx.try_send(WatcherEvent::FileDeleted(paths[0].to_path_buf())),
+                                );
                             }
                             if !should_ignore(paths[1], matcher, root) {
-                                let _ =
-                                    tx.try_send(WatcherEvent::FileCreated(paths[1].to_path_buf()));
+                                drop(
+                                    tx.try_send(WatcherEvent::FileCreated(paths[1].to_path_buf())),
+                                );
                             }
                         }
                         _ => {}
@@ -181,7 +188,7 @@ fn process_event(
                         if should_ignore(path, matcher, root) {
                             continue;
                         }
-                        let _ = tx.try_send(WatcherEvent::FileModified(path.to_path_buf()));
+                        drop(tx.try_send(WatcherEvent::FileModified(path.to_path_buf())));
                     }
                 }
             }
@@ -192,7 +199,7 @@ fn process_event(
                     continue;
                 }
                 let event = WatcherEvent::FileDeleted(path.to_path_buf());
-                let _ = tx.try_send(event);
+                drop(tx.try_send(event));
             }
         }
         _ => {}

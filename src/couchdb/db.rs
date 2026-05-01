@@ -556,7 +556,7 @@ impl CouchDb {
                 if let Some((username, password)) = &self.auth {
                     request = request.basic_auth(username, Some(password));
                 }
-                let _ = request.send().await;
+                drop(request.send().await);
                 debug!("Deleted old chunk: {}", chunk_id);
             }
         }

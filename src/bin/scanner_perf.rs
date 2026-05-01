@@ -1,3 +1,5 @@
+#![allow(clippy::pedantic, clippy::nursery)]
+
 use couchdb_file_sync::local::Scanner;
 use couchdb_file_sync::models::IgnoreMatcher;
 use std::fs;

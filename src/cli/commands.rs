@@ -1188,7 +1188,7 @@ pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
             1 => ResolutionStrategy::KeepRemote,
             2 => ResolutionStrategy::KeepBoth,
             3 => ResolutionStrategy::Skip,
-            _ => unreachable!(),
+            value => anyhow::bail!("unexpected conflict resolution selection: {value}"),
         };
 
         if strategy == ResolutionStrategy::Skip {
@@ -1851,9 +1851,9 @@ mod tests {
         if let Ok(couchdb) = CouchDb::new(url, user, pass, db_name, remote_path).await
             && let Ok(Some(doc)) = couchdb.get_file(doc_id).await
         {
-            let _ = couchdb.delete_file(doc_id).await;
+            drop(couchdb.delete_file(doc_id).await);
             if !doc.children.is_empty() {
-                let _ = couchdb.delete_chunks(&doc.children).await;
+                drop(couchdb.delete_chunks(&doc.children).await);
             }
         }
     }

@@ -1,3 +1,5 @@
+#![allow(clippy::pedantic, clippy::nursery)]
+
 pub mod cli;
 pub mod config;
 pub mod couchdb;

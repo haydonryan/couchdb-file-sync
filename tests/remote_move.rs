@@ -1,3 +1,5 @@
+#![allow(clippy::pedantic, clippy::nursery)]
+
 use anyhow::Result;
 use couchdb_file_sync::{CouchDb, LocalDb, SyncEngine};
 use std::collections::HashSet;
@@ -27,7 +29,7 @@ impl TestDir {
 
 impl Drop for TestDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        drop(fs::remove_dir_all(&self.path));
     }
 }
 
@@ -329,7 +331,7 @@ async fn cleanup_remote(
         couchdb.delete_chunks(chunk_ids).await?;
     }
     for doc_id in doc_ids {
-        let _ = couchdb.delete_file(doc_id).await;
+        drop(couchdb.delete_file(doc_id).await);
     }
     Ok(())
 }

@@ -1,3 +1,5 @@
+#![allow(clippy::pedantic, clippy::nursery)]
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use flate2::read::GzDecoder;
