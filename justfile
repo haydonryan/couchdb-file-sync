@@ -41,3 +41,9 @@ docker-deploy:
     else
     docker compose -f "$COMPOSE_FILE" up -d --build
     fi
+
+benchmark:
+    ./scripts/benchmark.sh
+
+update:
+    ./scripts/update-dependencies.sh
