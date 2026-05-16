@@ -278,8 +278,8 @@ print_summary() {
 ensure_repo_is_clean() {
   local status_output
 
-  status_output="1003 960 1001 1002 1003git status --porcelain)"
-  if [[ -z "" ]]; then
+  status_output="$(git status --porcelain)"
+  if [[ -z "${status_output}" ]]; then
     return 0
   fi
 
