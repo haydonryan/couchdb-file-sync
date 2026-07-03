@@ -76,7 +76,7 @@ walkdir = "2.5"
 # Environment variable expansion
 envy = "0.4"
 shellexpand = "3.1"
-rand = "0.10.1"
+rand = "0.10.2"
 
 [dev-dependencies]
 tempfile = "3.27"
