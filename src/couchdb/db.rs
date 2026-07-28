@@ -104,6 +104,37 @@ impl CouchDb {
         Ok(info.update_seq)
     }
 
+    /// Create a CouchDb instance for testing without connecting to a real server.
+    /// Only fields needed for path conversion and sync metadata are populated.
+    /// Panics if any method requiring actual CouchDB access is called.
+    #[cfg(test)]
+    pub fn for_test(remote_path: &str) -> Self {
+        let remote_path = if remote_path.is_empty() || remote_path == "/" {
+            String::new()
+        } else {
+            let mut path = remote_path.to_string();
+            if !path.ends_with('/') {
+                path.push('/');
+            }
+            path
+        };
+        // Create a client and database handle without connecting.
+        // `Database::new` and `Client::new_no_auth` are purely structural;
+        // actual HTTP requests will fail at runtime.
+        let client = couch_rs::Client::new_no_auth("http://localhost:1")
+            .expect("failed to create couch_rs client for test");
+        let db = couch_rs::database::Database::new("unittest".to_string(), client.clone());
+        Self {
+            client,
+            db,
+            http_client: reqwest::Client::new(),
+            base_db_url: "http://localhost:1/unittest".to_string(),
+            db_name: "unittest".to_string(),
+            auth: None,
+            remote_path,
+        }
+    }
+
     /// Fetch changes from CouchDB using the _changes feed (longpoll)
     pub async fn get_changes_feed(
         &self,

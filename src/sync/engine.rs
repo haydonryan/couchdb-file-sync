@@ -1,12 +1,12 @@
 use crate::couchdb::CouchDb;
 use crate::local::{compute_bytes_hash, compute_file_hash, LocalDb, Scanner};
 use crate::models::{
-    Change, ChangeType, Conflict, FileDoc, FileState, IgnoreMatcher, RemoteState,
-    ResolutionStrategy,
+    Change, ChangeType, Conflict, FileState, IgnoreMatcher, RemoteState, ResolutionStrategy,
 };
+use crate::sync::triage;
 use anyhow::Result;
 use chrono::Utc;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
 
@@ -164,7 +164,7 @@ impl SyncEngine {
         let local_states = scanner.full_scan()?;
         let remote_docs = self.couchdb.get_all_files().await?;
         let (uploads, remote_deletes) =
-            plan_remote_rebuild(&local_states, &remote_docs, self.couchdb.remote_prefix());
+            triage::plan_remote_rebuild(&local_states, &remote_docs, self.couchdb.remote_prefix());
 
         self.local_db.reset_sync_state()?;
 
@@ -196,7 +196,8 @@ impl SyncEngine {
         let scanner = Scanner::new(self.root_dir.clone(), self.ignore_matcher.clone());
         let local_states = scanner.full_scan()?;
         let remote_docs = self.couchdb.get_all_files().await?;
-        let (local_deletes, remote_downloads) = plan_local_rebuild(&local_states, &remote_docs);
+        let (local_deletes, remote_downloads) =
+            triage::plan_local_rebuild(&local_states, &remote_docs);
 
         self.local_db.reset_sync_state()?;
 
@@ -238,7 +239,7 @@ impl SyncEngine {
         let mut valid_stored_states = Vec::with_capacity(stored_states.len());
 
         for state in stored_states {
-            if is_polluted_state_path(&state.path, remote_prefix) {
+            if triage::is_polluted_state_path(&state.path, remote_prefix) {
                 warn!(
                     "Removing invalid state entry for {}: local state includes remote prefix {}",
                     state.path, remote_prefix
@@ -313,12 +314,42 @@ impl SyncEngine {
         local_changes: &[Change],
         remote_changes: &[Change],
     ) -> Result<(Vec<Change>, Vec<Change>, Vec<Conflict>)> {
-        let local_map: HashMap<_, _> = local_changes.iter().map(|c| (&c.path, c)).collect();
-        let remote_map: HashMap<_, _> = remote_changes.iter().map(|c| (&c.path, c)).collect();
+        // Build a complete map of stored states (one I/O batch)
+        let mut stored_states: HashMap<String, FileState> = HashMap::new();
+        // Collect all paths we need state for
+        let mut paths_to_lookup: Vec<&str> = Vec::new();
+        for lc in local_changes {
+            if !paths_to_lookup.contains(&lc.path.as_str()) {
+                paths_to_lookup.push(&lc.path);
+            }
+        }
+        for rc in remote_changes {
+            let local_path = self.couchdb.get_local_path(&rc.path);
+            if !paths_to_lookup.contains(&local_path.as_str()) {
+                // Need to clone to satisfy borrow checker; collect then lookup
+            }
+        }
+        // Actually load all stored states individually (keeps existing pattern)
+        for lc in local_changes {
+            if !stored_states.contains_key(&lc.path) {
+                if let Some(state) = self.local_db.get_file_state(&lc.path)? {
+                    stored_states.insert(lc.path.clone(), state);
+                }
+            }
+        }
+        for rc in remote_changes {
+            let local_path = self.couchdb.get_local_path(&rc.path);
+            // Use entry API: clone the key for the lookup to avoid borrow-after-move
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                stored_states.entry(local_path.clone())
+            {
+                if let Some(state) = self.local_db.get_file_state(&local_path)? {
+                    e.insert(state);
+                }
+            }
+        }
 
-        let mut local_to_upload = Vec::new();
-        let mut remote_to_apply = Vec::new();
-        let mut conflicts = Vec::new();
+        let remote_prefix = self.couchdb.remote_prefix();
 
         debug!(
             "========== ANALYZING {} LOCAL CHANGES ==========",
@@ -331,15 +362,7 @@ impl SyncEngine {
             debug!("  Remote path: {}", remote_path);
             debug!("  Change type: {:?}", lc.change_type);
 
-            if lc.change_type == ChangeType::Deleted {
-                debug!("  Local delete, skipping remote content comparison");
-                local_to_upload.push(lc.clone());
-                debug!("");
-                continue;
-            }
-
-            let stored_state = self.local_db.get_file_state(&lc.path)?;
-            if let Some(ref state) = stored_state {
+            if let Some(state) = stored_states.get(&lc.path) {
                 debug!("  STORED STATE:");
                 debug!("    hash: {}...", &state.hash[..8.min(state.hash.len())]);
                 debug!("    size: {} bytes", state.size);
@@ -350,17 +373,17 @@ impl SyncEngine {
                 debug!("  NO STORED STATE (first time sync)");
             }
 
-            let remote_changed = if let Some(rc) = remote_map.get(&remote_path) {
-                match (&rc.mtime, &stored_state) {
-                    (Some(remote_mtime), Some(state)) => {
-                        let changed = *remote_mtime > state.last_sync_at;
-                        if changed {
+            // Extra debug for remote change detection
+            if let Some(rc) = remote_changes.iter().find(|rc| rc.path == remote_path) {
+                if let Some(remote_mtime) = rc.mtime {
+                    if let Some(state) = stored_states.get(&lc.path) {
+                        if remote_mtime > state.last_sync_at {
                             info!("  [REMOTE CHANGE DETECTED] {}", lc.path);
                             info!(
                                 "    Remote mtime: {} | Last sync: {} | Diff: +{}s",
                                 remote_mtime.format("%Y-%m-%d %H:%M:%S"),
                                 state.last_sync_at.format("%Y-%m-%d %H:%M:%S"),
-                                (*remote_mtime - state.last_sync_at).num_seconds()
+                                (remote_mtime - state.last_sync_at).num_seconds()
                             );
                             if let Some(remote_rev) = &rc.rev {
                                 let stored_rev = state.couch_rev.as_deref().unwrap_or("none");
@@ -384,19 +407,7 @@ impl SyncEngine {
                                 state.last_sync_at.format("%Y-%m-%d %H:%M:%S")
                             );
                         }
-                        changed
-                    }
-                    (None, _) => {
-                        info!("  [REMOTE CHANGE DETECTED] {} - no remote mtime available, assuming changed", lc.path);
-                        if let Some(ref state) = stored_state {
-                            info!(
-                                "    Stored rev: {:?} | Remote rev: {:?}",
-                                state.couch_rev, rc.rev
-                            );
-                        }
-                        true
-                    }
-                    (_, None) => {
+                    } else {
                         info!(
                             "  [REMOTE CHANGE DETECTED] {} - no stored state (first sync)",
                             lc.path
@@ -405,195 +416,147 @@ impl SyncEngine {
                             "    Remote mtime: {:?} | Remote rev: {:?} | Remote size: {:?}",
                             rc.mtime, rc.rev, rc.size
                         );
-                        true
+                    }
+                } else {
+                    info!("  [REMOTE CHANGE DETECTED] {} - no remote mtime available, assuming changed", lc.path);
+                    if let Some(state) = stored_states.get(&lc.path) {
+                        info!(
+                            "    Stored rev: {:?} | Remote rev: {:?}",
+                            state.couch_rev, rc.rev
+                        );
                     }
                 }
             } else {
                 debug!("  {} - file not on remote yet", lc.path);
-                false
-            };
-
-            if remote_changed {
-                debug!("  => Remote is newer, fetching content to compare...");
-
-                // Fetch remote metadata
-                let remote_doc = match self.couchdb.fetch_metadata(&remote_path).await? {
-                    Some(doc) => doc,
-                    None => {
-                        debug!("  Remote document not found!");
-                        continue;
-                    }
-                };
-
-                // Get local state for comparison
-                let local_state = self.get_local_state(&lc.path).await?;
-                debug!("  LOCAL STATE (from disk):");
-                debug!(
-                    "    hash: {}...",
-                    &local_state.hash[..8.min(local_state.hash.len())]
-                );
-                debug!("    size: {} bytes", local_state.size);
-                debug!("    modified_at: {:?}", local_state.modified_at);
-
-                // Download remote content and compute hash for comparison
-                let remote_content = self.couchdb.get_file_content(&remote_path).await?;
-                let remote_hash = compute_bytes_hash(&remote_content);
-
-                debug!("  COMPARING CONTENT:");
-                debug!(
-                    "    local hash:  {}",
-                    &local_state.hash[..8.min(local_state.hash.len())]
-                );
-                debug!(
-                    "    remote hash: {}",
-                    &remote_hash[..8.min(remote_hash.len())]
-                );
-                debug!("    local size:  {} bytes", local_state.size);
-                debug!("    remote size: {} bytes", remote_content.len());
-
-                // Compare hashes to determine if content actually differs
-                if local_state.hash == remote_hash {
-                    info!(
-                        "  [OK] {} - content identical (hash: {}), updating sync state",
-                        lc.path,
-                        &local_state.hash[..8.min(local_state.hash.len())]
-                    );
-                    // Update local state to reflect remote rev
-                    let updated_state = FileState {
-                        path: lc.path.clone(),
-                        hash: local_state.hash,
-                        size: local_state.size,
-                        modified_at: local_state.modified_at,
-                        couch_rev: remote_doc.rev,
-                        last_sync_at: Utc::now(),
-                    };
-                    self.local_db.save_file_state(&updated_state)?;
-                } else {
-                    info!(
-                        "  [CONFLICT] {} - content differs (local: {}, remote: {})",
-                        lc.path,
-                        &local_state.hash[..8.min(local_state.hash.len())],
-                        &remote_hash[..8.min(remote_hash.len())]
-                    );
-
-                    // Convert mtime (milliseconds since epoch) to DateTime
-                    use chrono::TimeZone;
-                    let remote_modified_at = Utc
-                        .timestamp_millis_opt(remote_doc.mtime as i64)
-                        .single()
-                        .unwrap_or_else(Utc::now);
-
-                    let remote_state = RemoteState {
-                        path: remote_path.clone(),
-                        hash: remote_hash,
-                        size: remote_content.len() as u64,
-                        modified_at: remote_modified_at,
-                        couch_rev: remote_doc.rev.unwrap_or_default(),
-                        deleted: remote_doc.deleted,
-                    };
-                    debug!("  REMOTE STATE:");
-                    debug!("    size: {} bytes", remote_state.size);
-                    debug!("    modified_at: {:?}", remote_state.modified_at);
-                    debug!("    couch_rev: {:?}", remote_state.couch_rev);
-
-                    conflicts.push(Conflict::new(lc.path.clone(), local_state, remote_state));
-                }
-            } else {
-                info!(
-                    "  [UPLOAD] {} - remote unchanged, queuing for upload",
-                    lc.path
-                );
-                local_to_upload.push(lc.clone());
             }
-            debug!("");
         }
 
-        debug!(
-            "========== CHECKING {} REMOTE FILES ==========",
-            remote_changes.len()
-        );
-        for rc in remote_changes {
-            let local_path = self.couchdb.get_local_path(&rc.path);
-            debug!("--- REMOTE FILE: {} -> {} ---", rc.path, local_path);
-            debug!(
-                "  mtime: {:?}, rev: {:?}, size: {:?}",
-                rc.mtime, rc.rev, rc.size
-            );
+        // ── Run the pure triage function ──────────────────────────────────
+        let triage_result =
+            triage::triage_changes(local_changes, remote_changes, &stored_states, remote_prefix);
 
-            if local_map.contains_key(&local_path) {
-                debug!("  File also changed locally, skipping (handled above)");
-                continue;
-            }
+        // Collect results
+        let local_to_upload = triage_result.uploads;
+        let mut remote_to_apply = triage_result.downloads;
+        let mut conflicts: Vec<Conflict> = Vec::new();
 
-            if rc.change_type == ChangeType::Deleted {
-                let relative_path = local_path.trim_start_matches('/');
-                let file_path = self.root_dir.join(relative_path);
-                let stored_state = self.local_db.get_file_state(&local_path)?;
-                if should_apply_remote_delete(stored_state.as_ref(), rc.mtime, file_path.exists()) {
-                    debug!("  Remote delete is newer than last sync, scheduling local delete");
-                    remote_to_apply.push(rc.clone());
-                } else if file_path.exists() || stored_state.is_some() {
-                    debug!("  Remote delete is stale or file is untracked locally, skipping");
-                } else {
-                    debug!("  Remote deleted, no local file/state, skipping");
-                }
-                debug!("");
-                continue;
-            }
+        // ── Handle needs_comparison pairs (requires I/O) ──────────────────
+        for decision in &triage_result.needs_comparison {
+            let lc = match &decision.local_change {
+                Some(c) => c,
+                None => continue,
+            };
+            let _rc = match &decision.remote_change {
+                Some(c) => c,
+                None => continue,
+            };
 
-            let should_download = match self.local_db.get_file_state(&local_path)? {
-                Some(state) => {
-                    debug!("  LOCAL STATE EXISTS:");
-                    debug!("    hash: {}...", &state.hash[..8.min(state.hash.len())]);
-                    debug!("    size: {} bytes", state.size);
-                    debug!("    modified_at: {:?}", state.modified_at);
-                    debug!("    couch_rev: {:?}", state.couch_rev);
-                    debug!("    last_sync_at: {:?}", state.last_sync_at);
+            let remote_path = self.couchdb.get_remote_path(&lc.path);
+            debug!("  => Remote is newer, fetching content to compare...");
 
-                    match (rc.rev.as_ref(), state.couch_rev.as_ref()) {
-                        (Some(remote_rev), Some(stored_rev)) => {
-                            let changed = remote_rev != stored_rev;
-                            debug!("  REVISION COMPARE:");
-                            debug!("    stored_rev: {:?}", stored_rev);
-                            debug!("    remote_rev: {:?}", remote_rev);
-                            debug!("    changed: {}", changed);
-                            changed
-                        }
-                        (Some(_), None) => {
-                            debug!("  No stored rev, treating as new file");
-                            true
-                        }
-                        (None, Some(_)) => {
-                            debug!("  No remote rev, skipping");
-                            false
-                        }
-                        (None, None) => {
-                            debug!("  No revs at all, skipping");
-                            false
-                        }
-                    }
-                }
+            // Fetch remote metadata
+            let remote_doc = match self.couchdb.fetch_metadata(&remote_path).await? {
+                Some(doc) => doc,
                 None => {
-                    debug!("  NO LOCAL STATE");
-                    let relative_path = local_path.trim_start_matches('/');
-                    let file_path = self.root_dir.join(relative_path);
-                    if file_path.exists() {
-                        debug!("  File exists on disk but not tracked, skipping");
-                        false
-                    } else {
-                        debug!("  New file on remote, will download");
-                        true
-                    }
+                    debug!("  Remote document not found!");
+                    continue;
                 }
             };
 
-            if should_download {
-                debug!("  => Remote is newer, will download chunked file");
-                remote_to_apply.push(rc.clone());
+            // Get local state for comparison
+            let local_state = self.get_local_state(&lc.path).await?;
+            debug!("  LOCAL STATE (from disk):");
+            debug!(
+                "    hash: {}...",
+                &local_state.hash[..8.min(local_state.hash.len())]
+            );
+            debug!("    size: {} bytes", local_state.size);
+            debug!("    modified_at: {:?}", local_state.modified_at);
+
+            // Download remote content and compute hash for comparison
+            let remote_content = self.couchdb.get_file_content(&remote_path).await?;
+            let remote_hash = compute_bytes_hash(&remote_content);
+
+            debug!("  COMPARING CONTENT:");
+            debug!(
+                "    local hash:  {}",
+                &local_state.hash[..8.min(local_state.hash.len())]
+            );
+            debug!(
+                "    remote hash: {}",
+                &remote_hash[..8.min(remote_hash.len())]
+            );
+            debug!("    local size:  {} bytes", local_state.size);
+            debug!("    remote size: {} bytes", remote_content.len());
+
+            // Compare hashes to determine if content actually differs
+            if local_state.hash == remote_hash {
+                info!(
+                    "  [OK] {} - content identical (hash: {}), updating sync state",
+                    lc.path,
+                    &local_state.hash[..8.min(local_state.hash.len())]
+                );
+                // Update local state to reflect remote rev
+                let updated_state = FileState {
+                    path: lc.path.clone(),
+                    hash: local_state.hash,
+                    size: local_state.size,
+                    modified_at: local_state.modified_at,
+                    couch_rev: remote_doc.rev,
+                    last_sync_at: Utc::now(),
+                };
+                self.local_db.save_file_state(&updated_state)?;
             } else {
-                debug!("  => Skipping (already in sync)");
+                info!(
+                    "  [CONFLICT] {} - content differs (local: {}, remote: {})",
+                    lc.path,
+                    &local_state.hash[..8.min(local_state.hash.len())],
+                    &remote_hash[..8.min(remote_hash.len())]
+                );
+
+                // Convert mtime (milliseconds since epoch) to DateTime
+                use chrono::TimeZone;
+                let remote_modified_at = Utc
+                    .timestamp_millis_opt(remote_doc.mtime as i64)
+                    .single()
+                    .unwrap_or_else(Utc::now);
+
+                let remote_state = RemoteState {
+                    path: remote_path.clone(),
+                    hash: remote_hash,
+                    size: remote_content.len() as u64,
+                    modified_at: remote_modified_at,
+                    couch_rev: remote_doc.rev.unwrap_or_default(),
+                    deleted: remote_doc.deleted,
+                };
+                debug!("  REMOTE STATE:");
+                debug!("    size: {} bytes", remote_state.size);
+                debug!("    modified_at: {:?}", remote_state.modified_at);
+                debug!("    couch_rev: {:?}", remote_state.couch_rev);
+
+                conflicts.push(Conflict::new(lc.path.clone(), local_state, remote_state));
             }
-            debug!("");
+        }
+
+        // ── Handle remote deletes ─────────────────────────────────────────
+        for rc in &triage_result.remote_deletes {
+            let local_path = self.couchdb.get_local_path(&rc.path);
+            let relative_path = local_path.trim_start_matches('/');
+            let file_path = self.root_dir.join(relative_path);
+            let stored_state = stored_states.get(&local_path);
+            if triage::should_apply_remote_delete(stored_state, rc.mtime, file_path.exists()) {
+                debug!("  Remote delete is newer than last sync, scheduling local delete");
+                remote_to_apply.push(rc.clone());
+            } else if file_path.exists() || stored_state.is_some() {
+                debug!("  Remote delete is stale or file is untracked locally, skipping");
+            } else {
+                debug!("  Remote deleted, no local file/state, skipping");
+            }
+        }
+
+        // ── Debug skipped items ───────────────────────────────────────────
+        for decision in &triage_result.skipped {
+            debug!("  [SKIP] {} - already in sync", decision.path);
         }
 
         debug!("========== ANALYSIS COMPLETE ==========");
@@ -604,7 +567,7 @@ impl SyncEngine {
         Ok((local_to_upload, remote_to_apply, conflicts))
     }
 
-    /// Get local file state
+    /// Get local file state    /// Get local file state
     async fn get_local_state(&self, path: &str) -> Result<FileState> {
         // Strip leading / to prevent absolute path issues
         let relative_path = path.trim_start_matches('/');
@@ -866,6 +829,11 @@ impl SyncEngine {
         &self.root_dir
     }
 
+    /// Get the ignore matcher (for testing)
+    pub fn ignore_matcher(&self) -> &IgnoreMatcher {
+        &self.ignore_matcher
+    }
+
     /// Resolve a conflict
     /// Note: `local_path` is the local file path (stored in conflict), which gets
     /// converted to remote path when interacting with CouchDB
@@ -922,228 +890,123 @@ impl SyncEngine {
     }
 }
 
-fn should_apply_remote_delete(
-    stored_state: Option<&FileState>,
-    remote_mtime: Option<chrono::DateTime<Utc>>,
-    _file_exists: bool,
-) -> bool {
-    match stored_state {
-        Some(state) => match remote_mtime {
-            Some(remote_mtime) => remote_mtime > state.last_sync_at,
-            None => true,
-        },
-        None => false,
-    }
-}
-
-fn is_polluted_state_path(path: &str, remote_prefix: &str) -> bool {
-    let remote_prefix = remote_prefix.trim_end_matches('/');
-    !remote_prefix.is_empty()
-        && (path == remote_prefix || path.starts_with(&format!("{remote_prefix}/")))
-}
-
-fn plan_remote_rebuild(
-    local_states: &[FileState],
-    remote_docs: &[FileDoc],
-    remote_prefix: &str,
-) -> (Vec<String>, Vec<String>) {
-    let local_paths: HashSet<_> = local_states
-        .iter()
-        .map(|state| state.path.as_str())
-        .collect();
-    let uploads = local_states
-        .iter()
-        .map(|state| state.path.clone())
-        .collect::<Vec<_>>();
-    let remote_deletes = remote_docs
-        .iter()
-        .filter(|doc| !doc.deleted)
-        .filter_map(|doc| {
-            let local_path = remote_path_to_local_path(&doc.id, remote_prefix);
-            (!local_paths.contains(local_path.as_str())).then(|| doc.id.clone())
-        })
-        .collect::<Vec<_>>();
-
-    (uploads, remote_deletes)
-}
-
-fn plan_local_rebuild(
-    local_states: &[FileState],
-    remote_docs: &[FileDoc],
-) -> (Vec<String>, Vec<String>) {
-    let local_deletes = local_states
-        .iter()
-        .map(|state| state.path.clone())
-        .collect::<Vec<_>>();
-    let remote_downloads = remote_docs
-        .iter()
-        .filter(|doc| !doc.deleted)
-        .map(|doc| doc.id.clone())
-        .collect::<Vec<_>>();
-
-    (local_deletes, remote_downloads)
-}
-
-fn remote_path_to_local_path(remote_path: &str, remote_prefix: &str) -> String {
-    if remote_prefix.is_empty() {
-        remote_path.to_string()
-    } else {
-        remote_path
-            .strip_prefix(remote_prefix)
-            .unwrap_or(remote_path)
-            .to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        is_polluted_state_path, plan_local_rebuild, plan_remote_rebuild, remote_path_to_local_path,
-        should_apply_remote_delete,
-    };
-    use crate::models::{FileDoc, FileState, IgnoreMatcher};
-    use chrono::{Duration, TimeZone, Utc};
+    use super::*;
+    use crate::couchdb::CouchDb;
+    use crate::local::LocalDb;
+    use crate::models::IgnoreMatcher;
+    use std::path::PathBuf;
 
-    fn file_state(last_sync_at: chrono::DateTime<Utc>) -> FileState {
-        FileState {
-            path: "example.txt".to_string(),
-            hash: "abc".to_string(),
-            size: 1,
-            modified_at: last_sync_at,
-            couch_rev: Some("1-abc".to_string()),
-            last_sync_at,
-        }
+    /// Create a minimal CouchDb instance for testing construction.
+    /// Not all methods work without a real server.
+    fn test_couchdb() -> CouchDb {
+        CouchDb::for_test("test-prefix/")
+    }
+
+    fn test_local_db() -> LocalDb {
+        LocalDb::open_in_memory().expect("in-memory LocalDb should construct")
     }
 
     #[test]
-    fn stale_remote_delete_does_not_remove_tracked_local_file() {
-        let last_sync = Utc.with_ymd_and_hms(2026, 3, 23, 17, 12, 33).unwrap();
-        let remote_delete = last_sync - Duration::days(6);
+    fn engine_new_constructs_with_empty_ignore_matcher() {
+        let couch = test_couchdb();
+        let local = test_local_db();
+        let root = PathBuf::from("/tmp/test-sync-engine-new");
 
-        assert!(!should_apply_remote_delete(
-            Some(&file_state(last_sync)),
-            Some(remote_delete),
-            true,
-        ));
+        let engine = SyncEngine::new(couch, local, root.clone());
+
+        assert_eq!(engine.root_dir(), &root);
+        assert!(engine.get_conflicts().unwrap().is_empty());
+        // with_ignore uses IgnoreMatcher::empty() internally
+        // The default empty matcher should not ignore anything
+        assert!(!engine
+            .ignore_matcher()
+            .should_ignore(std::path::Path::new("test.txt")));
     }
 
     #[test]
-    fn newer_remote_delete_removes_tracked_local_file() {
-        let last_sync = Utc.with_ymd_and_hms(2026, 3, 23, 17, 12, 33).unwrap();
-        let remote_delete = last_sync + Duration::seconds(1);
+    fn engine_with_ignore_constructs_with_custom_ignore_matcher() {
+        let couch = test_couchdb();
+        let local = test_local_db();
+        let root = PathBuf::from("/tmp/test-sync-engine-with-ignore");
 
-        assert!(should_apply_remote_delete(
-            Some(&file_state(last_sync)),
-            Some(remote_delete),
-            true,
-        ));
+        let matcher = IgnoreMatcher::from_content("*.log\nnode_modules/");
+        let engine = SyncEngine::with_ignore(couch, local, root, matcher);
+
+        assert!(engine
+            .ignore_matcher()
+            .should_ignore(std::path::Path::new("debug.log")));
+        assert!(engine
+            .ignore_matcher()
+            .should_ignore(std::path::Path::new("node_modules/pkg/index.js")));
+        assert!(!engine
+            .ignore_matcher()
+            .should_ignore(std::path::Path::new("src/main.rs")));
     }
 
     #[test]
-    fn untracked_existing_local_file_is_not_deleted() {
-        let remote_delete = Utc.with_ymd_and_hms(2026, 3, 23, 17, 12, 33).unwrap();
-
-        assert!(!should_apply_remote_delete(None, Some(remote_delete), true));
-    }
-
-    #[test]
-    fn detects_state_entries_polluted_with_remote_prefix() {
-        assert!(is_polluted_state_path(
-            "Agents/ross-coulthart/AGENT.md",
-            "Agents/"
-        ));
-        assert!(is_polluted_state_path("Agents", "Agents/"));
-        assert!(!is_polluted_state_path(
-            "ross-coulthart/AGENT.md",
-            "Agents/"
-        ));
-        assert!(!is_polluted_state_path("Agentsmith/profile.md", "Agents/"));
-    }
-
-    #[test]
-    fn ignore_matcher_marks_previously_tracked_ignored_files() {
-        let matcher = IgnoreMatcher::from_content("auth-profiles.json");
-
-        assert!(matcher.should_ignore(std::path::Path::new("ross-coulthart/auth-profiles.json")));
-        assert!(!matcher.should_ignore(std::path::Path::new("ross-coulthart/AGENT.md")));
-    }
-
-    #[test]
-    fn remote_rebuild_uploads_local_files_and_deletes_remote_orphans() {
-        let local_states = vec![
-            FileState::new(
-                "notes/a.md".to_string(),
-                "hash-a".to_string(),
-                10,
-                Utc::now(),
-            ),
-            FileState::new(
-                "notes/b.md".to_string(),
-                "hash-b".to_string(),
-                20,
-                Utc::now(),
-            ),
-        ];
-        let remote_docs = vec![
-            FileDoc::new("mirror/notes/a.md".to_string(), String::new(), 10),
-            FileDoc::new("mirror/notes/orphan.md".to_string(), String::new(), 30),
-            FileDoc {
-                deleted: true,
-                ..FileDoc::new("mirror/notes/deleted.md".to_string(), String::new(), 0)
-            },
-        ];
-
-        let (uploads, remote_deletes) = plan_remote_rebuild(&local_states, &remote_docs, "mirror/");
-
-        assert_eq!(
-            uploads,
-            vec!["notes/a.md".to_string(), "notes/b.md".to_string()]
+    fn engine_new_and_with_ignore_produce_same_root_dir() {
+        let root = PathBuf::from("/tmp/test-sync-engine-root");
+        let engine1 = SyncEngine::new(test_couchdb(), test_local_db(), root.clone());
+        let engine2 = SyncEngine::with_ignore(
+            test_couchdb(),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::from_content("secret/"),
         );
-        assert_eq!(remote_deletes, vec!["mirror/notes/orphan.md".to_string()]);
+
+        assert_eq!(engine1.root_dir(), &root);
+        assert_eq!(engine2.root_dir(), &root);
     }
 
     #[test]
-    fn local_rebuild_deletes_local_files_and_downloads_live_remote_docs() {
-        let local_states = vec![
-            FileState::new(
-                "notes/old.md".to_string(),
-                "hash-old".to_string(),
-                10,
-                Utc::now(),
-            ),
-            FileState::new(
-                "notes/extra.md".to_string(),
-                "hash-extra".to_string(),
-                20,
-                Utc::now(),
-            ),
-        ];
-        let remote_docs = vec![
-            FileDoc::new("mirror/notes/new.md".to_string(), String::new(), 15),
-            FileDoc {
-                deleted: true,
-                ..FileDoc::new("mirror/notes/deleted.md".to_string(), String::new(), 0)
-            },
-        ];
-
-        let (local_deletes, remote_downloads) = plan_local_rebuild(&local_states, &remote_docs);
-
-        assert_eq!(
-            local_deletes,
-            vec!["notes/old.md".to_string(), "notes/extra.md".to_string()]
+    fn engine_initial_state_has_no_conflicts_and_no_file_states() {
+        let engine = SyncEngine::new(
+            test_couchdb(),
+            test_local_db(),
+            PathBuf::from("/tmp/test-sync-engine-state"),
         );
-        assert_eq!(remote_downloads, vec!["mirror/notes/new.md".to_string()]);
+
+        // Fresh engine should have no conflicts
+        assert!(engine.get_conflicts().unwrap().is_empty());
+
+        // Fresh engine should have no file states
+        assert!(engine.get_file_state("nonexistent.txt").unwrap().is_none());
+        assert!(engine.get_file_state("other/path.md").unwrap().is_none());
     }
 
     #[test]
-    fn remote_prefix_is_stripped_when_mapping_remote_paths_back_to_local() {
-        assert_eq!(
-            remote_path_to_local_path("Agents/ross-coulthart/AGENT.md", "Agents/"),
-            "ross-coulthart/AGENT.md"
+    fn engine_with_ignore_can_checkpoint() {
+        let engine = SyncEngine::new(
+            test_couchdb(),
+            test_local_db(),
+            PathBuf::from("/tmp/test-sync-engine-checkpoint"),
         );
-        assert_eq!(
-            remote_path_to_local_path("notes/test.md", ""),
-            "notes/test.md"
+
+        // Save a checkpoint
+        engine.save_checkpoint("123-abc").unwrap();
+
+        // Read it back
+        let cp = engine.get_checkpoint().unwrap();
+        assert!(cp.is_some());
+        assert_eq!(cp.unwrap().0, "123-abc");
+    }
+
+    #[test]
+    fn engine_path_conversion_methods_use_couchdb_prefix() {
+        let engine = SyncEngine::new(
+            test_couchdb(),
+            test_local_db(),
+            PathBuf::from("/tmp/test-sync-engine-paths"),
         );
+
+        // local_to_remote_path should prepend the prefix
+        let remote = engine.local_to_remote_path("doc.txt");
+        assert_eq!(remote, "test-prefix/doc.txt");
+
+        // remote_to_local_path should strip the prefix
+        let local = engine.remote_to_local_path("test-prefix/doc.txt");
+        assert_eq!(local, "doc.txt");
     }
 }
