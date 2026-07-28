@@ -1,6 +1,7 @@
 use crate::config::{default_user_config_file, AppConfig, SyncPath};
 use crate::couchdb::{ChangeFeedEntry, CouchDb};
 use crate::local::{AsyncFileWatcher, LocalDb};
+use crate::matrix::MatrixNotifier;
 use crate::models::{Change, ChangeType, IgnoreMatcher, ResolutionStrategy};
 use crate::sync::{SyncEngine, SyncReport};
 use crate::telegram::TelegramNotifier;
@@ -428,11 +429,13 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
     if !report.errors.is_empty() {
         let summary = format_sync_error_summary(&report.errors);
         notify_sync_error_telegram(&config, Some(&path), &summary).await;
+        notify_sync_error_matrix(&config, Some(&path), &summary).await;
     }
 
     // Send Telegram notifications for conflicts (one-time sync uses DB tracking)
     if report.conflicts > 0 {
         notify_conflicts_telegram(&config, &db_path, &path, None).await;
+        notify_conflicts_matrix(&config, &db_path, &path, None).await;
     }
 
     Ok(report)
@@ -632,6 +635,161 @@ async fn notify_sync_error_telegram(
     }
 }
 
+/// Matrix notifier helper for error notifications
+fn matrix_error_notifier(config: &AppConfig) -> Option<MatrixNotifier> {
+    if !config.notifications.enabled || !config.notifications.notify_on_sync_error {
+        return None;
+    }
+
+    let (homeserver_url, access_token, room_id) = match (
+        &config.notifications.matrix.homeserver_url,
+        &config.notifications.matrix.access_token,
+        &config.notifications.matrix.room_id,
+    ) {
+        (Some(url), Some(token), Some(room))
+            if !url.is_empty() && !token.is_empty() && !room.is_empty() =>
+        {
+            (url.clone(), token.clone(), room.clone())
+        }
+        _ => {
+            info!("Matrix not configured, skipping error notifications");
+            return None;
+        }
+    };
+
+    Some(MatrixNotifier::new(
+        homeserver_url,
+        access_token,
+        room_id,
+        config.notifications.matrix.message_type.clone(),
+    ))
+}
+
+/// Send Matrix notifications for any unnotified conflicts
+/// If session_notified is provided, only notify about conflicts not in that set (daemon mode)
+/// If session_notified is None, notify about all conflicts not marked as notified in DB (one-time sync)
+async fn notify_conflicts_matrix(
+    config: &AppConfig,
+    db_path: &Path,
+    sync_dir: &Path,
+    mut session_notified: Option<&mut HashSet<String>>,
+) {
+    // Check if Matrix is configured
+    let (homeserver_url, access_token, room_id) = match (
+        &config.notifications.matrix.homeserver_url,
+        &config.notifications.matrix.access_token,
+        &config.notifications.matrix.room_id,
+    ) {
+        (Some(url), Some(token), Some(room))
+            if !url.is_empty() && !token.is_empty() && !room.is_empty() =>
+        {
+            (url.clone(), token.clone(), room.clone())
+        }
+        _ => {
+            info!("Matrix not configured, skipping conflict notifications");
+            return;
+        }
+    };
+
+    // Re-open database to get conflicts
+    let local_db = match LocalDb::open(db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("Failed to open database for notifications: {}", e);
+            return;
+        }
+    };
+
+    let notifier = MatrixNotifier::new(
+        homeserver_url,
+        access_token,
+        room_id,
+        config.notifications.matrix.message_type.clone(),
+    );
+    let sync_dir_str = sync_dir.display().to_string();
+
+    // Get all conflicts
+    let conflicts = match local_db.get_conflicts() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Failed to get conflicts for notification: {}", e);
+            return;
+        }
+    };
+
+    // Filter to only new conflicts based on mode
+    let new_conflicts: Vec<_> = match &session_notified {
+        Some(notified) => {
+            // Daemon mode: only conflicts not notified this session
+            conflicts
+                .iter()
+                .filter(|c| !notified.contains(&c.path))
+                .collect()
+        }
+        None => {
+            // One-time sync: only conflicts not marked notified in DB
+            conflicts.iter().filter(|c| !c.notified).collect()
+        }
+    };
+
+    if new_conflicts.is_empty() {
+        return;
+    }
+
+    // Send notification for all new conflicts at once
+    match notifier
+        .notify_new_conflicts(&new_conflicts, &sync_dir_str)
+        .await
+    {
+        Ok(_) => {
+            info!(
+                "Sent Matrix notification for {} new conflict(s)",
+                new_conflicts.len()
+            );
+            // Mark conflicts as notified
+            for conflict in &new_conflicts {
+                if let Some(ref mut notified) = session_notified {
+                    // Daemon mode: track in session
+                    notified.insert(conflict.path.clone());
+                } else {
+                    // One-time sync: mark in DB
+                    if let Err(e) = local_db.mark_conflict_notified(&conflict.path) {
+                        warn!("Failed to mark conflict as notified: {}", e);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Failed to send Matrix notification: {}", e);
+        }
+    }
+}
+
+async fn notify_sync_error_matrix(
+    config: &AppConfig,
+    sync_dir: Option<&Path>,
+    error_message: &str,
+) {
+    let notifier = match matrix_error_notifier(config) {
+        Some(notifier) => notifier,
+        None => return,
+    };
+
+    let message = match sync_dir {
+        Some(path) => format!(
+            "Sync path: {}
+{}",
+            path.display(),
+            error_message
+        ),
+        None => error_message.to_string(),
+    };
+
+    if let Err(e) = notifier.notify_error(&message).await {
+        warn!("Failed to send Matrix error notification: {}", e);
+    }
+}
+
 /// Run continuous sync daemon
 pub async fn daemon(
     paths: Vec<SyncPath>,
@@ -663,6 +821,12 @@ pub async fn daemon(
                 if let Err(e) = live_sync_path(local_path.clone(), path_config.clone()).await {
                     error!("Live sync error for {}: {}", local_path.display(), e);
                     notify_sync_error_telegram(
+                        &path_config,
+                        Some(&local_path),
+                        &format!("Live sync error: {}", e),
+                    )
+                    .await;
+                    notify_sync_error_matrix(
                         &path_config,
                         Some(&local_path),
                         &format!("Live sync error: {}", e),
@@ -700,6 +864,12 @@ pub async fn daemon(
                 Err(e) => {
                     error!("Sync error for {}: {}", sync_path.local.display(), e);
                     notify_sync_error_telegram(
+                        &path_config,
+                        Some(&sync_path.local),
+                        &format!("Sync error: {}", e),
+                    )
+                    .await;
+                    notify_sync_error_matrix(
                         &path_config,
                         Some(&sync_path.local),
                         &format!("Sync error: {}", e),
@@ -745,11 +915,13 @@ async fn daemon_sync(
     if !report.errors.is_empty() {
         let summary = format_sync_error_summary(&report.errors);
         notify_sync_error_telegram(config, Some(path), &summary).await;
+        notify_sync_error_matrix(config, Some(path), &summary).await;
     }
 
     // Send Telegram notifications for NEW conflicts only (session-based tracking)
     if report.conflicts > 0 {
         notify_conflicts_telegram(config, &db_path, path, Some(session_notified)).await;
+        notify_conflicts_matrix(config, &db_path, path, Some(session_notified)).await;
     }
 
     Ok(report)
@@ -834,6 +1006,12 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
                 &format!("Local watcher error: {}", e),
             )
             .await;
+            notify_sync_error_matrix(
+                &watcher_config,
+                Some(&watcher_root),
+                &format!("Local watcher error: {}", e),
+            )
+            .await;
         }
     });
 
@@ -844,6 +1022,12 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
         if let Err(e) = run_remote_changes(remote_config, initial_since, remote_tx).await {
             error!("Remote changes feed error: {}", e);
             notify_sync_error_telegram(
+                &remote_config_notify,
+                Some(&remote_root),
+                &format!("Remote changes feed error: {}", e),
+            )
+            .await;
+            notify_sync_error_matrix(
                 &remote_config_notify,
                 Some(&remote_root),
                 &format!("Remote changes feed error: {}", e),
@@ -865,12 +1049,24 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
                         &format!("Live local change error for {}: {}", change.path, e),
                     )
                     .await;
+                    notify_sync_error_matrix(
+                        &config,
+                        Some(&path),
+                        &format!("Live local change error for {}: {}", change.path, e),
+                    )
+                    .await;
                 }
             }
             Some(entry) = remote_rx.recv() => {
                 if let Err(e) = handle_remote_change(&mut engine, &mut touched, &ignore_matcher, entry).await {
                     warn!("Live remote change error: {}", e);
                     notify_sync_error_telegram(
+                        &config,
+                        Some(&path),
+                        &format!("Live remote change error: {}", e),
+                    )
+                    .await;
+                    notify_sync_error_matrix(
                         &config,
                         Some(&path),
                         &format!("Live remote change error: {}", e),
@@ -942,6 +1138,8 @@ async fn run_remote_changes(
                 }
                 error!("Changes feed error: {}", e);
                 notify_sync_error_telegram(&config, None, &format!("Changes feed error: {}", e))
+                    .await;
+                notify_sync_error_matrix(&config, None, &format!("Changes feed error: {}", e))
                     .await;
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }

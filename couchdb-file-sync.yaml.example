@@ -53,12 +53,17 @@ conflicts:
   auto_resolve: false
   conflict_dir: ".conflicts"  # Where to store conflict copies
 
-# Telegram notifications for conflicts
+# Notification settings (Telegram and/or Matrix)
 notifications:
   enabled: false
   telegram:
     bot_token: "${TELEGRAM_BOT_TOKEN}"  # From @BotFather
     chat_id: "${TELEGRAM_CHAT_ID}"      # Your chat ID
+  matrix:
+    homeserver_url: "${MATRIX_HOMESERVER_URL}"  # e.g. https://matrix.example.com
+    access_token: "${MATRIX_ACCESS_TOKEN}"      # Matrix access token
+    room_id: "${MATRIX_ROOM_ID}"                # Room ID to send notifications to
+    message_type: "m.notice"                    # m.notice or m.text
   notify_on_conflict: true
   notify_on_sync_error: true
   notify_summary: false

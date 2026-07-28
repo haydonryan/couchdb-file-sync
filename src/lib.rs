@@ -3,6 +3,7 @@ pub mod config;
 pub mod couchdb;
 pub mod local;
 pub mod logging;
+pub mod matrix;
 pub mod models;
 pub mod sync;
 pub mod telegram;

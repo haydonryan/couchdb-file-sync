@@ -197,6 +197,8 @@ pub struct NotificationConfig {
     #[serde(default)]
     pub telegram: TelegramConfig,
     #[serde(default)]
+    pub matrix: MatrixConfig,
+    #[serde(default)]
     pub notify_on_conflict: bool,
     #[serde(default)]
     pub notify_on_sync_error: bool,
@@ -209,6 +211,16 @@ pub struct NotificationConfig {
 pub struct TelegramConfig {
     pub bot_token: Option<String>,
     pub chat_id: Option<String>,
+}
+
+/// Matrix notification configuration
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct MatrixConfig {
+    pub homeserver_url: Option<String>,
+    pub access_token: Option<String>,
+    pub room_id: Option<String>,
+    #[serde(default = "default_matrix_message_type")]
+    pub message_type: String,
 }
 
 /// Logging configuration
@@ -275,6 +287,9 @@ fn default_max_file_size() -> u64 {
     1024 * 1024 * 1024 // 1GB
 }
 
+fn default_matrix_message_type() -> String {
+    "m.notice".to_string()
+}
 fn default_parallel() -> bool {
     true
 }
