@@ -314,6 +314,7 @@ fn default_log_format() -> String {
 mod tests {
     use super::*;
     use std::path::Path;
+    use tempfile::TempDir;
 
     #[test]
     fn default_user_config_dir_uses_xdg_config_home_when_set() {
@@ -349,4 +350,208 @@ mod tests {
             .unwrap_or_else(|| home_dir.join(".config"));
         Some(config_home.join("couchdb-file-sync"))
     }
+
+
+    // ---- AppConfig default tests ----
+
+    #[test]
+    fn test_app_config_default_has_sensible_values() {
+        let config = AppConfig::default();
+
+        // CouchDB defaults
+        assert_eq!(config.couchdb.url, "http://localhost:5984");
+        assert_eq!(config.couchdb.database, "couchdb_file_sync_files");
+        assert_eq!(config.couchdb.timeout_seconds, 30);
+        assert_eq!(config.couchdb.retry_attempts, 3);
+        assert!(config.couchdb.username.is_none());
+        assert!(config.couchdb.password.is_none());
+        assert_eq!(config.couchdb.remote_path, "");
+
+        // Sync defaults
+        assert!(config.sync.root_dir.is_none());
+        assert_eq!(config.sync.poll_interval, 60);
+        assert_eq!(config.sync.debounce_ms, 500);
+        assert_eq!(config.sync.batch_size, 100);
+        assert_eq!(config.sync.max_file_size, 1024 * 1024 * 1024);
+        assert!(config.sync.parallel);
+        assert_eq!(config.sync.max_parallel, 4);
+
+        // Empty by default
+        assert!(config.paths.is_empty());
+        assert!(config.ignore.patterns.is_empty());
+        assert!(config.ignore.ignore_files.is_empty());
+
+        // Conflict defaults
+        assert_eq!(config.conflicts.default_strategy, "keep-both");
+        assert!(!config.conflicts.auto_resolve);
+        assert!(config.conflicts.conflict_dir.is_none());
+
+        // Logging defaults
+        assert_eq!(config.logging.level, "info");
+        assert_eq!(config.logging.format, "pretty");
+        assert!(config.logging.file.is_none());
+        assert_eq!(config.logging.rotated_logs, RotatedLogPolicy::Delete);
+
+        // Notifications defaults
+        assert!(!config.notifications.enabled);
+        assert!(!config.notifications.notify_on_conflict);
+        assert!(!config.notifications.notify_on_sync_error);
+        assert!(!config.notifications.notify_summary);
+    }
+
+    #[test]
+    fn test_couchdb_config_default_uses_provided_defaults() {
+        let couch = CouchDbConfig::default();
+        assert_eq!(couch.url, "http://localhost:5984");
+        assert_eq!(couch.database, "couchdb_file_sync_files");
+        assert_eq!(couch.timeout_seconds, 30);
+        assert_eq!(couch.retry_attempts, 3);
+    }
+
+    #[test]
+    fn test_sync_config_default_values() {
+        let sync = SyncConfig::default();
+        assert!(sync.root_dir.is_none());
+        assert_eq!(sync.poll_interval, 60);
+        assert_eq!(sync.debounce_ms, 500);
+        assert_eq!(sync.batch_size, 100);
+        assert_eq!(sync.max_file_size, 1024 * 1024 * 1024);
+        assert!(sync.parallel);
+        assert_eq!(sync.max_parallel, 4);
+    }
+
+    #[test]
+    fn test_conflict_config_default() {
+        let conflict = ConflictConfig::default();
+        assert_eq!(conflict.default_strategy, "keep-both");
+        assert!(!conflict.auto_resolve);
+        assert!(conflict.conflict_dir.is_none());
+    }
+
+    #[test]
+    fn test_logging_config_default() {
+        let log = LoggingConfig::default();
+        assert_eq!(log.level, "info");
+        assert_eq!(log.format, "pretty");
+        assert!(log.file.is_none());
+        assert_eq!(log.rotated_logs, RotatedLogPolicy::Delete);
+    }
+
+    // ---- SyncPath tests ----
+
+    #[test]
+    fn test_sync_path_construction() {
+        let sync_path = SyncPath {
+            local: PathBuf::from("/home/user/docs"),
+            remote: "notes/".to_string(),
+        };
+        assert_eq!(sync_path.local, PathBuf::from("/home/user/docs"));
+        assert_eq!(sync_path.remote, "notes/");
+    }
+
+    #[test]
+    fn test_sync_path_default_remote() {
+        // When remote is not serialized, it should default to empty string
+        let yaml = r#"
+local: /home/user/docs
+"#;
+        let sync_path: SyncPath = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(sync_path.local, PathBuf::from("/home/user/docs"));
+        assert_eq!(sync_path.remote, "", "remote should default to empty string");
+    }
+
+    #[test]
+    fn test_sync_path_round_trip() {
+        let original = SyncPath {
+            local: PathBuf::from("/data/photos"),
+            remote: "photos/".to_string(),
+        };
+        let yaml = serde_yaml::to_string(&original).unwrap();
+        let deserialized: SyncPath = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(original.local, deserialized.local);
+        assert_eq!(original.remote, deserialized.remote);
+    }
+
+    // ---- AppConfig::load tests ----
+
+    #[test]
+    fn test_app_config_load_returns_defaults_when_no_file() {
+        // When no config file is given, load should succeed.
+        let result = AppConfig::load(None);
+        assert!(result.is_ok(), "load should succeed without config file: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_app_config_load_with_missing_file_path_fails_gracefully() {
+        // The config crate's File::from() requires the file to exist.
+        // load() will return an error when given a nonexistent path.
+        let result = AppConfig::load(Some(PathBuf::from("/definitely/does/not/exist/config.yaml")));
+        assert!(result.is_err(), "load with nonexistent file path should return Err");
+        // But calling with None should work (no file, just env)
+        let result = AppConfig::load(None);
+        assert!(result.is_ok(), "load without file path should succeed");
+    }
+
+    #[test]
+    fn test_app_config_env_overrides() {
+        // Save all potentially conflicting env vars
+        let old_url = std::env::var_os("COUCHDB_FILE_SYNC__COUCHDB__URL");
+        let old_interval = std::env::var_os("COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL");
+        let old_log = std::env::var_os("COUCHDB_FILE_SYNC__LOGGING__LEVEL");
+
+        // Clear interfering env vars
+        std::env::remove_var("COUCHDB_FILE_SYNC__COUCHDB__URL");
+        std::env::remove_var("COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL");
+        std::env::remove_var("COUCHDB_FILE_SYNC__LOGGING__LEVEL");
+
+        // --- Test 1: Env vars override defaults ---
+        std::env::set_var("COUCHDB_FILE_SYNC__COUCHDB__URL", "https://couch.example.com:6984");
+        std::env::set_var("COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL", "120");
+        std::env::set_var("COUCHDB_FILE_SYNC__LOGGING__LEVEL", "debug");
+
+        let config = AppConfig::load(None).unwrap();
+        assert_eq!(config.couchdb.url, "https://couch.example.com:6984");
+        assert_eq!(config.sync.poll_interval, 120);
+        assert_eq!(config.logging.level, "debug");
+
+        // --- Test 2: Env var overrides config file ---
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("test-config.yaml");
+        std::fs::write(
+            &config_path,
+            r#"
+couchdb:
+  url: "http://file-value:5984"
+  database: "from_file"
+sync:
+  poll_interval: 99
+logging:
+  level: "warn"
+"#,
+        )
+        .unwrap();
+
+        // Env var overrides file value
+        std::env::set_var("COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL", "200");
+
+        let config = AppConfig::load(Some(config_path)).unwrap();
+
+        // File value should be present for non-overridden keys
+        assert_eq!(config.couchdb.url, "https://couch.example.com:6984");
+        assert_eq!(config.couchdb.database, "from_file");
+        assert_eq!(config.logging.level, "debug");
+
+        // Env overrides file for poll_interval
+        assert_eq!(config.sync.poll_interval, 200);
+
+        // --- Restore original env vars ---
+        if let Some(v) = old_url { std::env::set_var("COUCHDB_FILE_SYNC__COUCHDB__URL", v); }
+        else { std::env::remove_var("COUCHDB_FILE_SYNC__COUCHDB__URL"); }
+        if let Some(v) = old_interval { std::env::set_var("COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL", v); }
+        else { std::env::remove_var("COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL"); }
+        if let Some(v) = old_log { std::env::set_var("COUCHDB_FILE_SYNC__LOGGING__LEVEL", v); }
+        else { std::env::remove_var("COUCHDB_FILE_SYNC__LOGGING__LEVEL"); }
+    }
+
+
 }
