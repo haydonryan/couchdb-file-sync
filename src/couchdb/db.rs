@@ -517,3 +517,205 @@ impl CouchDb {
 pub fn build_couch_url(host: &str, port: u16) -> String {
     format!("http://{}:{}", host, port)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to create a CouchDb instance for testing without a real CouchDB.
+    /// The methods under test (is_path_allowed, get_remote_path, get_local_path)
+    /// only depend on self.remote_path, so we use dummy couch_rs values.
+    fn test_couchdb(remote_path: &str) -> CouchDb {
+        let client = Client::new_no_auth("http://localhost:15984").unwrap();
+        let db = Database::new("test_db".to_string(), client.clone());
+        CouchDb {
+            client,
+            db,
+            http_client: HttpClient::new(),
+            base_db_url: "http://localhost:15984/test_db".to_string(),
+            db_name: "test_db".to_string(),
+            auth: None,
+            remote_path: remote_path.to_string(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 10051: is_path_allowed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_path_allowed_empty_prefix_permits_all() {
+        let db = test_couchdb("");
+        assert!(db.is_path_allowed("any/path/file.md"));
+        assert!(db.is_path_allowed("deeply/nested/path/document.txt"));
+    }
+
+    #[test]
+    fn is_path_allowed_trailing_slash_prefix() {
+        let db = test_couchdb("notes/");
+        assert!(db.is_path_allowed("notes/file.md"));
+        assert!(db.is_path_allowed("notes/subdir/doc.txt"));
+        assert!(!db.is_path_allowed("other/file.md"));
+        assert!(!db.is_path_allowed("journal/entry.md"));
+    }
+
+    #[test]
+    fn is_path_allows_exact_prefix_match_without_trailing_slash() {
+        // A path equal to the prefix (minus trailing slash) should also be allowed
+        let db = test_couchdb("notes/");
+        assert!(db.is_path_allowed("notes"));
+    }
+
+    #[test]
+    fn is_path_allowed_rejects_outside_prefix() {
+        let db = test_couchdb("notes/");
+        assert!(!db.is_path_allowed("Notes/file.md"));
+        assert!(!db.is_path_allowed("note"));
+        assert!(!db.is_path_allowed("notes_extra/file.md"));
+    }
+
+    #[test]
+    fn is_path_allowed_root_prefix_normalized_to_empty() {
+        let db = test_couchdb("");
+        assert!(db.is_path_allowed("any/path.md"));
+    }
+
+    #[test]
+    fn is_path_allowed_nested_paths() {
+        let db = test_couchdb("obsidian/");
+        assert!(db.is_path_allowed("obsidian/vault/notes/file.md"));
+        assert!(db.is_path_allowed("obsidian/vault/deep/nested/doc.txt"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 10052: get_remote_path and get_local_path round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_remote_path_without_prefix_passthrough() {
+        let db = test_couchdb("");
+        assert_eq!(db.get_remote_path("file.md"), "file.md");
+        assert_eq!(db.get_remote_path("subdir/doc.txt"), "subdir/doc.txt");
+    }
+
+    #[test]
+    fn get_remote_path_with_prefix() {
+        let db = test_couchdb("notes/");
+        assert_eq!(db.get_remote_path("file.md"), "notes/file.md");
+        assert_eq!(db.get_remote_path("subdir/doc.txt"), "notes/subdir/doc.txt");
+    }
+
+    #[test]
+    fn get_local_path_without_prefix_passthrough() {
+        let db = test_couchdb("");
+        assert_eq!(db.get_local_path("file.md"), "file.md");
+        assert_eq!(db.get_local_path("subdir/doc.txt"), "subdir/doc.txt");
+    }
+
+    #[test]
+    fn get_local_path_strips_prefix() {
+        let db = test_couchdb("notes/");
+        assert_eq!(db.get_local_path("notes/file.md"), "file.md");
+        assert_eq!(db.get_local_path("notes/subdir/doc.txt"), "subdir/doc.txt");
+    }
+
+    #[test]
+    fn get_local_path_unknown_prefix_returns_whole() {
+        let db = test_couchdb("notes/");
+        // When the remote path doesn't start with the prefix, return as-is
+        assert_eq!(db.get_local_path("other/file.md"), "other/file.md");
+    }
+
+    #[test]
+    fn remote_local_path_round_trip_without_prefix() {
+        let db = test_couchdb("");
+        let local = "some/file.md";
+        let remote = db.get_remote_path(local);
+        assert_eq!(db.get_local_path(&remote), local);
+    }
+
+    #[test]
+    fn remote_local_path_round_trip_with_prefix() {
+        let db = test_couchdb("obsidian/");
+        let local = "vault/note.md";
+        let remote = db.get_remote_path(local);
+        assert_eq!(remote, "obsidian/vault/note.md");
+        assert_eq!(db.get_local_path(&remote), local);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 10053: build_couch_url, seq_to_string, 404 handling in get_file
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_couch_url_constructs_http_url() {
+        assert_eq!(build_couch_url("localhost", 5984), "http://localhost:5984");
+    }
+
+    #[test]
+    fn build_couch_url_with_ip_and_non_default_port() {
+        assert_eq!(build_couch_url("127.0.0.1", 443), "http://127.0.0.1:443");
+    }
+
+    #[test]
+    fn seq_to_string_from_string() {
+        let value = Value::String("12345-abc".to_string());
+        assert_eq!(seq_to_string(&value), "12345-abc");
+    }
+
+    #[test]
+    fn seq_to_string_from_number() {
+        let value = Value::Number(serde_json::Number::from(67890));
+        assert_eq!(seq_to_string(&value), "67890");
+    }
+
+    #[test]
+    fn seq_to_string_from_null() {
+        let value = Value::Null;
+        assert_eq!(seq_to_string(&value), "null");
+    }
+
+    #[test]
+    fn seq_to_string_from_array() {
+        let value = Value::Array(vec![
+            Value::String("seq1".to_string()),
+            Value::String("seq2".to_string()),
+        ]);
+        // For non-string values, serde_json::to_string is used
+        assert_eq!(seq_to_string(&value), "[\"seq1\",\"seq2\"]");
+    }
+
+    /// Test that get_file returns Ok(None) for paths outside the allowed prefix
+    #[tokio::test]
+    async fn get_file_returns_none_for_disallowed_path() {
+        let db = test_couchdb("notes/");
+        let result = db.get_file("other/outside.md").await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    /// Test that fetch_metadata returns Ok(None) for paths outside the allowed prefix
+    #[tokio::test]
+    async fn fetch_metadata_returns_none_for_disallowed_path() {
+        let db = test_couchdb("notes/");
+        let result = db.fetch_metadata("other/outside.md").await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_file_disallowed_path_returns_ok_none() {
+        let db = test_couchdb("data/");
+        let result = db.get_file("config/secrets.md").await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_metadata_disallowed_path_returns_ok_none() {
+        let db = test_couchdb("data/");
+        let result = db.fetch_metadata("config/secrets.md").await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+}
