@@ -463,3 +463,520 @@ fn i64_to_u64(value: i64) -> rusqlite::Result<u64> {
     }
     Ok(value as u64)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{Change, ChangeSource, ChangeType, Conflict};
+    use chrono::{DateTime, Utc};
+
+    // ── helpers ──────────────────────────────────────────────────────────
+
+    fn test_db() -> LocalDb {
+        LocalDb::open_in_memory().expect("failed to create in-memory database")
+    }
+
+    fn make_file_state(path: &str) -> FileState {
+        FileState::new(
+            path.to_string(),
+            "abc123".to_string(),
+            1024,
+            Utc::now(),
+        )
+    }
+
+    fn make_change(path: &str) -> Change {
+        Change::local_created(path.to_string(), "def456".to_string(), 2048)
+    }
+
+    fn make_conflict(path: &str) -> Conflict {
+        let local = make_file_state(path);
+        let remote = crate::models::RemoteState {
+            path: path.to_string(),
+            hash: "remote_hash".to_string(),
+            size: 4096,
+            modified_at: Utc::now(),
+            couch_rev: "1-abc".to_string(),
+            deleted: false,
+        };
+        Conflict::new(path.to_string(), local, remote)
+    }
+
+    // ── file_state operations ────────────────────────────────────────────
+
+    #[test]
+    fn test_save_and_get_file_state() {
+        let db = test_db();
+        let state = make_file_state("/test/file.txt");
+
+        db.save_file_state(&state).expect("save_file_state failed");
+        let loaded = db
+            .get_file_state("/test/file.txt")
+            .expect("get_file_state failed");
+
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.path, "/test/file.txt");
+        assert_eq!(loaded.hash, "abc123");
+        assert_eq!(loaded.size, 1024);
+    }
+
+    #[test]
+    fn test_get_file_state_missing() {
+        let db = test_db();
+        let loaded = db
+            .get_file_state("/nonexistent")
+            .expect("get_file_state failed");
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn test_save_file_state_update_existing() {
+        let db = test_db();
+        let mut state = make_file_state("/test/file.txt");
+        db.save_file_state(&state).expect("first save");
+
+        // Update with new hash and size
+        state.hash = "updated_hash".to_string();
+        state.size = 2048;
+        db.save_file_state(&state).expect("update save");
+
+        let loaded = db
+            .get_file_state("/test/file.txt")
+            .expect("get_file_state")
+            .unwrap();
+        assert_eq!(loaded.hash, "updated_hash");
+        assert_eq!(loaded.size, 2048);
+    }
+
+    #[test]
+    fn test_delete_file_state() {
+        let db = test_db();
+        let state = make_file_state("/test/file.txt");
+        db.save_file_state(&state).expect("save");
+
+        db.delete_file_state("/test/file.txt")
+            .expect("delete");
+
+        let loaded = db
+            .get_file_state("/test/file.txt")
+            .expect("get_file_state");
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn test_get_all_file_states_empty() {
+        let db = test_db();
+        let states = db.get_all_file_states().expect("get_all_file_states");
+        assert!(states.is_empty());
+    }
+
+    #[test]
+    fn test_get_all_file_states_multiple() {
+        let db = test_db();
+        db.save_file_state(&make_file_state("/a.txt"))
+            .expect("save a");
+        db.save_file_state(&make_file_state("/b.txt"))
+            .expect("save b");
+        db.save_file_state(&make_file_state("/c.txt"))
+            .expect("save c");
+
+        let states = db.get_all_file_states().expect("get_all_file_states");
+        assert_eq!(states.len(), 3);
+
+        let paths: Vec<&str> = states.iter().map(|s| s.path.as_str()).collect();
+        assert!(paths.contains(&"/a.txt"));
+        assert!(paths.contains(&"/b.txt"));
+        assert!(paths.contains(&"/c.txt"));
+    }
+
+    #[test]
+    fn test_clear_file_states() {
+        let db = test_db();
+        db.save_file_state(&make_file_state("/a.txt"))
+            .expect("save a");
+        db.save_file_state(&make_file_state("/b.txt"))
+            .expect("save b");
+
+        let cleared = db.clear_file_states().expect("clear_file_states");
+        assert_eq!(cleared, 2);
+
+        let states = db.get_all_file_states().expect("get_all_file_states");
+        assert!(states.is_empty());
+    }
+
+    // ── change_queue operations ──────────────────────────────────────────
+
+    #[test]
+    fn test_queue_and_get_pending_changes() {
+        let db = test_db();
+        let change = make_change("/test/file.txt");
+        db.queue_change(&change).expect("queue_change");
+
+        let pending = db.get_pending_changes().expect("get_pending_changes");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].path, "/test/file.txt");
+        assert_eq!(pending[0].change_type, ChangeType::Created);
+        assert_eq!(pending[0].source, ChangeSource::Local);
+    }
+
+    #[test]
+    fn test_get_pending_changes_empty() {
+        let db = test_db();
+        let pending = db.get_pending_changes().expect("get_pending_changes");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_get_pending_changes_ordered_by_timestamp() {
+        let db = test_db();
+
+        let mut c1 = make_change("/first");
+        c1.timestamp = DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut c2 = make_change("/second");
+        c2.timestamp = DateTime::parse_from_rfc3339("2025-01-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut c3 = make_change("/third");
+        c3.timestamp = DateTime::parse_from_rfc3339("2025-01-03T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        db.queue_change(&c3).expect("queue c3");
+        db.queue_change(&c1).expect("queue c1");
+        db.queue_change(&c2).expect("queue c2");
+
+        let pending = db.get_pending_changes().expect("get_pending_changes");
+        assert_eq!(pending.len(), 3);
+        assert_eq!(pending[0].path, "/first");
+        assert_eq!(pending[1].path, "/second");
+        assert_eq!(pending[2].path, "/third");
+    }
+
+    #[test]
+    fn test_mark_changes_processed() {
+        let db = test_db();
+        db.queue_change(&make_change("/a.txt"))
+            .expect("queue a");
+        db.queue_change(&make_change("/b.txt"))
+            .expect("queue b");
+
+        db.mark_changes_processed(&["/a.txt".to_string()])
+            .expect("mark_changes_processed");
+
+        let pending = db.get_pending_changes().expect("get_pending_changes");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].path, "/b.txt");
+    }
+
+    #[test]
+    fn test_mark_changes_processed_all() {
+        let db = test_db();
+        db.queue_change(&make_change("/a.txt"))
+            .expect("queue a");
+        db.queue_change(&make_change("/b.txt"))
+            .expect("queue b");
+
+        db.mark_changes_processed(&["/a.txt".to_string(), "/b.txt".to_string()])
+            .expect("mark_changes_processed");
+
+        let pending = db.get_pending_changes().expect("get_pending_changes");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_clear_processed_changes() {
+        let db = test_db();
+        db.queue_change(&make_change("/a.txt"))
+            .expect("queue a");
+        db.queue_change(&make_change("/b.txt"))
+            .expect("queue b");
+
+        db.mark_changes_processed(&["/a.txt".to_string()])
+            .expect("mark");
+        let cleared = db
+            .clear_processed_changes()
+            .expect("clear_processed_changes");
+        assert_eq!(cleared, 1);
+
+        let pending = db.get_pending_changes().expect("get_pending_changes");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].path, "/b.txt");
+    }
+
+    #[test]
+    fn test_clear_processed_changes_noop_when_none_processed() {
+        let db = test_db();
+        db.queue_change(&make_change("/a.txt"))
+            .expect("queue a");
+
+        let cleared = db
+            .clear_processed_changes()
+            .expect("clear_processed_changes");
+        assert_eq!(cleared, 0);
+
+        let pending = db.get_pending_changes().expect("get_pending_changes");
+        assert_eq!(pending.len(), 1);
+    }
+
+    // ── conflict operations ──────────────────────────────────────────────
+
+    #[test]
+    fn test_store_and_get_conflicts() {
+        let db = test_db();
+        let conflict = make_conflict("/test/conflict.txt");
+        db.store_conflict(&conflict).expect("store_conflict");
+
+        let conflicts = db.get_conflicts().expect("get_conflicts");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, "/test/conflict.txt");
+        assert_eq!(conflicts[0].local_state.hash, "abc123");
+        assert_eq!(conflicts[0].remote_state.hash, "remote_hash");
+        assert!(!conflicts[0].notified);
+    }
+
+    #[test]
+    fn test_get_conflicts_empty() {
+        let db = test_db();
+        let conflicts = db.get_conflicts().expect("get_conflicts");
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_get_conflict_by_path() {
+        let db = test_db();
+        db.store_conflict(&make_conflict("/a.txt"))
+            .expect("store a");
+        db.store_conflict(&make_conflict("/b.txt"))
+            .expect("store b");
+
+        let found = db.get_conflict("/a.txt").expect("get_conflict");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().path, "/a.txt");
+
+        let not_found = db.get_conflict("/nonexistent").expect("get_conflict");
+        assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn test_store_conflict_replace_existing() {
+        let db = test_db();
+        let mut conflict = make_conflict("/test/conflict.txt");
+        db.store_conflict(&conflict).expect("first store");
+
+        conflict.notified = true;
+        conflict.remote_state.hash = "updated_remote".to_string();
+        db.store_conflict(&conflict).expect("second store");
+
+        let loaded = db
+            .get_conflict("/test/conflict.txt")
+            .expect("get_conflict")
+            .unwrap();
+        assert!(loaded.notified);
+        assert_eq!(loaded.remote_state.hash, "updated_remote");
+    }
+
+    #[test]
+    fn test_mark_conflict_notified() {
+        let db = test_db();
+        db.store_conflict(&make_conflict("/test/conflict.txt"))
+            .expect("store");
+
+        db.mark_conflict_notified("/test/conflict.txt")
+            .expect("mark_notified");
+
+        let loaded = db
+            .get_conflict("/test/conflict.txt")
+            .expect("get_conflict")
+            .unwrap();
+        assert!(loaded.notified);
+    }
+
+    #[test]
+    fn test_delete_conflict() {
+        let db = test_db();
+        db.store_conflict(&make_conflict("/test/conflict.txt"))
+            .expect("store");
+
+        db.delete_conflict("/test/conflict.txt")
+            .expect("delete");
+
+        let loaded = db
+            .get_conflict("/test/conflict.txt")
+            .expect("get_conflict");
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn test_clear_conflicts() {
+        let db = test_db();
+        db.store_conflict(&make_conflict("/a.txt"))
+            .expect("store a");
+        db.store_conflict(&make_conflict("/b.txt"))
+            .expect("store b");
+
+        let cleared = db.clear_conflicts().expect("clear_conflicts");
+        assert_eq!(cleared, 2);
+
+        let conflicts = db.get_conflicts().expect("get_conflicts");
+        assert!(conflicts.is_empty());
+    }
+
+    // ── checkpoint operations ────────────────────────────────────────────
+
+    #[test]
+    fn test_get_checkpoint_none() {
+        let db = test_db();
+        let cp = db.get_checkpoint().expect("get_checkpoint");
+        assert!(cp.is_none());
+    }
+
+    #[test]
+    fn test_save_and_get_checkpoint() {
+        let db = test_db();
+        db.save_checkpoint("1000-abc")
+            .expect("save_checkpoint");
+
+        let cp = db
+            .get_checkpoint()
+            .expect("get_checkpoint")
+            .expect("checkpoint should exist");
+        assert_eq!(cp.0, "1000-abc");
+    }
+
+    #[test]
+    fn test_save_checkpoint_replace() {
+        let db = test_db();
+        db.save_checkpoint("old-seq").expect("first save");
+        db.save_checkpoint("new-seq").expect("second save");
+
+        let cp = db
+            .get_checkpoint()
+            .expect("get_checkpoint")
+            .expect("checkpoint should exist");
+        assert_eq!(cp.0, "new-seq");
+    }
+
+    #[test]
+    fn test_clear_checkpoint() {
+        let db = test_db();
+        db.save_checkpoint("some-seq").expect("save");
+
+        let cleared = db.clear_checkpoint().expect("clear_checkpoint");
+        assert_eq!(cleared, 1);
+
+        let cp = db.get_checkpoint().expect("get_checkpoint");
+        assert!(cp.is_none());
+    }
+
+    #[test]
+    fn test_clear_checkpoint_noop_when_empty() {
+        let db = test_db();
+        let cleared = db.clear_checkpoint().expect("clear_checkpoint");
+        assert_eq!(cleared, 0);
+    }
+
+    #[test]
+    fn test_reset_sync_state() {
+        let db = test_db();
+
+        // Insert data across all tables
+        db.save_file_state(&make_file_state("/a.txt"))
+            .expect("save file state");
+        db.queue_change(&make_change("/a.txt"))
+            .expect("queue change");
+        db.store_conflict(&make_conflict("/a.txt"))
+            .expect("store conflict");
+        db.save_checkpoint("seq-1").expect("save checkpoint");
+
+        // Reset
+        db.reset_sync_state().expect("reset_sync_state");
+
+        // Verify everything is gone
+        assert!(db
+            .get_all_file_states()
+            .expect("file states")
+            .is_empty());
+        assert!(db
+            .get_pending_changes()
+            .expect("pending changes")
+            .is_empty());
+        assert!(db.get_conflicts().expect("conflicts").is_empty());
+        assert!(db.get_checkpoint().expect("checkpoint").is_none());
+    }
+
+    // ── edge cases ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_delete_file_state_nonexistent() {
+        let db = test_db();
+        let result = db.delete_file_state("/nonexistent");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_delete_conflict_nonexistent() {
+        let db = test_db();
+        let result = db.delete_conflict("/nonexistent");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_mark_conflict_notified_nonexistent() {
+        let db = test_db();
+        let result = db.mark_conflict_notified("/nonexistent");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_queue_change_with_all_change_types() {
+        let db = test_db();
+        let path = "/test/file.txt";
+        let hash = Some("hash".to_string());
+        let size = Some(100u64);
+        let now = Utc::now();
+
+        let created = Change::new(
+            path.to_string(),
+            ChangeType::Created,
+            ChangeSource::Local,
+            hash.clone(),
+            size,
+            None,
+            None,
+        );
+        let modified = Change::new(
+            path.to_string(),
+            ChangeType::Modified,
+            ChangeSource::Remote,
+            hash.clone(),
+            size,
+            Some(now),
+            Some("1-rev".to_string()),
+        );
+        let deleted = Change::new(
+            path.to_string(),
+            ChangeType::Deleted,
+            ChangeSource::Local,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        db.queue_change(&created).expect("queue created");
+        db.queue_change(&modified).expect("queue modified");
+        db.queue_change(&deleted).expect("queue deleted");
+
+        let pending = db.get_pending_changes().expect("get_pending_changes");
+        assert_eq!(pending.len(), 3);
+        assert_eq!(pending[0].change_type, ChangeType::Created);
+        assert_eq!(pending[1].change_type, ChangeType::Modified);
+        assert_eq!(pending[2].change_type, ChangeType::Deleted);
+        assert_eq!(pending[0].source, ChangeSource::Local);
+        assert_eq!(pending[1].source, ChangeSource::Remote);
+        assert_eq!(pending[2].source, ChangeSource::Local);
+    }
+}
