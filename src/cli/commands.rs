@@ -1579,3 +1579,297 @@ fn print_sync_report(report: &SyncReport) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    // ── truncate_str ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_truncate_str_short_string() {
+        let result = truncate_str("hello", 10);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_truncate_str_exact_width() {
+        let result = truncate_str("hello", 5);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_truncate_str_overflow_with_ellipsis() {
+        let result = truncate_str("hello world", 8);
+        assert_eq!(result, "hello...");
+    }
+
+    #[test]
+    fn test_truncate_str_width_three() {
+        let result = truncate_str("hello world", 3);
+        assert_eq!(result, "...");
+    }
+
+    #[test]
+    fn test_truncate_str_width_two() {
+        let result = truncate_str("hello world", 2);
+        assert_eq!(result, "..");
+    }
+
+    #[test]
+    fn test_truncate_str_width_one() {
+        let result = truncate_str("hello world", 1);
+        assert_eq!(result, ".");
+    }
+
+    #[test]
+    fn test_truncate_str_width_zero() {
+        let result = truncate_str("hello world", 0);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_truncate_str_empty_string() {
+        let result = truncate_str("", 10);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_truncate_str_unicode() {
+        let result = truncate_str("héllo wörld", 8);
+        assert_eq!(result, "héllo...");
+    }
+
+    // ── format_sync_error_summary ─────────────────────────────────────────
+
+    #[test]
+    fn test_format_sync_error_summary_empty() {
+        let result = format_sync_error_summary(&[]);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_format_sync_error_summary_single() {
+        let result = format_sync_error_summary(&["file not found".to_string()]);
+        assert_eq!(result, "• file not found");
+    }
+
+    #[test]
+    fn test_format_sync_error_summary_multiple_within_limit() {
+        let errors: Vec<String> = (1..=5).map(|i| format!("error {}", i)).collect();
+        let result = format_sync_error_summary(&errors);
+        let expected = (1..=5)
+            .map(|i| format!("• error {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_format_sync_error_summary_truncation() {
+        let errors: Vec<String> = (1..=15).map(|i| format!("error {}", i)).collect();
+        let result = format_sync_error_summary(&errors);
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 11);
+        assert!(lines[10].starts_with("...and 5 more"));
+    }
+
+    #[test]
+    fn test_format_sync_error_summary_exactly_ten() {
+        let errors: Vec<String> = (1..=10).map(|i| format!("error {}", i)).collect();
+        let result = format_sync_error_summary(&errors);
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 10);
+        assert!(!result.contains("...and"));
+    }
+
+    // ── print_sync_report ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_print_sync_report_empty() {
+        let report = SyncReport::default();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            print_sync_report(&report);
+        }));
+    }
+
+    #[test]
+    fn test_print_sync_report_with_errors() {
+        let report = SyncReport {
+            uploaded: 5,
+            downloaded: 3,
+            deleted_local: 1,
+            deleted_remote: 0,
+            conflicts: 2,
+            errors: vec!["timeout".to_string(), "permission denied".to_string()],
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            print_sync_report(&report);
+        }));
+    }
+
+    #[test]
+    fn test_print_sync_report_with_conflicts() {
+        let report = SyncReport {
+            uploaded: 2,
+            downloaded: 1,
+            deleted_local: 0,
+            deleted_remote: 1,
+            conflicts: 3,
+            errors: vec![],
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            print_sync_report(&report);
+        }));
+    }
+
+    #[test]
+    fn test_print_sync_report_all_zeros() {
+        let report = SyncReport {
+            uploaded: 0,
+            downloaded: 0,
+            deleted_local: 0,
+            deleted_remote: 0,
+            conflicts: 0,
+            errors: vec![],
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            print_sync_report(&report);
+        }));
+    }
+
+    // ── state_dir / state_db_path ─────────────────────────────────────────
+
+    #[test]
+    fn test_state_dir_new_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".couchdb-file-sync")).unwrap();
+        let result = state_dir(root);
+        assert_eq!(result, root.join(".couchdb-file-sync"));
+    }
+
+    #[test]
+    fn test_state_dir_old_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".couchfs")).unwrap();
+        let result = state_dir(root);
+        assert_eq!(result, root.join(".couchfs"));
+    }
+
+    #[test]
+    fn test_state_dir_prefers_new_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".couchdb-file-sync")).unwrap();
+        std::fs::create_dir_all(root.join(".couchfs")).unwrap();
+        let result = state_dir(root);
+        assert_eq!(result, root.join(".couchdb-file-sync"));
+    }
+
+    #[test]
+    fn test_state_dir_neither_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let result = state_dir(root);
+        assert_eq!(result, root.join(".couchdb-file-sync"));
+    }
+
+    #[test]
+    fn test_state_db_path_construction() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let result = state_db_path(root);
+        assert_eq!(result, root.join(".couchdb-file-sync").join("state.db"));
+    }
+
+    #[test]
+    fn test_state_db_path_with_existing_new_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".couchdb-file-sync")).unwrap();
+        let result = state_db_path(root);
+        assert_eq!(result, root.join(".couchdb-file-sync").join("state.db"));
+    }
+
+    // ── local_mtime ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_local_mtime_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("test.txt"), "content").unwrap();
+        let mtime = local_mtime(root, "test.txt");
+        let now = SystemTime::now();
+        let diff = now.duration_since(mtime).unwrap_or_default();
+        assert!(diff.as_secs() < 5);
+    }
+
+    #[test]
+    fn test_local_mtime_file_not_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mtime = local_mtime(root, "nonexistent.txt");
+        let now = SystemTime::now();
+        let diff = now.duration_since(mtime).unwrap_or_default();
+        assert!(diff.as_secs() < 5);
+    }
+
+    #[test]
+    fn test_local_mtime_nested_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("subdir")).unwrap();
+        std::fs::write(root.join("subdir/file.txt"), "content").unwrap();
+        let mtime = local_mtime(root, "subdir/file.txt");
+        let now = SystemTime::now();
+        let diff = now.duration_since(mtime).unwrap_or_default();
+        assert!(diff.as_secs() < 5);
+    }
+
+    // ── load_ignore_patterns ──────────────────────────────────────────────
+
+    #[test]
+    fn test_load_ignore_patterns_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let matcher = load_ignore_patterns(root);
+        assert!(matcher.is_empty());
+    }
+
+    #[test]
+    fn test_load_ignore_patterns_with_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".sync-ignore"), "*.log\n*.tmp\nbuild/\n").unwrap();
+        let matcher = load_ignore_patterns(root);
+        assert!(!matcher.is_empty());
+        assert!(matcher.is_ignored("debug.log", false));
+        assert!(matcher.is_ignored("file.tmp", false));
+        assert!(!matcher.is_ignored("main.rs", false));
+    }
+
+    #[test]
+    fn test_load_ignore_patterns_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".sync-ignore"), "").unwrap();
+        let matcher = load_ignore_patterns(root);
+        assert!(matcher.is_empty());
+    }
+
+    #[test]
+    fn test_load_ignore_patterns_comments_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join(".sync-ignore"),
+            "# This is a comment\n# Another comment\n",
+        )
+        .unwrap();
+        let matcher = load_ignore_patterns(root);
+        assert!(matcher.is_empty());
+    }
+}
