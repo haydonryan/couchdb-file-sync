@@ -477,12 +477,7 @@ mod tests {
     }
 
     fn make_file_state(path: &str) -> FileState {
-        FileState::new(
-            path.to_string(),
-            "abc123".to_string(),
-            1024,
-            Utc::now(),
-        )
+        FileState::new(path.to_string(), "abc123".to_string(), 1024, Utc::now())
     }
 
     fn make_change(path: &str) -> Change {
@@ -555,12 +550,9 @@ mod tests {
         let state = make_file_state("/test/file.txt");
         db.save_file_state(&state).expect("save");
 
-        db.delete_file_state("/test/file.txt")
-            .expect("delete");
+        db.delete_file_state("/test/file.txt").expect("delete");
 
-        let loaded = db
-            .get_file_state("/test/file.txt")
-            .expect("get_file_state");
+        let loaded = db.get_file_state("/test/file.txt").expect("get_file_state");
         assert!(loaded.is_none());
     }
 
@@ -658,10 +650,8 @@ mod tests {
     #[test]
     fn test_mark_changes_processed() {
         let db = test_db();
-        db.queue_change(&make_change("/a.txt"))
-            .expect("queue a");
-        db.queue_change(&make_change("/b.txt"))
-            .expect("queue b");
+        db.queue_change(&make_change("/a.txt")).expect("queue a");
+        db.queue_change(&make_change("/b.txt")).expect("queue b");
 
         db.mark_changes_processed(&["/a.txt".to_string()])
             .expect("mark_changes_processed");
@@ -674,10 +664,8 @@ mod tests {
     #[test]
     fn test_mark_changes_processed_all() {
         let db = test_db();
-        db.queue_change(&make_change("/a.txt"))
-            .expect("queue a");
-        db.queue_change(&make_change("/b.txt"))
-            .expect("queue b");
+        db.queue_change(&make_change("/a.txt")).expect("queue a");
+        db.queue_change(&make_change("/b.txt")).expect("queue b");
 
         db.mark_changes_processed(&["/a.txt".to_string(), "/b.txt".to_string()])
             .expect("mark_changes_processed");
@@ -689,10 +677,8 @@ mod tests {
     #[test]
     fn test_clear_processed_changes() {
         let db = test_db();
-        db.queue_change(&make_change("/a.txt"))
-            .expect("queue a");
-        db.queue_change(&make_change("/b.txt"))
-            .expect("queue b");
+        db.queue_change(&make_change("/a.txt")).expect("queue a");
+        db.queue_change(&make_change("/b.txt")).expect("queue b");
 
         db.mark_changes_processed(&["/a.txt".to_string()])
             .expect("mark");
@@ -709,8 +695,7 @@ mod tests {
     #[test]
     fn test_clear_processed_changes_noop_when_none_processed() {
         let db = test_db();
-        db.queue_change(&make_change("/a.txt"))
-            .expect("queue a");
+        db.queue_change(&make_change("/a.txt")).expect("queue a");
 
         let cleared = db
             .clear_processed_changes()
@@ -800,12 +785,9 @@ mod tests {
         db.store_conflict(&make_conflict("/test/conflict.txt"))
             .expect("store");
 
-        db.delete_conflict("/test/conflict.txt")
-            .expect("delete");
+        db.delete_conflict("/test/conflict.txt").expect("delete");
 
-        let loaded = db
-            .get_conflict("/test/conflict.txt")
-            .expect("get_conflict");
+        let loaded = db.get_conflict("/test/conflict.txt").expect("get_conflict");
         assert!(loaded.is_none());
     }
 
@@ -836,8 +818,7 @@ mod tests {
     #[test]
     fn test_save_and_get_checkpoint() {
         let db = test_db();
-        db.save_checkpoint("1000-abc")
-            .expect("save_checkpoint");
+        db.save_checkpoint("1000-abc").expect("save_checkpoint");
 
         let cp = db
             .get_checkpoint()
@@ -895,10 +876,7 @@ mod tests {
         db.reset_sync_state().expect("reset_sync_state");
 
         // Verify everything is gone
-        assert!(db
-            .get_all_file_states()
-            .expect("file states")
-            .is_empty());
+        assert!(db.get_all_file_states().expect("file states").is_empty());
         assert!(db
             .get_pending_changes()
             .expect("pending changes")

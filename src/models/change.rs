@@ -315,7 +315,9 @@ mod tests {
         batch.push(Change::local_deleted("c.txt".into()));
         let locals = batch.local_changes();
         assert_eq!(locals.len(), 2);
-        assert!(locals.iter().all(|c| matches!(c.source, ChangeSource::Local)));
+        assert!(locals
+            .iter()
+            .all(|c| matches!(c.source, ChangeSource::Local)));
     }
 
     #[test]
@@ -323,10 +325,18 @@ mod tests {
         let mut batch = ChangeBatch::new();
         batch.push(Change::local_created("a.txt".into(), "h1".into(), 100));
         batch.push(Change::remote_deleted("b.txt".into()));
-        batch.push(Change::remote_created("c.txt".into(), "h2".into(), 200, Utc::now(), "1-rev".into()));
+        batch.push(Change::remote_created(
+            "c.txt".into(),
+            "h2".into(),
+            200,
+            Utc::now(),
+            "1-rev".into(),
+        ));
         let remotes = batch.remote_changes();
         assert_eq!(remotes.len(), 2);
-        assert!(remotes.iter().all(|c| matches!(c.source, ChangeSource::Remote)));
+        assert!(remotes
+            .iter()
+            .all(|c| matches!(c.source, ChangeSource::Remote)));
     }
 
     #[test]

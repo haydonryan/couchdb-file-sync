@@ -86,12 +86,8 @@ mod tests {
 
     #[test]
     fn test_conflict_new() {
-        let local_state = FileState::new(
-            "/path/to/file.txt".into(),
-            "hash1".into(),
-            100,
-            Utc::now(),
-        );
+        let local_state =
+            FileState::new("/path/to/file.txt".into(), "hash1".into(), 100, Utc::now());
         let remote_state = RemoteState {
             path: "/path/to/file.txt".into(),
             hash: "hash2".into(),
@@ -100,7 +96,11 @@ mod tests {
             couch_rev: "1-abc".into(),
             deleted: false,
         };
-        let conflict = Conflict::new("/path/to/file.txt".into(), local_state.clone(), remote_state.clone());
+        let conflict = Conflict::new(
+            "/path/to/file.txt".into(),
+            local_state.clone(),
+            remote_state.clone(),
+        );
         assert_eq!(conflict.path, "/path/to/file.txt");
         assert!(!conflict.notified);
         // Verify the states are stored
@@ -110,12 +110,8 @@ mod tests {
 
     #[test]
     fn test_conflict_mark_notified() {
-        let local_state = FileState::new(
-            "/path/to/file.txt".into(),
-            "hash1".into(),
-            100,
-            Utc::now(),
-        );
+        let local_state =
+            FileState::new("/path/to/file.txt".into(), "hash1".into(), 100, Utc::now());
         let remote_state = RemoteState {
             path: "/path/to/file.txt".into(),
             hash: "hash2".into(),
@@ -132,12 +128,8 @@ mod tests {
 
     #[test]
     fn test_conflict_detected_at_set() {
-        let local_state = FileState::new(
-            "/path/to/file.txt".into(),
-            "hash1".into(),
-            100,
-            Utc::now(),
-        );
+        let local_state =
+            FileState::new("/path/to/file.txt".into(), "hash1".into(), 100, Utc::now());
         let remote_state = RemoteState {
             path: "/path/to/file.txt".into(),
             hash: "hash2".into(),
@@ -155,10 +147,22 @@ mod tests {
 
     #[test]
     fn test_resolution_strategy_from_str() {
-        assert_eq!("keep-local".parse::<ResolutionStrategy>(), Ok(ResolutionStrategy::KeepLocal));
-        assert_eq!("keep-remote".parse::<ResolutionStrategy>(), Ok(ResolutionStrategy::KeepRemote));
-        assert_eq!("keep-both".parse::<ResolutionStrategy>(), Ok(ResolutionStrategy::KeepBoth));
-        assert_eq!("skip".parse::<ResolutionStrategy>(), Ok(ResolutionStrategy::Skip));
+        assert_eq!(
+            "keep-local".parse::<ResolutionStrategy>(),
+            Ok(ResolutionStrategy::KeepLocal)
+        );
+        assert_eq!(
+            "keep-remote".parse::<ResolutionStrategy>(),
+            Ok(ResolutionStrategy::KeepRemote)
+        );
+        assert_eq!(
+            "keep-both".parse::<ResolutionStrategy>(),
+            Ok(ResolutionStrategy::KeepBoth)
+        );
+        assert_eq!(
+            "skip".parse::<ResolutionStrategy>(),
+            Ok(ResolutionStrategy::Skip)
+        );
     }
 
     #[test]
