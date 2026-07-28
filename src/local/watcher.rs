@@ -245,3 +245,461 @@ impl AsyncFileWatcher {
         self.inner.event_to_change(event)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{ChangeSource, ChangeType};
+    use notify_debouncer_full::notify::event::{
+        CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode,
+    };
+    use notify_debouncer_full::notify::{Event, EventKind};
+    use std::time::Instant;
+
+    // -----------------------------------------------------------------------
+    // Helper: construct a minimal FileWatcher for testing
+    // -----------------------------------------------------------------------
+    fn test_watcher(root: PathBuf) -> FileWatcher {
+        let (_tx, event_rx) = tokio::sync::mpsc::channel(100);
+        FileWatcher {
+            root_dir: root,
+            ignore_matcher: Arc::new(IgnoreMatcher::empty()),
+            event_rx,
+        }
+    }
+
+    fn debounced_event(kind: EventKind, paths: Vec<PathBuf>) -> DebouncedEvent {
+        DebouncedEvent {
+            event: Event {
+                kind,
+                paths,
+                attrs: Default::default(),
+            },
+            time: Instant::now(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // relative_path
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_relative_path_basic() {
+        let root = PathBuf::from("/home/user/sync");
+        let w = test_watcher(root);
+
+        let path = Path::new("/home/user/sync/docs/file.txt");
+        assert_eq!(w.relative_path(path), Some(PathBuf::from("docs/file.txt")));
+    }
+
+    #[test]
+    fn test_relative_path_root_itself() {
+        let root = PathBuf::from("/home/user/sync");
+        let w = test_watcher(root.clone());
+
+        // strip_prefix on the root itself gives an empty path
+        assert_eq!(w.relative_path(&root), Some(PathBuf::from("")));
+    }
+
+    #[test]
+    fn test_relative_path_not_under_root() {
+        let root = PathBuf::from("/home/user/sync");
+        let w = test_watcher(root);
+
+        let path = Path::new("/other/path.txt");
+        assert_eq!(w.relative_path(path), None);
+    }
+
+    #[test]
+    fn test_relative_path_deeply_nested() {
+        let root = PathBuf::from("/a/b");
+        let w = test_watcher(root);
+
+        let path = Path::new("/a/b/c/d/e/f.txt");
+        assert_eq!(w.relative_path(path), Some(PathBuf::from("c/d/e/f.txt")));
+    }
+
+    // -----------------------------------------------------------------------
+    // should_ignore (free function)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_should_ignore_path_under_root_not_matched() {
+        let matcher = IgnoreMatcher::from_content("*.log");
+        let root = Path::new("/root");
+        let path = Path::new("/root/docs/readme.md");
+        assert!(!should_ignore(path, &matcher, root));
+    }
+
+    #[test]
+    fn test_should_ignore_path_matches_pattern() {
+        let matcher = IgnoreMatcher::from_content("*.log");
+        let root = Path::new("/root");
+        let path = Path::new("/root/debug.log");
+        assert!(should_ignore(path, &matcher, root));
+    }
+
+    #[test]
+    fn test_should_ignore_path_outside_root() {
+        let matcher = IgnoreMatcher::empty();
+        let root = Path::new("/root");
+        let path = Path::new("/other/file.txt");
+        assert!(should_ignore(path, &matcher, root));
+    }
+
+    #[test]
+    fn test_should_ignore_dotfile() {
+        let matcher = IgnoreMatcher::empty();
+        let root = Path::new("/root");
+        let path = Path::new("/root/.hidden");
+        assert!(should_ignore(path, &matcher, root));
+    }
+
+    #[test]
+    fn test_should_ignore_dotfile_nested() {
+        let matcher = IgnoreMatcher::empty();
+        let root = Path::new("/root");
+        let path = Path::new("/root/folder/.hidden");
+        assert!(should_ignore(path, &matcher, root));
+    }
+
+    #[test]
+    fn test_should_ignore_sync_ignore_file() {
+        let matcher = IgnoreMatcher::empty();
+        let root = Path::new("/root");
+        let path = Path::new("/root/.sync-ignore");
+        // .sync-ignore is always ignored by the model's should_ignore
+        assert!(should_ignore(path, &matcher, root));
+    }
+
+    #[test]
+    fn test_should_ignore_couchfs_dir() {
+        let matcher = IgnoreMatcher::empty();
+        let root = Path::new("/root");
+        let path = Path::new("/root/some/.couchfs/tmp");
+        assert!(should_ignore(path, &matcher, root));
+    }
+
+    #[test]
+    fn test_should_ignore_regular_file_visible() {
+        let matcher = IgnoreMatcher::empty();
+        let root = Path::new("/root");
+        let path = Path::new("/root/work/file.txt");
+        assert!(!should_ignore(path, &matcher, root));
+    }
+
+    // -----------------------------------------------------------------------
+    // event_to_change
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_event_to_change_created() {
+        let root = PathBuf::from("/root");
+        let w = test_watcher(root);
+
+        let event = WatcherEvent::FileCreated(PathBuf::from("/root/new.txt"));
+        let change = w.event_to_change(event).unwrap();
+        assert_eq!(change.path, "new.txt");
+        assert_eq!(change.change_type, ChangeType::Created);
+        assert_eq!(change.source, ChangeSource::Local);
+    }
+
+    #[test]
+    fn test_event_to_change_modified() {
+        let root = PathBuf::from("/root");
+        let w = test_watcher(root);
+
+        let event = WatcherEvent::FileModified(PathBuf::from("/root/existing.txt"));
+        let change = w.event_to_change(event).unwrap();
+        assert_eq!(change.path, "existing.txt");
+        assert_eq!(change.change_type, ChangeType::Modified);
+        assert_eq!(change.source, ChangeSource::Local);
+    }
+
+    #[test]
+    fn test_event_to_change_deleted() {
+        let root = PathBuf::from("/root");
+        let w = test_watcher(root);
+
+        let event = WatcherEvent::FileDeleted(PathBuf::from("/root/gone.txt"));
+        let change = w.event_to_change(event).unwrap();
+        assert_eq!(change.path, "gone.txt");
+        assert_eq!(change.change_type, ChangeType::Deleted);
+        assert_eq!(change.source, ChangeSource::Local);
+    }
+
+    #[test]
+    fn test_event_to_change_renamed() {
+        let root = PathBuf::from("/root");
+        let w = test_watcher(root);
+
+        let event = WatcherEvent::FileRenamed(
+            PathBuf::from("/root/old.txt"),
+            PathBuf::from("/root/new.txt"),
+        );
+        let change = w.event_to_change(event).unwrap();
+        // Renamed produces a local_created for the destination
+        assert_eq!(change.path, "new.txt");
+        assert_eq!(change.change_type, ChangeType::Created);
+        assert_eq!(change.source, ChangeSource::Local);
+    }
+
+    #[test]
+    fn test_event_to_change_path_outside_root_returns_none() {
+        let root = PathBuf::from("/root");
+        let w = test_watcher(root);
+
+        let event = WatcherEvent::FileCreated(PathBuf::from("/outside/file.txt"));
+        assert!(w.event_to_change(event).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // process_event – Create
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_process_event_create_sends_file_created() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let matcher = IgnoreMatcher::empty();
+        let root = Path::new("/root");
+
+        let event = debounced_event(
+            EventKind::Create(CreateKind::Any),
+            vec![PathBuf::from("/root/new.txt")],
+        );
+
+        process_event(event, &tx, &matcher, root).unwrap();
+
+        let received = rx.try_recv().unwrap();
+        match received {
+            WatcherEvent::FileCreated(path) => assert_eq!(path, PathBuf::from("/root/new.txt")),
+            other => panic!("Expected FileCreated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_process_event_create_ignored_path_skipped() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let matcher = IgnoreMatcher::from_content("*.tmp");
+        let root = Path::new("/root");
+
+        let event = debounced_event(
+            EventKind::Create(CreateKind::Any),
+            vec![PathBuf::from("/root/file.tmp")],
+        );
+
+        process_event(event, &tx, &matcher, root).unwrap();
+
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_process_event_create_path_outside_root_skipped() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let matcher = IgnoreMatcher::empty();
+        let root = Path::new("/root");
+
+        let event = debounced_event(
+            EventKind::Create(CreateKind::Any),
+            vec![PathBuf::from("/outside/file.txt")],
+        );
+
+        process_event(event, &tx, &matcher, root).unwrap();
+
+        assert!(rx.try_recv().is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // process_event – Modify (content change → FileModified)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_process_event_modify_data_sends_file_modified() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let matcher = IgnoreMatcher::empty();
+        let root = Path::new("/root");
+
+        let event = debounced_event(
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            vec![PathBuf::from("/root/file.txt")],
+        );
+
+        process_event(event, &tx, &matcher, root).unwrap();
+
+        let received = rx.try_recv().unwrap();
+        match received {
+            WatcherEvent::FileModified(path) => assert_eq!(path, PathBuf::from("/root/file.txt")),
+            other => panic!("Expected FileModified, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_process_event_modify_any_sends_file_modified() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let matcher = IgnoreMatcher::empty();
+        let root = Path::new("/root");
+
+        let event = debounced_event(
+            EventKind::Modify(ModifyKind::Any),
+            vec![PathBuf::from("/root/file.txt")],
+        );
+
+        process_event(event, &tx, &matcher, root).unwrap();
+
+        let received = rx.try_recv().unwrap();
+        match received {
+            WatcherEvent::FileModified(path) => assert_eq!(path, PathBuf::from("/root/file.txt")),
+            other => panic!("Expected FileModified, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // process_event – Modify / Name (rename variants)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_process_event_rename_from_sends_file_deleted() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let matcher = IgnoreMatcher::empty();
+        let root = Path::new("/root");
+
+        let event = debounced_event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            vec![PathBuf::from("/root/old.txt")],
+        );
+
+        process_event(event, &tx, &matcher, root).unwrap();
+
+        let received = rx.try_recv().unwrap();
+        match received {
+            WatcherEvent::FileDeleted(path) => assert_eq!(path, PathBuf::from("/root/old.txt")),
+            other => panic!("Expected FileDeleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_process_event_rename_to_sends_file_created() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let matcher = IgnoreMatcher::empty();
+        let root = Path::new("/root");
+
+        let event = debounced_event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            vec![PathBuf::from("/root/new.txt")],
+        );
+
+        process_event(event, &tx, &matcher, root).unwrap();
+
+        let received = rx.try_recv().unwrap();
+        match received {
+            WatcherEvent::FileCreated(path) => assert_eq!(path, PathBuf::from("/root/new.txt")),
+            other => panic!("Expected FileCreated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_process_event_rename_both_sends_delete_and_create() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let matcher = IgnoreMatcher::empty();
+        let root = Path::new("/root");
+
+        let event = debounced_event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            vec![
+                PathBuf::from("/root/old.txt"),
+                PathBuf::from("/root/new.txt"),
+            ],
+        );
+
+        process_event(event, &tx, &matcher, root).unwrap();
+
+        // Should emit FileDeleted for the first path and FileCreated for the second
+        let mut deleted = false;
+        let mut created = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                WatcherEvent::FileDeleted(p) => {
+                    assert_eq!(p, PathBuf::from("/root/old.txt"));
+                    deleted = true;
+                }
+                WatcherEvent::FileCreated(p) => {
+                    assert_eq!(p, PathBuf::from("/root/new.txt"));
+                    created = true;
+                }
+                other => panic!("Unexpected event: {other:?}"),
+            }
+        }
+        assert!(deleted, "Expected FileDeleted for old path");
+        assert!(created, "Expected FileCreated for new path");
+    }
+
+    #[test]
+    fn test_process_event_rename_both_single_path_does_nothing() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let matcher = IgnoreMatcher::empty();
+        let root = Path::new("/root");
+
+        // RenameMode::Both with only one path – the code's match arm that
+        // handles RenameMode::Both && paths.len() >= 2 is skipped.
+        let event = debounced_event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            vec![PathBuf::from("/root/only.txt")],
+        );
+
+        process_event(event, &tx, &matcher, root).unwrap();
+
+        assert!(rx.try_recv().is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // process_event – Remove
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_process_event_remove_sends_file_deleted() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let matcher = IgnoreMatcher::empty();
+        let root = Path::new("/root");
+
+        let event = debounced_event(
+            EventKind::Remove(RemoveKind::Any),
+            vec![PathBuf::from("/root/gone.txt")],
+        );
+
+        process_event(event, &tx, &matcher, root).unwrap();
+
+        let received = rx.try_recv().unwrap();
+        match received {
+            WatcherEvent::FileDeleted(path) => assert_eq!(path, PathBuf::from("/root/gone.txt")),
+            other => panic!("Expected FileDeleted, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // process_event – ignored paths in rename variants
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_process_event_rename_from_ignored_path_skipped() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let matcher = IgnoreMatcher::from_content("*.old");
+        let root = Path::new("/root");
+
+        let event = debounced_event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            vec![PathBuf::from("/root/file.old")],
+        );
+
+        process_event(event, &tx, &matcher, root).unwrap();
+
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_process_event_remove_ignored_path_skipped() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let matcher = IgnoreMatcher::from_content("*.swp");
+        let root = Path::new("/root");
+
+        let event = debounced_event(
+            EventKind::Remove(RemoveKind::Any),
+            vec![PathBuf::from("/root/file.swp")],
+        );
+
+        process_event(event, &tx, &matcher, root).unwrap();
+
+        assert!(rx.try_recv().is_err());
+    }
+}
