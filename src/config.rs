@@ -351,7 +351,6 @@ mod tests {
         Some(config_home.join("couchdb-file-sync"))
     }
 
-
     // ---- AppConfig default tests ----
 
     #[test]
@@ -457,7 +456,10 @@ local: /home/user/docs
 "#;
         let sync_path: SyncPath = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(sync_path.local, PathBuf::from("/home/user/docs"));
-        assert_eq!(sync_path.remote, "", "remote should default to empty string");
+        assert_eq!(
+            sync_path.remote, "",
+            "remote should default to empty string"
+        );
     }
 
     #[test]
@@ -478,15 +480,24 @@ local: /home/user/docs
     fn test_app_config_load_returns_defaults_when_no_file() {
         // When no config file is given, load should succeed.
         let result = AppConfig::load(None);
-        assert!(result.is_ok(), "load should succeed without config file: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "load should succeed without config file: {:?}",
+            result.err()
+        );
     }
 
     #[test]
     fn test_app_config_load_with_missing_file_path_fails_gracefully() {
         // The config crate's File::from() requires the file to exist.
         // load() will return an error when given a nonexistent path.
-        let result = AppConfig::load(Some(PathBuf::from("/definitely/does/not/exist/config.yaml")));
-        assert!(result.is_err(), "load with nonexistent file path should return Err");
+        let result = AppConfig::load(Some(PathBuf::from(
+            "/definitely/does/not/exist/config.yaml",
+        )));
+        assert!(
+            result.is_err(),
+            "load with nonexistent file path should return Err"
+        );
         // But calling with None should work (no file, just env)
         let result = AppConfig::load(None);
         assert!(result.is_ok(), "load without file path should succeed");
@@ -505,7 +516,10 @@ local: /home/user/docs
         std::env::remove_var("COUCHDB_FILE_SYNC__LOGGING__LEVEL");
 
         // --- Test 1: Env vars override defaults ---
-        std::env::set_var("COUCHDB_FILE_SYNC__COUCHDB__URL", "https://couch.example.com:6984");
+        std::env::set_var(
+            "COUCHDB_FILE_SYNC__COUCHDB__URL",
+            "https://couch.example.com:6984",
+        );
         std::env::set_var("COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL", "120");
         std::env::set_var("COUCHDB_FILE_SYNC__LOGGING__LEVEL", "debug");
 
@@ -545,13 +559,20 @@ logging:
         assert_eq!(config.sync.poll_interval, 200);
 
         // --- Restore original env vars ---
-        if let Some(v) = old_url { std::env::set_var("COUCHDB_FILE_SYNC__COUCHDB__URL", v); }
-        else { std::env::remove_var("COUCHDB_FILE_SYNC__COUCHDB__URL"); }
-        if let Some(v) = old_interval { std::env::set_var("COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL", v); }
-        else { std::env::remove_var("COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL"); }
-        if let Some(v) = old_log { std::env::set_var("COUCHDB_FILE_SYNC__LOGGING__LEVEL", v); }
-        else { std::env::remove_var("COUCHDB_FILE_SYNC__LOGGING__LEVEL"); }
+        if let Some(v) = old_url {
+            std::env::set_var("COUCHDB_FILE_SYNC__COUCHDB__URL", v);
+        } else {
+            std::env::remove_var("COUCHDB_FILE_SYNC__COUCHDB__URL");
+        }
+        if let Some(v) = old_interval {
+            std::env::set_var("COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL", v);
+        } else {
+            std::env::remove_var("COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL");
+        }
+        if let Some(v) = old_log {
+            std::env::set_var("COUCHDB_FILE_SYNC__LOGGING__LEVEL", v);
+        } else {
+            std::env::remove_var("COUCHDB_FILE_SYNC__LOGGING__LEVEL");
+        }
     }
-
-
 }
