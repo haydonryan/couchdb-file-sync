@@ -229,7 +229,6 @@ mod tests {
         assert_ne!(hash1, hash2, "Hash should change when content changes");
     }
 
-
     // ---- scan_file tests ----
 
     #[test]
@@ -367,7 +366,10 @@ mod tests {
         let scanner = Scanner::new(temp_dir.path().to_path_buf(), IgnoreMatcher::empty());
         let states = scanner.full_scan().unwrap();
 
-        assert!(states.is_empty(), "Empty directory should produce no file states");
+        assert!(
+            states.is_empty(),
+            "Empty directory should produce no file states"
+        );
     }
 
     // ---- scan_single tests ----
@@ -393,7 +395,10 @@ mod tests {
         let scanner = Scanner::new(temp_dir.path().to_path_buf(), IgnoreMatcher::empty());
         let result = scanner.scan_single(Path::new("nonexistent.txt")).unwrap();
 
-        assert!(result.is_none(), "scan_single should return None for missing files");
+        assert!(
+            result.is_none(),
+            "scan_single should return None for missing files"
+        );
     }
 
     #[test]
@@ -405,7 +410,10 @@ mod tests {
         let scanner = Scanner::new(temp_dir.path().to_path_buf(), matcher);
         let result = scanner.scan_single(Path::new("secret.log")).unwrap();
 
-        assert!(result.is_none(), "scan_single should return None for ignored files");
+        assert!(
+            result.is_none(),
+            "scan_single should return None for ignored files"
+        );
     }
 
     #[test]
@@ -416,7 +424,10 @@ mod tests {
         let scanner = Scanner::new(temp_dir.path().to_path_buf(), IgnoreMatcher::empty());
         let result = scanner.scan_single(Path::new(".hidden")).unwrap();
 
-        assert!(result.is_none(), "scan_single should return None for dotfiles");
+        assert!(
+            result.is_none(),
+            "scan_single should return None for dotfiles"
+        );
     }
 
     #[test]
@@ -427,7 +438,10 @@ mod tests {
         let scanner = Scanner::new(temp_dir.path().to_path_buf(), IgnoreMatcher::empty());
         let result = scanner.scan_single(Path::new("adir")).unwrap();
 
-        assert!(result.is_none(), "scan_single should return None for directories");
+        assert!(
+            result.is_none(),
+            "scan_single should return None for directories"
+        );
     }
 
     // ---- detect_changes tests ----
@@ -437,12 +451,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let scanner = Scanner::new(temp_dir.path().to_path_buf(), IgnoreMatcher::empty());
 
-        let state = FileState::new(
-            "file.txt".to_string(),
-            "abc".to_string(),
-            10,
-            Utc::now(),
-        );
+        let state = FileState::new("file.txt".to_string(), "abc".to_string(), 10, Utc::now());
 
         let current = vec![state.clone()];
         let stored = vec![state];
@@ -532,7 +541,12 @@ mod tests {
         ];
         let current = vec![
             FileState::new("keep.txt".to_string(), "h1".to_string(), 1, Utc::now()),
-            FileState::new("modify.txt".to_string(), "h2_new".to_string(), 22, Utc::now()),
+            FileState::new(
+                "modify.txt".to_string(),
+                "h2_new".to_string(),
+                22,
+                Utc::now(),
+            ),
             FileState::new("create.txt".to_string(), "h4".to_string(), 4, Utc::now()),
         ];
 
@@ -543,5 +557,4 @@ mod tests {
         assert!(change_paths.contains(&"modify.txt"));
         assert!(change_paths.contains(&"delete.txt"));
     }
-
 }
