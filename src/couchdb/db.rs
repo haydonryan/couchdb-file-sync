@@ -1,4 +1,4 @@
-use crate::models::{Change, ChunkDoc, FileDoc, RemoteState};
+use crate::models::{Change, ChunkDoc, DatabaseName, FileDoc, RemotePath, RemoteState};
 use anyhow::Result;
 use couch_rs::database::Database;
 use couch_rs::Client;
@@ -14,10 +14,10 @@ pub struct CouchDb {
     db: Database,
     http_client: HttpClient,
     base_db_url: String,
-    db_name: String,
+    db_name: DatabaseName,
     auth: Option<(String, String)>,
     /// Remote path prefix to sync (e.g., "notes/" or "obsidian/")
-    remote_path: String,
+    remote_path: RemotePath,
 }
 
 /// Entry from a CouchDB changes feed
@@ -70,17 +70,6 @@ impl CouchDb {
             _ => None,
         };
 
-        // Normalize remote path - ensure it ends with / if not empty
-        let remote_path = if remote_path.is_empty() || remote_path == "/" {
-            String::new()
-        } else {
-            let mut path = remote_path.to_string();
-            if !path.ends_with('/') {
-                path.push('/');
-            }
-            path
-        };
-
         let base = url.trim_end_matches('/');
         let base_db_url = if base.ends_with(&format!("/{}", db_name)) {
             base.to_string()
@@ -93,9 +82,9 @@ impl CouchDb {
             db,
             http_client: HttpClient::new(),
             base_db_url,
-            db_name: db_name.to_string(),
+            db_name: DatabaseName::new(db_name.to_string()),
             auth,
-            remote_path,
+            remote_path: RemotePath::new(remote_path.to_string()),
         })
     }
 
@@ -109,15 +98,7 @@ impl CouchDb {
     /// Panics if any method requiring actual CouchDB access is called.
     #[cfg(test)]
     pub fn for_test(remote_path: &str) -> Self {
-        let remote_path = if remote_path.is_empty() || remote_path == "/" {
-            String::new()
-        } else {
-            let mut path = remote_path.to_string();
-            if !path.ends_with('/') {
-                path.push('/');
-            }
-            path
-        };
+        let remote_path = RemotePath::new(remote_path);
         // Create a client and database handle without connecting.
         // `Database::new` and `Client::new_no_auth` are purely structural;
         // actual HTTP requests will fail at runtime.
@@ -129,9 +110,9 @@ impl CouchDb {
             db,
             http_client: reqwest::Client::new(),
             base_db_url: "http://localhost:1/unittest".to_string(),
-            db_name: "unittest".to_string(),
+            db_name: DatabaseName::new("unittest"),
             auth: None,
-            remote_path,
+            remote_path: RemotePath::new(remote_path.to_string()),
         }
     }
 
@@ -205,7 +186,8 @@ impl CouchDb {
         if self.remote_path.is_empty() {
             true
         } else {
-            path.starts_with(&self.remote_path) || path == self.remote_path.trim_end_matches('/')
+            path.starts_with(self.remote_path.as_str())
+                || path == self.remote_path.as_str().trim_end_matches('/')
         }
     }
 
@@ -231,7 +213,7 @@ impl CouchDb {
         } else {
             // Strip the remote path prefix
             remote_path
-                .strip_prefix(&self.remote_path)
+                .strip_prefix(self.remote_path.as_str())
                 .unwrap_or(remote_path)
                 .to_string()
         }
@@ -556,9 +538,9 @@ mod tests {
             db,
             http_client: HttpClient::new(),
             base_db_url: "http://localhost:15984/test_db".to_string(),
-            db_name: "test_db".to_string(),
+            db_name: DatabaseName::new("test_db"),
             auth: None,
-            remote_path: remote_path.to_string(),
+            remote_path: RemotePath::new(remote_path.to_string()),
         }
     }
 

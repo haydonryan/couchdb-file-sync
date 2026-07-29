@@ -1,8 +1,8 @@
 use crate::couchdb::CouchDb;
 use crate::local::{compute_bytes_hash, compute_file_hash, LocalDb, Scanner};
 use crate::models::{
-    Change, ChangeType, Conflict, CouchRev, FileState, IgnoreMatcher, RemoteState,
-    ResolutionStrategy, SyncDirPath,
+    Change, ChangeType, Checkpoint, Conflict, CouchRev, DownloadCount, FileState, IgnoreMatcher,
+    RemoteState, ResolutionStrategy, SyncDirPath, UploadCount,
 };
 use crate::sync::triage;
 use anyhow::Result;
@@ -21,8 +21,8 @@ pub struct SyncEngine {
 /// Report from a sync operation
 #[derive(Debug, Clone, Default)]
 pub struct SyncReport {
-    pub uploaded: usize,
-    pub downloaded: usize,
+    pub uploaded: UploadCount,
+    pub downloaded: DownloadCount,
     pub deleted_local: usize,
     pub deleted_remote: usize,
     pub conflicts: usize,
@@ -109,7 +109,7 @@ impl SyncEngine {
                         report.deleted_remote += 1;
                         self.local_db.delete_file_state(change.path())?;
                     } else {
-                        report.uploaded += 1;
+                        report.uploaded.0 += 1;
                     }
                 }
                 Err(e) => {
@@ -137,7 +137,7 @@ impl SyncEngine {
                     if matches!(change.change_type(), ChangeType::Deleted) {
                         report.deleted_local += 1;
                     } else {
-                        report.downloaded += 1;
+                        report.downloaded.0 += 1;
                     }
                 }
                 Err(e) => {
@@ -177,7 +177,7 @@ impl SyncEngine {
         for local_path in uploads {
             let remote_path = self.couchdb.get_remote_path(&local_path);
             self.upload_local_file(&local_path, &remote_path).await?;
-            report.uploaded += 1;
+            report.uploaded.0 += 1;
         }
 
         for remote_path in remote_deletes {
@@ -222,7 +222,7 @@ impl SyncEngine {
                 .await?
                 .is_some()
             {
-                report.downloaded += 1;
+                report.downloaded.0 += 1;
             }
         }
 
@@ -311,7 +311,7 @@ impl SyncEngine {
     /// Fetch remote changes from CouchDB
     async fn fetch_remote_changes(&self) -> Result<(Vec<Change>, String)> {
         let checkpoint = self.local_db.get_checkpoint()?;
-        let since = checkpoint.map(|(seq, _)| seq);
+        let since = checkpoint.map(|cp| cp.last_seq);
 
         self.couchdb.get_changes(since.as_deref()).await
     }
@@ -820,7 +820,7 @@ impl SyncEngine {
     }
 
     /// Get sync checkpoint
-    pub fn get_checkpoint(&self) -> Result<Option<(String, chrono::DateTime<chrono::Utc>)>> {
+    pub fn get_checkpoint(&self) -> Result<Option<Checkpoint>> {
         self.local_db.get_checkpoint()
     }
 
@@ -1011,7 +1011,7 @@ mod tests {
         // Read it back
         let cp = engine.get_checkpoint().unwrap();
         assert!(cp.is_some());
-        assert_eq!(cp.unwrap().0, "123-abc");
+        assert_eq!(cp.unwrap().last_seq, "123-abc");
     }
 
     #[test]
