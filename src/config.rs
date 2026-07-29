@@ -99,13 +99,136 @@ fn default_user_config_candidates() -> Vec<PathBuf> {
     paths
 }
 
+// ─── Enums ─────────────────────────────────────────────────────────────────
+
+/// Log level enum replacing arbitrary String
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    /// Return the tracing-compatible filter string
+    pub fn as_filter_str(&self) -> &'static str {
+        match self {
+            LogLevel::Trace => "trace",
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Error => "error",
+        }
+    }
+}
+
+/// Log format enum replacing arbitrary String
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    #[default]
+    Pretty,
+    Json,
+    Compact,
+}
+
+/// Conflict resolution strategy enum replacing arbitrary String
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConflictStrategy {
+    #[default]
+    KeepBoth,
+    KeepLocal,
+    KeepRemote,
+    Skip,
+}
+
+impl ConflictStrategy {
+    /// Return the serialized form (matches serde rename)
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConflictStrategy::KeepBoth => "keep-both",
+            ConflictStrategy::KeepLocal => "keep-local",
+            ConflictStrategy::KeepRemote => "keep-remote",
+            ConflictStrategy::Skip => "skip",
+        }
+    }
+}
+
+/// Matrix message type enum replacing arbitrary String
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum MatrixMessageType {
+    #[default]
+    #[serde(rename = "m.notice")]
+    Notice,
+    #[serde(rename = "m.text")]
+    Text,
+    #[serde(rename = "m.emote")]
+    Emote,
+}
+
+impl MatrixMessageType {
+    /// Return the Matrix wire format string
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MatrixMessageType::Notice => "m.notice",
+            MatrixMessageType::Text => "m.text",
+            MatrixMessageType::Emote => "m.emote",
+        }
+    }
+}
+
+/// Rotation config combining mode and policy into a single enum
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RotationConfig {
+    /// No log rotation
+    #[default]
+    Never,
+    /// Rotate daily and keep old files
+    DailyKeep,
+    /// Rotate daily and delete old files after one cycle
+    DailyDelete,
+}
+
+// ─── Credential structs ────────────────────────────────────────────────────
+
+/// Unified Telegram credentials
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramCredentials {
+    pub bot_token: String,
+    pub chat_id: String,
+}
+
+/// Unified Matrix credentials
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatrixCredentials {
+    pub homeserver_url: String,
+    pub access_token: String,
+    pub room_id: String,
+}
+
+/// Unified CouchDB authentication
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CouchDbAuth {
+    pub username: String,
+    pub password: String,
+}
+
+// ─── Config structs ────────────────────────────────────────────────────────
+
 /// CouchDB connection configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CouchDbConfig {
     #[serde(default = "default_db_url")]
     pub url: String,
-    pub username: Option<String>,
-    pub password: Option<String>,
+    #[serde(default)]
+    pub auth: Option<CouchDbAuth>,
     #[serde(default = "default_db_name")]
     pub database: String,
     /// Remote path to sync (e.g., "notes/" or "obsidian/"). Empty means sync all.
@@ -121,8 +244,7 @@ impl Default for CouchDbConfig {
     fn default() -> Self {
         Self {
             url: default_db_url(),
-            username: None,
-            password: None,
+            auth: None,
             database: default_db_name(),
             remote_path: String::new(),
             timeout_seconds: default_timeout(),
@@ -171,29 +293,18 @@ pub struct IgnoreConfig {
 }
 
 /// Conflict resolution configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ConflictConfig {
-    #[serde(default = "default_conflict_strategy")]
-    pub default_strategy: String,
+    #[serde(default)]
+    pub default_strategy: ConflictStrategy,
     #[serde(default)]
     pub auto_resolve: bool,
     pub conflict_dir: Option<PathBuf>,
 }
 
-impl Default for ConflictConfig {
-    fn default() -> Self {
-        Self {
-            default_strategy: default_conflict_strategy(),
-            auto_resolve: false,
-            conflict_dir: None,
-        }
-    }
-}
-
 /// Notification configuration
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct NotificationConfig {
-    pub enabled: bool,
     #[serde(default)]
     pub telegram: TelegramConfig,
     #[serde(default)]
@@ -202,59 +313,37 @@ pub struct NotificationConfig {
     pub notify_on_conflict: bool,
     #[serde(default)]
     pub notify_on_sync_error: bool,
-    #[serde(default)]
-    pub notify_summary: bool,
 }
 
 /// Telegram notification configuration
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TelegramConfig {
-    pub bot_token: Option<String>,
-    pub chat_id: Option<String>,
+    #[serde(default)]
+    pub credentials: Option<TelegramCredentials>,
 }
 
 /// Matrix notification configuration
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct MatrixConfig {
-    pub homeserver_url: Option<String>,
-    pub access_token: Option<String>,
-    pub room_id: Option<String>,
-    #[serde(default = "default_matrix_message_type")]
-    pub message_type: String,
+    #[serde(default)]
+    pub credentials: Option<MatrixCredentials>,
+    #[serde(default)]
+    pub message_type: MatrixMessageType,
 }
 
 /// Logging configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct LoggingConfig {
-    #[serde(default = "default_log_level")]
-    pub level: String,
-    #[serde(default = "default_log_format")]
-    pub format: String,
+    #[serde(default)]
+    pub level: LogLevel,
+    #[serde(default)]
+    pub format: LogFormat,
     pub file: Option<PathBuf>,
     #[serde(default)]
-    pub rotated_logs: RotatedLogPolicy,
+    pub rotation: RotationConfig,
 }
 
-impl Default for LoggingConfig {
-    fn default() -> Self {
-        Self {
-            level: default_log_level(),
-            format: default_log_format(),
-            file: None,
-            rotated_logs: RotatedLogPolicy::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum RotatedLogPolicy {
-    Keep,
-    #[default]
-    Delete,
-}
-
-// Default value functions
+// Default value functions (kept for backward compat with serde defaults)
 fn default_db_url() -> String {
     "http://localhost:5984".to_string()
 }
@@ -287,27 +376,12 @@ fn default_max_file_size() -> u64 {
     1024 * 1024 * 1024 // 1GB
 }
 
-fn default_matrix_message_type() -> String {
-    "m.notice".to_string()
-}
 fn default_parallel() -> bool {
     true
 }
 
 fn default_max_parallel() -> usize {
     4
-}
-
-fn default_conflict_strategy() -> String {
-    "keep-both".to_string()
-}
-
-fn default_log_level() -> String {
-    "info".to_string()
-}
-
-fn default_log_format() -> String {
-    "pretty".to_string()
 }
 
 #[cfg(test)]
@@ -351,6 +425,132 @@ mod tests {
         Some(config_home.join("couchdb-file-sync"))
     }
 
+    // ---- Enum tests ----
+
+    #[test]
+    fn test_log_level_default() {
+        assert_eq!(LogLevel::default(), LogLevel::Info);
+    }
+
+    #[test]
+    fn test_log_level_filter_str() {
+        assert_eq!(LogLevel::Trace.as_filter_str(), "trace");
+        assert_eq!(LogLevel::Debug.as_filter_str(), "debug");
+        assert_eq!(LogLevel::Info.as_filter_str(), "info");
+        assert_eq!(LogLevel::Warn.as_filter_str(), "warn");
+        assert_eq!(LogLevel::Error.as_filter_str(), "error");
+    }
+
+    #[test]
+    fn test_log_format_default() {
+        assert_eq!(LogFormat::default(), LogFormat::Pretty);
+    }
+
+    #[test]
+    fn test_conflict_strategy_default() {
+        assert_eq!(ConflictStrategy::default(), ConflictStrategy::KeepBoth);
+    }
+
+    #[test]
+    fn test_conflict_strategy_as_str() {
+        assert_eq!(ConflictStrategy::KeepBoth.as_str(), "keep-both");
+        assert_eq!(ConflictStrategy::KeepLocal.as_str(), "keep-local");
+        assert_eq!(ConflictStrategy::KeepRemote.as_str(), "keep-remote");
+        assert_eq!(ConflictStrategy::Skip.as_str(), "skip");
+    }
+
+    #[test]
+    fn test_matrix_message_type_default() {
+        assert_eq!(MatrixMessageType::default(), MatrixMessageType::Notice);
+    }
+
+    #[test]
+    fn test_matrix_message_type_as_str() {
+        assert_eq!(MatrixMessageType::Notice.as_str(), "m.notice");
+        assert_eq!(MatrixMessageType::Text.as_str(), "m.text");
+        assert_eq!(MatrixMessageType::Emote.as_str(), "m.emote");
+    }
+
+    #[test]
+    fn test_rotation_config_default() {
+        assert_eq!(RotationConfig::default(), RotationConfig::Never);
+    }
+
+    #[test]
+    fn test_rotation_config_serde_round_trip() {
+        let variants = [
+            RotationConfig::Never,
+            RotationConfig::DailyKeep,
+            RotationConfig::DailyDelete,
+        ];
+        for variant in &variants {
+            let yaml = serde_yaml::to_string(variant).unwrap();
+            let deserialized: RotationConfig = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(*variant, deserialized);
+        }
+    }
+
+    #[test]
+    fn test_log_level_serde_lowercase() {
+        let yaml = "debug\n";
+        let level: LogLevel = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(level, LogLevel::Debug);
+    }
+
+    #[test]
+    fn test_conflict_strategy_serde_kebab() {
+        let yaml = "keep-local\n";
+        let strategy: ConflictStrategy = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(strategy, ConflictStrategy::KeepLocal);
+    }
+
+    #[test]
+    fn test_matrix_message_type_serde() {
+        let yaml = "m.text\n";
+        let msg_type: MatrixMessageType = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(msg_type, MatrixMessageType::Text);
+    }
+
+    // ---- Credential struct tests ----
+
+    #[test]
+    fn test_telegram_credentials() {
+        let creds = TelegramCredentials {
+            bot_token: "123:abc".into(),
+            chat_id: "-456".into(),
+        };
+        let yaml = serde_yaml::to_string(&creds).unwrap();
+        let deserialized: TelegramCredentials = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(deserialized.bot_token, "123:abc");
+        assert_eq!(deserialized.chat_id, "-456");
+    }
+
+    #[test]
+    fn test_matrix_credentials() {
+        let creds = MatrixCredentials {
+            homeserver_url: "https://matrix.example.com".into(),
+            access_token: "syt_token".into(),
+            room_id: "!room:example.com".into(),
+        };
+        let yaml = serde_yaml::to_string(&creds).unwrap();
+        let deserialized: MatrixCredentials = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(deserialized.homeserver_url, "https://matrix.example.com");
+        assert_eq!(deserialized.access_token, "syt_token");
+        assert_eq!(deserialized.room_id, "!room:example.com");
+    }
+
+    #[test]
+    fn test_couchdb_auth() {
+        let auth = CouchDbAuth {
+            username: "admin".into(),
+            password: "secret".into(),
+        };
+        let yaml = serde_yaml::to_string(&auth).unwrap();
+        let deserialized: CouchDbAuth = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(deserialized.username, "admin");
+        assert_eq!(deserialized.password, "secret");
+    }
+
     // ---- AppConfig default tests ----
 
     #[test]
@@ -362,8 +562,7 @@ mod tests {
         assert_eq!(config.couchdb.database, "couchdb_file_sync_files");
         assert_eq!(config.couchdb.timeout_seconds, 30);
         assert_eq!(config.couchdb.retry_attempts, 3);
-        assert!(config.couchdb.username.is_none());
-        assert!(config.couchdb.password.is_none());
+        assert!(config.couchdb.auth.is_none());
         assert_eq!(config.couchdb.remote_path, "");
 
         // Sync defaults
@@ -381,21 +580,24 @@ mod tests {
         assert!(config.ignore.ignore_files.is_empty());
 
         // Conflict defaults
-        assert_eq!(config.conflicts.default_strategy, "keep-both");
+        assert_eq!(
+            config.conflicts.default_strategy,
+            ConflictStrategy::KeepBoth
+        );
         assert!(!config.conflicts.auto_resolve);
         assert!(config.conflicts.conflict_dir.is_none());
 
         // Logging defaults
-        assert_eq!(config.logging.level, "info");
-        assert_eq!(config.logging.format, "pretty");
+        assert_eq!(config.logging.level, LogLevel::Info);
+        assert_eq!(config.logging.format, LogFormat::Pretty);
         assert!(config.logging.file.is_none());
-        assert_eq!(config.logging.rotated_logs, RotatedLogPolicy::Delete);
+        assert_eq!(config.logging.rotation, RotationConfig::Never);
 
         // Notifications defaults
-        assert!(!config.notifications.enabled);
+        assert!(config.notifications.telegram.credentials.is_none());
+        assert!(config.notifications.matrix.credentials.is_none());
         assert!(!config.notifications.notify_on_conflict);
         assert!(!config.notifications.notify_on_sync_error);
-        assert!(!config.notifications.notify_summary);
     }
 
     #[test]
@@ -422,7 +624,7 @@ mod tests {
     #[test]
     fn test_conflict_config_default() {
         let conflict = ConflictConfig::default();
-        assert_eq!(conflict.default_strategy, "keep-both");
+        assert_eq!(conflict.default_strategy, ConflictStrategy::KeepBoth);
         assert!(!conflict.auto_resolve);
         assert!(conflict.conflict_dir.is_none());
     }
@@ -430,10 +632,10 @@ mod tests {
     #[test]
     fn test_logging_config_default() {
         let log = LoggingConfig::default();
-        assert_eq!(log.level, "info");
-        assert_eq!(log.format, "pretty");
+        assert_eq!(log.level, LogLevel::Info);
+        assert_eq!(log.format, LogFormat::Pretty);
         assert!(log.file.is_none());
-        assert_eq!(log.rotated_logs, RotatedLogPolicy::Delete);
+        assert_eq!(log.rotation, RotationConfig::Never);
     }
 
     // ---- SyncPath tests ----
@@ -526,7 +728,7 @@ local: /home/user/docs
         let config = AppConfig::load(None).unwrap();
         assert_eq!(config.couchdb.url, "https://couch.example.com:6984");
         assert_eq!(config.sync.poll_interval, 120);
-        assert_eq!(config.logging.level, "debug");
+        assert_eq!(config.logging.level, LogLevel::Debug);
 
         // --- Test 2: Env var overrides config file ---
         let temp_dir = TempDir::new().unwrap();
@@ -553,7 +755,7 @@ logging:
         // File value should be present for non-overridden keys
         assert_eq!(config.couchdb.url, "https://couch.example.com:6984");
         assert_eq!(config.couchdb.database, "from_file");
-        assert_eq!(config.logging.level, "debug");
+        assert_eq!(config.logging.level, LogLevel::Debug);
 
         // Env overrides file for poll_interval
         assert_eq!(config.sync.poll_interval, 200);
@@ -574,5 +776,91 @@ logging:
         } else {
             std::env::remove_var("COUCHDB_FILE_SYNC__LOGGING__LEVEL");
         }
+    }
+
+    // ---- CouchDB auth deserialization ----
+
+    #[test]
+    fn test_couchdb_config_with_auth() {
+        let yaml = r#"
+url: "https://couch.example.com:6984"
+auth:
+  username: admin
+  password: secret
+database: my_db
+"#;
+        let config: CouchDbConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.url, "https://couch.example.com:6984");
+        assert!(config.auth.is_some());
+        let auth = config.auth.unwrap();
+        assert_eq!(auth.username, "admin");
+        assert_eq!(auth.password, "secret");
+        assert_eq!(config.database, "my_db");
+    }
+
+    #[test]
+    fn test_couchdb_config_without_auth() {
+        let yaml = r#"
+url: "https://couch.example.com:6984"
+database: my_db
+"#;
+        let config: CouchDbConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.url, "https://couch.example.com:6984");
+        assert!(config.auth.is_none());
+        assert_eq!(config.database, "my_db");
+    }
+
+    // ---- Telegram config deserialization ----
+
+    #[test]
+    fn test_telegram_config_with_credentials() {
+        let yaml = r#"
+credentials:
+  bot_token: "123:abc"
+  chat_id: "-456"
+"#;
+        let config: TelegramConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.credentials.is_some());
+        let creds = config.credentials.unwrap();
+        assert_eq!(creds.bot_token, "123:abc");
+        assert_eq!(creds.chat_id, "-456");
+    }
+
+    #[test]
+    fn test_telegram_config_without_credentials() {
+        let config = TelegramConfig::default();
+        assert!(config.credentials.is_none());
+    }
+
+    // ---- Matrix config deserialization ----
+
+    #[test]
+    fn test_matrix_config_with_credentials() {
+        let yaml = r#"
+credentials:
+  homeserver_url: "https://matrix.example.com"
+  access_token: "syt_token"
+  room_id: "!room:example.com"
+message_type: "m.text"
+"#;
+        let config: MatrixConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.credentials.is_some());
+        let creds = config.credentials.unwrap();
+        assert_eq!(creds.homeserver_url, "https://matrix.example.com");
+        assert_eq!(creds.access_token, "syt_token");
+        assert_eq!(creds.room_id, "!room:example.com");
+        assert_eq!(config.message_type, MatrixMessageType::Text);
+    }
+
+    #[test]
+    fn test_matrix_config_default_message_type() {
+        let yaml = r#"
+credentials:
+  homeserver_url: "https://matrix.example.com"
+  access_token: "syt_token"
+  room_id: "!room:example.com"
+"#;
+        let config: MatrixConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.message_type, MatrixMessageType::Notice);
     }
 }

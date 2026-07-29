@@ -5,7 +5,7 @@ use tracing::info;
 
 use couchdb_file_sync::cli;
 use couchdb_file_sync::config::{default_log_file, default_user_config_file, AppConfig, SyncPath};
-use couchdb_file_sync::logging::{AppLogWriter, RotationMode};
+use couchdb_file_sync::logging::AppLogWriter;
 
 #[derive(Parser, Debug)]
 #[command(name = "couchdb-file-sync")]
@@ -153,11 +153,21 @@ async fn main() -> Result<()> {
     if let Some(url) = cli.db_url {
         config.couchdb.url = url;
     }
-    if let Some(user) = cli.db_user {
-        config.couchdb.username = Some(user);
-    }
-    if let Some(pass) = cli.db_pass {
-        config.couchdb.password = Some(pass);
+    if let (Some(username), Some(password)) = (cli.db_user.as_ref(), cli.db_pass.as_ref()) {
+        config.couchdb.auth = Some(couchdb_file_sync::config::CouchDbAuth {
+            username: username.clone(),
+            password: password.clone(),
+        });
+    } else if let Some(user) = cli.db_user.as_ref() {
+        config.couchdb.auth = Some(couchdb_file_sync::config::CouchDbAuth {
+            username: user.clone(),
+            password: String::new(),
+        });
+    } else if let Some(pass) = cli.db_pass.as_ref() {
+        config.couchdb.auth = Some(couchdb_file_sync::config::CouchDbAuth {
+            username: String::new(),
+            password: pass.clone(),
+        });
     }
     if let Some(name) = cli.db_name {
         config.couchdb.database = name;
@@ -408,12 +418,14 @@ fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daem
     let filter = if std::env::var("RUST_LOG").is_ok() {
         EnvFilter::from_default_env()
     } else {
-        let level = match verbose {
-            0 => "info",
-            1 => "debug",
-            _ => "trace",
+        let level = if verbose >= 2 {
+            couchdb_file_sync::config::LogLevel::Trace
+        } else if verbose >= 1 {
+            couchdb_file_sync::config::LogLevel::Debug
+        } else {
+            config.logging.level
         };
-        EnvFilter::new(format!("couchdb_file_sync={}", level))
+        EnvFilter::new(format!("couchdb_file_sync={}", level.as_filter_str()))
     };
 
     let stdout_layer = tracing_subscriber::fmt::layer().with_filter(filter);
@@ -426,11 +438,11 @@ fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daem
             .or_else(default_log_file)
             .unwrap_or_else(|| std::path::PathBuf::from("couchdb-file-sync.log"));
         let rotation = if daemon_mode {
-            RotationMode::Daily
+            couchdb_file_sync::config::RotationConfig::DailyKeep
         } else {
-            RotationMode::Never
+            couchdb_file_sync::config::RotationConfig::Never
         };
-        let log_writer = AppLogWriter::new(log_path.clone(), rotation, config.logging.rotated_logs);
+        let log_writer = AppLogWriter::new(log_path.clone(), rotation);
         let (non_blocking, guard) = match log_writer {
             Ok(writer) => tracing_appender::non_blocking(writer),
             Err(err) => {

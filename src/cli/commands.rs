@@ -407,8 +407,8 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
     // Connect to CouchDB
     let couchdb = CouchDb::new(
         &config.couchdb.url,
-        config.couchdb.username.as_deref(),
-        config.couchdb.password.as_deref(),
+        config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
+        config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
         &config.couchdb.database,
         &config.couchdb.remote_path,
     )
@@ -450,8 +450,8 @@ pub async fn rebuild_remote(path: PathBuf, config: AppConfig) -> Result<SyncRepo
     let local_db = LocalDb::open(&db_path)?;
     let couchdb = CouchDb::new(
         &config.couchdb.url,
-        config.couchdb.username.as_deref(),
-        config.couchdb.password.as_deref(),
+        config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
+        config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
         &config.couchdb.database,
         &config.couchdb.remote_path,
     )
@@ -473,8 +473,8 @@ pub async fn rebuild_local(path: PathBuf, config: AppConfig) -> Result<SyncRepor
     let local_db = LocalDb::open(&db_path)?;
     let couchdb = CouchDb::new(
         &config.couchdb.url,
-        config.couchdb.username.as_deref(),
-        config.couchdb.password.as_deref(),
+        config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
+        config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
         &config.couchdb.database,
         &config.couchdb.remote_path,
     )
@@ -497,12 +497,9 @@ async fn notify_conflicts_telegram(
     mut session_notified: Option<&mut HashSet<String>>,
 ) {
     // Check if Telegram is configured
-    let (bot_token, chat_id) = match (
-        &config.notifications.telegram.bot_token,
-        &config.notifications.telegram.chat_id,
-    ) {
-        (Some(token), Some(id)) if !token.is_empty() && !id.is_empty() => {
-            (token.clone(), id.clone())
+    let (bot_token, chat_id) = match &config.notifications.telegram.credentials {
+        Some(creds) if !creds.bot_token.is_empty() && !creds.chat_id.is_empty() => {
+            (creds.bot_token.clone(), creds.chat_id.clone())
         }
         _ => {
             info!("Telegram not configured, skipping conflict notifications");
@@ -580,16 +577,13 @@ async fn notify_conflicts_telegram(
 }
 
 fn telegram_error_notifier(config: &AppConfig) -> Option<TelegramNotifier> {
-    if !config.notifications.enabled || !config.notifications.notify_on_sync_error {
+    if !config.notifications.notify_on_sync_error {
         return None;
     }
 
-    let (bot_token, chat_id) = match (
-        &config.notifications.telegram.bot_token,
-        &config.notifications.telegram.chat_id,
-    ) {
-        (Some(token), Some(id)) if !token.is_empty() && !id.is_empty() => {
-            (token.clone(), id.clone())
+    let (bot_token, chat_id) = match &config.notifications.telegram.credentials {
+        Some(creds) if !creds.bot_token.is_empty() && !creds.chat_id.is_empty() => {
+            (creds.bot_token.clone(), creds.chat_id.clone())
         }
         _ => {
             info!("Telegram not configured, skipping error notifications");
@@ -637,19 +631,21 @@ async fn notify_sync_error_telegram(
 
 /// Matrix notifier helper for error notifications
 fn matrix_error_notifier(config: &AppConfig) -> Option<MatrixNotifier> {
-    if !config.notifications.enabled || !config.notifications.notify_on_sync_error {
+    if !config.notifications.notify_on_sync_error {
         return None;
     }
 
-    let (homeserver_url, access_token, room_id) = match (
-        &config.notifications.matrix.homeserver_url,
-        &config.notifications.matrix.access_token,
-        &config.notifications.matrix.room_id,
-    ) {
-        (Some(url), Some(token), Some(room))
-            if !url.is_empty() && !token.is_empty() && !room.is_empty() =>
+    let (homeserver_url, access_token, room_id) = match &config.notifications.matrix.credentials {
+        Some(c)
+            if !c.homeserver_url.is_empty()
+                && !c.access_token.is_empty()
+                && !c.room_id.is_empty() =>
         {
-            (url.clone(), token.clone(), room.clone())
+            (
+                c.homeserver_url.clone(),
+                c.access_token.clone(),
+                c.room_id.clone(),
+            )
         }
         _ => {
             info!("Matrix not configured, skipping error notifications");
@@ -661,7 +657,12 @@ fn matrix_error_notifier(config: &AppConfig) -> Option<MatrixNotifier> {
         homeserver_url,
         access_token,
         room_id,
-        config.notifications.matrix.message_type.clone(),
+        config
+            .notifications
+            .matrix
+            .message_type
+            .as_str()
+            .to_string(),
     ))
 }
 
@@ -675,15 +676,17 @@ async fn notify_conflicts_matrix(
     mut session_notified: Option<&mut HashSet<String>>,
 ) {
     // Check if Matrix is configured
-    let (homeserver_url, access_token, room_id) = match (
-        &config.notifications.matrix.homeserver_url,
-        &config.notifications.matrix.access_token,
-        &config.notifications.matrix.room_id,
-    ) {
-        (Some(url), Some(token), Some(room))
-            if !url.is_empty() && !token.is_empty() && !room.is_empty() =>
+    let (homeserver_url, access_token, room_id) = match &config.notifications.matrix.credentials {
+        Some(c)
+            if !c.homeserver_url.is_empty()
+                && !c.access_token.is_empty()
+                && !c.room_id.is_empty() =>
         {
-            (url.clone(), token.clone(), room.clone())
+            (
+                c.homeserver_url.clone(),
+                c.access_token.clone(),
+                c.room_id.clone(),
+            )
         }
         _ => {
             info!("Matrix not configured, skipping conflict notifications");
@@ -704,7 +707,12 @@ async fn notify_conflicts_matrix(
         homeserver_url,
         access_token,
         room_id,
-        config.notifications.matrix.message_type.clone(),
+        config
+            .notifications
+            .matrix
+            .message_type
+            .as_str()
+            .to_string(),
     );
     let sync_dir_str = sync_dir.display().to_string();
 
@@ -899,8 +907,8 @@ async fn daemon_sync(
     // Connect to CouchDB
     let couchdb = CouchDb::new(
         &config.couchdb.url,
-        config.couchdb.username.as_deref(),
-        config.couchdb.password.as_deref(),
+        config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
+        config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
         &config.couchdb.database,
         &config.couchdb.remote_path,
     )
@@ -971,8 +979,8 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
 
     let couchdb = CouchDb::new(
         &config.couchdb.url,
-        config.couchdb.username.as_deref(),
-        config.couchdb.password.as_deref(),
+        config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
+        config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
         &config.couchdb.database,
         &config.couchdb.remote_path,
     )
@@ -1107,8 +1115,8 @@ async fn run_remote_changes(
 ) -> Result<()> {
     let couchdb = CouchDb::new(
         &config.couchdb.url,
-        config.couchdb.username.as_deref(),
-        config.couchdb.password.as_deref(),
+        config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
+        config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
         &config.couchdb.database,
         &config.couchdb.remote_path,
     )
@@ -1305,8 +1313,8 @@ pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
 
     let couchdb = CouchDb::new(
         &config.couchdb.url,
-        config.couchdb.username.as_deref(),
-        config.couchdb.password.as_deref(),
+        config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
+        config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
         &config.couchdb.database,
         &config.couchdb.remote_path,
     )

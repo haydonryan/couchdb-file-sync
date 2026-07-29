@@ -4,8 +4,10 @@
 # CouchDB connection settings
 couchdb:
   url: "http://localhost:5984"
-  username: "admin"
-  password: "${COUCHDB_PASSWORD}"  # Can use environment variable substitution
+  # Authentication (optional, only needed if CouchDB requires login)
+  auth:
+    username: "admin"
+    password: "${COUCHDB_PASSWORD}"  # Can use environment variable substitution
   database: "couchdb_file_sync_files"
   # Remote path prefix to sync (e.g., "notes/" or "obsidian/")
   # Empty or "/" means sync the entire database
@@ -49,28 +51,30 @@ ignore:
 
 # Conflict resolution settings
 conflicts:
-  default_strategy: "keep-both"  # keep-local, keep-remote, keep-both
+  default_strategy: keep-both  # keep-both, keep-local, keep-remote, skip
   auto_resolve: false
   conflict_dir: ".conflicts"  # Where to store conflict copies
 
 # Notification settings (Telegram and/or Matrix)
 notifications:
-  enabled: false
   telegram:
-    bot_token: "${TELEGRAM_BOT_TOKEN}"  # From @BotFather
-    chat_id: "${TELEGRAM_CHAT_ID}"      # Your chat ID
+    # Include only if you have Telegram notification credentials
+    # credentials:
+    #   bot_token: "${TELEGRAM_BOT_TOKEN}"  # From @BotFather
+    #   chat_id: "${TELEGRAM_CHAT_ID}"      # Your chat ID
   matrix:
-    homeserver_url: "${MATRIX_HOMESERVER_URL}"  # e.g. https://matrix.example.com
-    access_token: "${MATRIX_ACCESS_TOKEN}"      # Matrix access token
-    room_id: "${MATRIX_ROOM_ID}"                # Room ID to send notifications to
-    message_type: "m.notice"                    # m.notice or m.text
+    # Include only if you have Matrix notification credentials
+    # credentials:
+    #   homeserver_url: "${MATRIX_HOMESERVER_URL}"  # e.g. https://matrix.example.com
+    #   access_token: "${MATRIX_ACCESS_TOKEN}"      # Matrix access token
+    #   room_id: "${MATRIX_ROOM_ID}"                # Room ID to send notifications to
+    message_type: m.notice  # m.notice, m.text, or m.emote
   notify_on_conflict: true
   notify_on_sync_error: true
-  notify_summary: false
 
 # Logging settings
 logging:
-  level: "info"      # error, warn, info, debug, trace
-  format: "pretty"   # pretty, json, compact
+  level: info      # trace, debug, info, warn, error
+  format: pretty   # pretty, json, compact
   # file: "~/.local/state/couchdb-file-sync/couchdb-file-sync.log"  # Optional file output (used by sync/daemon)
-  rotated_logs: "delete"  # delete, keep (daemon rotates every 24 hours)
+  rotation: daily-delete  # never, daily-keep, daily-delete

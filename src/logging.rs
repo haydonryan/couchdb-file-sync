@@ -1,4 +1,4 @@
-use crate::config::RotatedLogPolicy;
+use crate::config::RotationConfig;
 use chrono::{Local, NaiveDate};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -7,41 +7,28 @@ use std::time::{Duration as StdDuration, Instant};
 
 const ROTATION_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum RotationMode {
-    Never,
-    Daily,
-}
-
 pub struct AppLogWriter {
     path: PathBuf,
-    rotation: RotationMode,
-    rotated_logs: RotatedLogPolicy,
+    rotation: RotationConfig,
     opened_on: NaiveDate,
     last_rotation_at: Instant,
     file: Option<File>,
 }
 
 impl AppLogWriter {
-    pub fn new(
-        path: PathBuf,
-        rotation: RotationMode,
-        rotated_logs: RotatedLogPolicy,
-    ) -> io::Result<Self> {
-        Self::new_for_date(path, rotation, rotated_logs, Local::now().date_naive())
+    pub fn new(path: PathBuf, rotation: RotationConfig) -> io::Result<Self> {
+        Self::new_for_date(path, rotation, Local::now().date_naive())
     }
 
     fn new_for_date(
         path: PathBuf,
-        rotation: RotationMode,
-        rotated_logs: RotatedLogPolicy,
+        rotation: RotationConfig,
         current_date: NaiveDate,
     ) -> io::Result<Self> {
         let file = open_log_file(&path)?;
         Ok(Self {
             path,
             rotation,
-            rotated_logs,
             opened_on: current_date,
             last_rotation_at: Instant::now(),
             file: Some(file),
@@ -49,7 +36,8 @@ impl AppLogWriter {
     }
 
     fn rotate_if_needed(&mut self) -> io::Result<()> {
-        if self.rotation != RotationMode::Daily
+        if self.rotation != RotationConfig::DailyKeep
+            && self.rotation != RotationConfig::DailyDelete
             || self.last_rotation_at.elapsed() < ROTATION_INTERVAL
         {
             return Ok(());
@@ -64,13 +52,13 @@ impl AppLogWriter {
         }
         drop(self.file.take());
 
-        match self.rotated_logs {
-            RotatedLogPolicy::Delete => match fs::remove_file(&self.path) {
+        match self.rotation {
+            RotationConfig::DailyDelete => match fs::remove_file(&self.path) {
                 Ok(()) => {}
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err),
             },
-            RotatedLogPolicy::Keep => {
+            RotationConfig::DailyKeep => {
                 let rotated_path = rotated_log_path(&self.path, self.opened_on);
                 match fs::remove_file(&rotated_path) {
                     Ok(()) => {}
@@ -79,6 +67,7 @@ impl AppLogWriter {
                 }
                 fs::rename(&self.path, rotated_path)?;
             }
+            RotationConfig::Never => {}
         }
 
         self.file = Some(open_log_file(&self.path)?);
@@ -131,8 +120,8 @@ fn rotated_log_path(path: &Path, date: NaiveDate) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{rotated_log_path, AppLogWriter, RotationMode};
-    use crate::config::RotatedLogPolicy;
+    use super::{rotated_log_path, AppLogWriter};
+    use crate::config::RotationConfig;
     use chrono::{Duration, Local, NaiveDate};
     use std::fs;
     use std::io::Write;
@@ -144,13 +133,9 @@ mod tests {
         let log_path = tempdir.path().join("app.log");
         let today = Local::now().date_naive();
 
-        let mut writer = AppLogWriter::new_for_date(
-            log_path.clone(),
-            RotationMode::Daily,
-            RotatedLogPolicy::Delete,
-            today,
-        )
-        .unwrap();
+        let mut writer =
+            AppLogWriter::new_for_date(log_path.clone(), RotationConfig::DailyDelete, today)
+                .unwrap();
         writer.write_all(b"day one").unwrap();
         writer.rotate(today + Duration::days(1)).unwrap();
         writer.write_all(b"day two").unwrap();
@@ -166,13 +151,8 @@ mod tests {
         let log_path = tempdir.path().join("app.log");
         let today = Local::now().date_naive();
 
-        let mut writer = AppLogWriter::new_for_date(
-            log_path.clone(),
-            RotationMode::Daily,
-            RotatedLogPolicy::Keep,
-            today,
-        )
-        .unwrap();
+        let mut writer =
+            AppLogWriter::new_for_date(log_path.clone(), RotationConfig::DailyKeep, today).unwrap();
         writer.write_all(b"day one").unwrap();
         writer.rotate(today + Duration::days(1)).unwrap();
         writer.write_all(b"day two").unwrap();
@@ -200,6 +180,28 @@ mod tests {
         assert_eq!(
             rotated,
             PathBuf::from("/tmp/couchdb-file-sync-2026-03-17.log")
+        );
+    }
+
+    #[test]
+    fn never_config_does_not_rotate() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let log_path = tempdir.path().join("app.log");
+        let today = Local::now().date_naive();
+
+        let mut writer =
+            AppLogWriter::new_for_date(log_path.clone(), RotationConfig::Never, today).unwrap();
+
+        // Ensure we don't attempt rotation for Never
+        writer.write_all(b"some content").unwrap();
+        // rotate() is a no-op for Never, so calling it explicitly should not change anything
+        writer.rotate(today + Duration::days(1)).unwrap();
+        writer.write_all(b" more content").unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&log_path).unwrap(),
+            "some content more content"
         );
     }
 }
