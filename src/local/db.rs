@@ -1,4 +1,4 @@
-use crate::models::{Change, ChangeSource, ChangeType, Conflict, CouchRev, FileState};
+use crate::models::{Change, ChangeSource, ChangeType, Checkpoint, Conflict, CouchRev, FileState};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
@@ -413,7 +413,7 @@ impl LocalDb {
     // === Sync Checkpoint Operations ===
 
     /// Get last sync checkpoint
-    pub fn get_checkpoint(&self) -> Result<Option<(String, DateTime<Utc>)>> {
+    pub fn get_checkpoint(&self) -> Result<Option<Checkpoint>> {
         let result = self
             .conn
             .query_row(
@@ -422,7 +422,7 @@ impl LocalDb {
                 |row| {
                     let seq: String = row.get(0)?;
                     let timestamp: DateTime<Utc> = row.get(1)?;
-                    Ok((seq, timestamp))
+                    Ok(Checkpoint::new(seq, timestamp))
                 },
             )
             .optional()?;
@@ -843,7 +843,7 @@ mod tests {
             .get_checkpoint()
             .expect("get_checkpoint")
             .expect("checkpoint should exist");
-        assert_eq!(cp.0, "1000-abc");
+        assert_eq!(cp.last_seq, "1000-abc");
     }
 
     #[test]
@@ -856,7 +856,7 @@ mod tests {
             .get_checkpoint()
             .expect("get_checkpoint")
             .expect("checkpoint should exist");
-        assert_eq!(cp.0, "new-seq");
+        assert_eq!(cp.last_seq, "new-seq");
     }
 
     #[test]

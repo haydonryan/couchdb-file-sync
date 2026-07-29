@@ -2,7 +2,9 @@ use crate::config::{default_user_config_file, AppConfig, SyncPath};
 use crate::couchdb::{ChangeFeedEntry, CouchDb};
 use crate::local::{AsyncFileWatcher, LocalDb};
 use crate::matrix::MatrixNotifier;
-use crate::models::{Change, ChangeType, IgnoreMatcher, ResolutionStrategy, SyncDirPath};
+use crate::models::{
+    Change, ChangeType, DatabaseName, IgnoreMatcher, RemotePath, ResolutionStrategy, SyncDirPath,
+};
 use crate::sync::{SyncEngine, SyncReport};
 use crate::telegram::TelegramNotifier;
 use anyhow::{Context, Result};
@@ -409,8 +411,8 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
         &config.couchdb.url,
         config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
         config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
-        &config.couchdb.database,
-        &config.couchdb.remote_path,
+        &DatabaseName::new(&config.couchdb.database),
+        &RemotePath::new(&config.couchdb.remote_path),
     )
     .await?;
 
@@ -457,8 +459,8 @@ pub async fn rebuild_remote(path: PathBuf, config: AppConfig) -> Result<SyncRepo
         &config.couchdb.url,
         config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
         config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
-        &config.couchdb.database,
-        &config.couchdb.remote_path,
+        &DatabaseName::new(&config.couchdb.database),
+        &RemotePath::new(&config.couchdb.remote_path),
     )
     .await?;
 
@@ -485,8 +487,8 @@ pub async fn rebuild_local(path: PathBuf, config: AppConfig) -> Result<SyncRepor
         &config.couchdb.url,
         config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
         config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
-        &config.couchdb.database,
-        &config.couchdb.remote_path,
+        &DatabaseName::new(&config.couchdb.database),
+        &RemotePath::new(&config.couchdb.remote_path),
     )
     .await?;
 
@@ -924,8 +926,8 @@ async fn daemon_sync(
         &config.couchdb.url,
         config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
         config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
-        &config.couchdb.database,
-        &config.couchdb.remote_path,
+        &DatabaseName::new(&config.couchdb.database),
+        &RemotePath::new(&config.couchdb.remote_path),
     )
     .await?;
 
@@ -1001,8 +1003,8 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
         &config.couchdb.url,
         config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
         config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
-        &config.couchdb.database,
-        &config.couchdb.remote_path,
+        &DatabaseName::new(&config.couchdb.database),
+        &RemotePath::new(&config.couchdb.remote_path),
     )
     .await?;
 
@@ -1012,8 +1014,8 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
         SyncDirPath::new(path.clone()).unwrap(),
         (*ignore_matcher).clone(),
     );
-    let initial_since = match engine.get_checkpoint()? {
-        Some((seq, _)) => seq,
+    let initial_since: String = match engine.get_checkpoint()? {
+        Some(cp) => cp.last_seq,
         None => {
             info!("No checkpoint found, starting changes feed from 'now'");
             "now".to_string()
@@ -1141,8 +1143,8 @@ async fn run_remote_changes(
         &config.couchdb.url,
         config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
         config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
-        &config.couchdb.database,
-        &config.couchdb.remote_path,
+        &DatabaseName::new(&config.couchdb.database),
+        &RemotePath::new(&config.couchdb.remote_path),
     )
     .await?;
 
@@ -1337,8 +1339,8 @@ pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
         &config.couchdb.url,
         config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
         config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
-        &config.couchdb.database,
-        &config.couchdb.remote_path,
+        &DatabaseName::new(&config.couchdb.database),
+        &RemotePath::new(&config.couchdb.remote_path),
     )
     .await?;
 
@@ -1517,7 +1519,7 @@ pub async fn status(path: PathBuf, json: bool, _config: &AppConfig) -> Result<()
             "tracked_files": file_states.len(),
             "local_files": file_count,
             "pending_conflicts": conflicts.len(),
-            "last_sync": checkpoint.map(|(_, ts)| ts),
+            "last_sync": checkpoint.as_ref().map(|cp| cp.last_sync_at),
         });
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
@@ -1528,9 +1530,12 @@ pub async fn status(path: PathBuf, json: bool, _config: &AppConfig) -> Result<()
         println!("Tracked files:  {}", file_states.len());
         println!("Pending conflicts: {}", conflicts.len());
 
-        if let Some((seq, ts)) = checkpoint {
-            println!("Last sync:      {}", ts.format("%Y-%m-%d %H:%M:%S UTC"));
-            println!("Last sequence:  {}", seq);
+        if let Some(cp) = &checkpoint {
+            println!(
+                "Last sync:      {}",
+                cp.last_sync_at.format("%Y-%m-%d %H:%M:%S UTC")
+            );
+            println!("Last sequence:  {}", cp.last_seq);
         } else {
             println!("Last sync:      Never");
         }
@@ -1585,8 +1590,8 @@ fn state_db_path(root: &Path) -> PathBuf {
 fn print_sync_report(report: &SyncReport) {
     println!();
     println!("Sync complete ✓");
-    println!("  Uploaded:  {}", report.uploaded);
-    println!("  Downloaded: {}", report.downloaded);
+    println!("  Uploaded:  {}", report.uploaded.0);
+    println!("  Downloaded: {}", report.downloaded.0);
     println!("  Deleted (local): {}", report.deleted_local);
     println!("  Deleted (remote): {}", report.deleted_remote);
 
@@ -1608,6 +1613,7 @@ fn print_sync_report(report: &SyncReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{DownloadCount, UploadCount};
     use std::time::SystemTime;
 
     // ── truncate_str ──────────────────────────────────────────────────────
@@ -1722,8 +1728,8 @@ mod tests {
     #[test]
     fn test_print_sync_report_with_errors() {
         let report = SyncReport {
-            uploaded: 5,
-            downloaded: 3,
+            uploaded: UploadCount(5),
+            downloaded: DownloadCount(3),
             deleted_local: 1,
             deleted_remote: 0,
             conflicts: 2,
@@ -1737,8 +1743,8 @@ mod tests {
     #[test]
     fn test_print_sync_report_with_conflicts() {
         let report = SyncReport {
-            uploaded: 2,
-            downloaded: 1,
+            uploaded: UploadCount(2),
+            downloaded: DownloadCount(1),
             deleted_local: 0,
             deleted_remote: 1,
             conflicts: 3,
@@ -1752,8 +1758,8 @@ mod tests {
     #[test]
     fn test_print_sync_report_all_zeros() {
         let report = SyncReport {
-            uploaded: 0,
-            downloaded: 0,
+            uploaded: UploadCount(0),
+            downloaded: DownloadCount(0),
             deleted_local: 0,
             deleted_remote: 0,
             conflicts: 0,
