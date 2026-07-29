@@ -26,77 +26,125 @@ pub enum ChangeSource {
     Remote,
 }
 
-/// A change record for sync operations
+/// A change record for sync operations - per-variant sum type preventing invalid combinations
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Change {
-    pub path: String,
-    pub change_type: ChangeType,
-    pub source: ChangeSource,
-    pub timestamp: DateTime<Utc>,
-    pub hash: Option<String>,
-    pub size: Option<u64>,
-    /// Remote modification time (for comparing with local state)
-    pub mtime: Option<DateTime<Utc>>,
-    /// Remote CouchDB revision
-    pub rev: Option<String>,
+pub enum Change {
+    LocalCreated {
+        path: String,
+        hash: String,
+        size: u64,
+    },
+    LocalModified {
+        path: String,
+        hash: String,
+        size: u64,
+    },
+    LocalDeleted {
+        path: String,
+    },
+    RemoteCreated {
+        path: String,
+        hash: String,
+        size: u64,
+        mtime: DateTime<Utc>,
+        rev: String,
+    },
+    RemoteModified {
+        path: String,
+        hash: String,
+        size: u64,
+        mtime: DateTime<Utc>,
+        rev: String,
+    },
+    RemoteDeleted {
+        path: String,
+        mtime: Option<DateTime<Utc>>,
+    },
 }
 
 impl Change {
-    pub fn new(
-        path: String,
-        change_type: ChangeType,
-        source: ChangeSource,
-        hash: Option<String>,
-        size: Option<u64>,
-        mtime: Option<DateTime<Utc>>,
-        rev: Option<String>,
-    ) -> Self {
-        Self {
-            path,
-            change_type,
-            source,
-            timestamp: Utc::now(),
-            hash,
-            size,
-            mtime,
-            rev,
+    pub fn path(&self) -> &str {
+        match self {
+            Change::LocalCreated { path, .. }
+            | Change::LocalModified { path, .. }
+            | Change::LocalDeleted { path }
+            | Change::RemoteCreated { path, .. }
+            | Change::RemoteModified { path, .. }
+            | Change::RemoteDeleted { path, .. } => path,
+        }
+    }
+
+    pub fn change_type(&self) -> ChangeType {
+        match self {
+            Change::LocalCreated { .. } | Change::RemoteCreated { .. } => ChangeType::Created,
+            Change::LocalModified { .. } | Change::RemoteModified { .. } => ChangeType::Modified,
+            Change::LocalDeleted { .. } | Change::RemoteDeleted { .. } => ChangeType::Deleted,
+        }
+    }
+
+    pub fn source(&self) -> ChangeSource {
+        match self {
+            Change::LocalCreated { .. }
+            | Change::LocalModified { .. }
+            | Change::LocalDeleted { .. } => ChangeSource::Local,
+            Change::RemoteCreated { .. }
+            | Change::RemoteModified { .. }
+            | Change::RemoteDeleted { .. } => ChangeSource::Remote,
+        }
+    }
+
+    pub fn hash(&self) -> Option<&str> {
+        match self {
+            Change::LocalCreated { hash, .. }
+            | Change::LocalModified { hash, .. }
+            | Change::RemoteCreated { hash, .. }
+            | Change::RemoteModified { hash, .. } => Some(hash),
+            Change::LocalDeleted { .. } | Change::RemoteDeleted { .. } => None,
+        }
+    }
+
+    pub fn size(&self) -> Option<u64> {
+        match self {
+            Change::LocalCreated { size, .. }
+            | Change::LocalModified { size, .. }
+            | Change::RemoteCreated { size, .. }
+            | Change::RemoteModified { size, .. } => Some(*size),
+            Change::LocalDeleted { .. } | Change::RemoteDeleted { .. } => None,
+        }
+    }
+
+    pub fn mtime(&self) -> Option<&DateTime<Utc>> {
+        match self {
+            Change::RemoteCreated { mtime, .. } | Change::RemoteModified { mtime, .. } => {
+                Some(mtime)
+            }
+            Change::LocalCreated { .. }
+            | Change::LocalModified { .. }
+            | Change::LocalDeleted { .. } => None,
+            Change::RemoteDeleted { mtime, .. } => mtime.as_ref(),
+        }
+    }
+
+    pub fn rev(&self) -> Option<&str> {
+        match self {
+            Change::RemoteCreated { rev, .. } | Change::RemoteModified { rev, .. } => Some(rev),
+            Change::LocalCreated { .. }
+            | Change::LocalModified { .. }
+            | Change::LocalDeleted { .. }
+            | Change::RemoteDeleted { .. } => None,
         }
     }
 
     pub fn local_created(path: String, hash: String, size: u64) -> Self {
-        Self::new(
-            path,
-            ChangeType::Created,
-            ChangeSource::Local,
-            Some(hash),
-            Some(size),
-            None,
-            None,
-        )
+        Change::LocalCreated { path, hash, size }
     }
 
     pub fn local_modified(path: String, hash: String, size: u64) -> Self {
-        Self::new(
-            path,
-            ChangeType::Modified,
-            ChangeSource::Local,
-            Some(hash),
-            Some(size),
-            None,
-            None,
-        )
+        Change::LocalModified { path, hash, size }
     }
 
     pub fn local_deleted(path: String) -> Self {
-        Self::new(
-            path,
-            ChangeType::Deleted,
-            ChangeSource::Local,
-            None,
-            None,
-            None,
-            None,
-        )
+        Change::LocalDeleted { path }
     }
 
     pub fn remote_created(
@@ -106,15 +154,13 @@ impl Change {
         mtime: DateTime<Utc>,
         rev: String,
     ) -> Self {
-        Self::new(
+        Change::RemoteCreated {
             path,
-            ChangeType::Created,
-            ChangeSource::Remote,
-            Some(hash),
-            Some(size),
-            Some(mtime),
-            Some(rev),
-        )
+            hash,
+            size,
+            mtime,
+            rev,
+        }
     }
 
     pub fn remote_modified(
@@ -124,34 +170,24 @@ impl Change {
         mtime: DateTime<Utc>,
         rev: String,
     ) -> Self {
-        Self::new(
+        Change::RemoteModified {
             path,
-            ChangeType::Modified,
-            ChangeSource::Remote,
-            Some(hash),
-            Some(size),
-            Some(mtime),
-            Some(rev),
-        )
+            hash,
+            size,
+            mtime,
+            rev,
+        }
     }
 
-    pub fn remote_deleted(path: String) -> Self {
-        Self::new(
-            path,
-            ChangeType::Deleted,
-            ChangeSource::Remote,
-            None,
-            None,
-            None,
-            None,
-        )
+    pub fn remote_deleted(path: String, mtime: Option<DateTime<Utc>>) -> Self {
+        Change::RemoteDeleted { path, mtime }
     }
 }
 
 /// A batch of changes for sync operations
 #[derive(Debug, Clone, Default)]
 pub struct ChangeBatch {
-    pub changes: Vec<Change>,
+    changes: Vec<Change>,
 }
 
 impl ChangeBatch {
@@ -173,10 +209,18 @@ impl ChangeBatch {
         self.changes.len()
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &Change> {
+        self.changes.iter()
+    }
+
+    pub fn into_inner(self) -> Vec<Change> {
+        self.changes
+    }
+
     pub fn local_changes(&self) -> Vec<Change> {
         self.changes
             .iter()
-            .filter(|c| matches!(c.source, ChangeSource::Local))
+            .filter(|c| c.source() == ChangeSource::Local)
             .cloned()
             .collect()
     }
@@ -184,7 +228,7 @@ impl ChangeBatch {
     pub fn remote_changes(&self) -> Vec<Change> {
         self.changes
             .iter()
-            .filter(|c| matches!(c.source, ChangeSource::Remote))
+            .filter(|c| c.source() == ChangeSource::Remote)
             .cloned()
             .collect()
     }
@@ -215,33 +259,33 @@ mod tests {
     #[test]
     fn test_change_local_created() {
         let c = Change::local_created("/path/to/file.txt".into(), "abc123".into(), 1024);
-        assert_eq!(c.path, "/path/to/file.txt");
-        assert_eq!(c.change_type, ChangeType::Created);
-        assert_eq!(c.source, ChangeSource::Local);
-        assert_eq!(c.hash, Some("abc123".into()));
-        assert_eq!(c.size, Some(1024));
-        assert!(c.mtime.is_none());
-        assert!(c.rev.is_none());
+        assert_eq!(c.path(), "/path/to/file.txt");
+        assert_eq!(c.change_type(), ChangeType::Created);
+        assert_eq!(c.source(), ChangeSource::Local);
+        assert_eq!(c.hash(), Some("abc123"));
+        assert_eq!(c.size(), Some(1024));
+        assert!(c.mtime().is_none());
+        assert!(c.rev().is_none());
     }
 
     #[test]
     fn test_change_local_modified() {
         let c = Change::local_modified("/path/to/file.txt".into(), "def456".into(), 2048);
-        assert_eq!(c.path, "/path/to/file.txt");
-        assert_eq!(c.change_type, ChangeType::Modified);
-        assert_eq!(c.source, ChangeSource::Local);
-        assert_eq!(c.hash, Some("def456".into()));
-        assert_eq!(c.size, Some(2048));
+        assert_eq!(c.path(), "/path/to/file.txt");
+        assert_eq!(c.change_type(), ChangeType::Modified);
+        assert_eq!(c.source(), ChangeSource::Local);
+        assert_eq!(c.hash(), Some("def456"));
+        assert_eq!(c.size(), Some(2048));
     }
 
     #[test]
     fn test_change_local_deleted() {
         let c = Change::local_deleted("/path/to/file.txt".into());
-        assert_eq!(c.path, "/path/to/file.txt");
-        assert_eq!(c.change_type, ChangeType::Deleted);
-        assert_eq!(c.source, ChangeSource::Local);
-        assert!(c.hash.is_none());
-        assert!(c.size.is_none());
+        assert_eq!(c.path(), "/path/to/file.txt");
+        assert_eq!(c.change_type(), ChangeType::Deleted);
+        assert_eq!(c.source(), ChangeSource::Local);
+        assert!(c.hash().is_none());
+        assert!(c.size().is_none());
     }
 
     #[test]
@@ -254,13 +298,13 @@ mod tests {
             mtime,
             "1-abc".into(),
         );
-        assert_eq!(c.path, "/remote/path.txt");
-        assert_eq!(c.change_type, ChangeType::Created);
-        assert_eq!(c.source, ChangeSource::Remote);
-        assert_eq!(c.hash, Some("hash1".into()));
-        assert_eq!(c.size, Some(512));
-        assert_eq!(c.mtime, Some(mtime));
-        assert_eq!(c.rev, Some("1-abc".into()));
+        assert_eq!(c.path(), "/remote/path.txt");
+        assert_eq!(c.change_type(), ChangeType::Created);
+        assert_eq!(c.source(), ChangeSource::Remote);
+        assert_eq!(c.hash(), Some("hash1"));
+        assert_eq!(c.size(), Some(512));
+        assert_eq!(c.mtime(), Some(&mtime));
+        assert_eq!(c.rev(), Some("1-abc"));
     }
 
     #[test]
@@ -273,22 +317,22 @@ mod tests {
             mtime,
             "2-def".into(),
         );
-        assert_eq!(c.path, "/remote/path.txt");
-        assert_eq!(c.change_type, ChangeType::Modified);
-        assert_eq!(c.source, ChangeSource::Remote);
-        assert_eq!(c.rev, Some("2-def".into()));
+        assert_eq!(c.path(), "/remote/path.txt");
+        assert_eq!(c.change_type(), ChangeType::Modified);
+        assert_eq!(c.source(), ChangeSource::Remote);
+        assert_eq!(c.rev(), Some("2-def"));
     }
 
     #[test]
     fn test_change_remote_deleted() {
-        let c = Change::remote_deleted("/remote/path.txt".into());
-        assert_eq!(c.path, "/remote/path.txt");
-        assert_eq!(c.change_type, ChangeType::Deleted);
-        assert_eq!(c.source, ChangeSource::Remote);
-        assert!(c.hash.is_none());
-        assert!(c.size.is_none());
-        assert!(c.mtime.is_none());
-        assert!(c.rev.is_none());
+        let c = Change::remote_deleted("/remote/path.txt".into(), None);
+        assert_eq!(c.path(), "/remote/path.txt");
+        assert_eq!(c.change_type(), ChangeType::Deleted);
+        assert_eq!(c.source(), ChangeSource::Remote);
+        assert!(c.hash().is_none());
+        assert!(c.size().is_none());
+        assert!(c.mtime().is_none());
+        assert!(c.rev().is_none());
     }
 
     #[test]
@@ -302,7 +346,7 @@ mod tests {
     fn test_change_batch_push_and_len() {
         let mut batch = ChangeBatch::new();
         batch.push(Change::local_created("a.txt".into(), "h1".into(), 100));
-        batch.push(Change::remote_deleted("b.txt".into()));
+        batch.push(Change::remote_deleted("b.txt".into(), None));
         assert!(!batch.is_empty());
         assert_eq!(batch.len(), 2);
     }
@@ -311,20 +355,18 @@ mod tests {
     fn test_change_batch_local_changes_filter() {
         let mut batch = ChangeBatch::new();
         batch.push(Change::local_created("a.txt".into(), "h1".into(), 100));
-        batch.push(Change::remote_deleted("b.txt".into()));
+        batch.push(Change::remote_deleted("b.txt".into(), None));
         batch.push(Change::local_deleted("c.txt".into()));
         let locals = batch.local_changes();
         assert_eq!(locals.len(), 2);
-        assert!(locals
-            .iter()
-            .all(|c| matches!(c.source, ChangeSource::Local)));
+        assert!(locals.iter().all(|c| c.source() == ChangeSource::Local));
     }
 
     #[test]
     fn test_change_batch_remote_changes_filter() {
         let mut batch = ChangeBatch::new();
         batch.push(Change::local_created("a.txt".into(), "h1".into(), 100));
-        batch.push(Change::remote_deleted("b.txt".into()));
+        batch.push(Change::remote_deleted("b.txt".into(), None));
         batch.push(Change::remote_created(
             "c.txt".into(),
             "h2".into(),
@@ -334,9 +376,7 @@ mod tests {
         ));
         let remotes = batch.remote_changes();
         assert_eq!(remotes.len(), 2);
-        assert!(remotes
-            .iter()
-            .all(|c| matches!(c.source, ChangeSource::Remote)));
+        assert!(remotes.iter().all(|c| c.source() == ChangeSource::Remote));
     }
 
     #[test]

@@ -539,7 +539,7 @@ async fn notify_conflicts_telegram(
         }
         None => {
             // One-time sync: only conflicts not marked notified in DB
-            conflicts.iter().filter(|c| !c.notified).collect()
+            conflicts.iter().filter(|c| !c.is_notified()).collect()
         }
     };
 
@@ -736,7 +736,7 @@ async fn notify_conflicts_matrix(
         }
         None => {
             // One-time sync: only conflicts not marked notified in DB
-            conflicts.iter().filter(|c| !c.notified).collect()
+            conflicts.iter().filter(|c| !c.is_notified()).collect()
         }
     };
 
@@ -1050,17 +1050,17 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
         tokio::select! {
             Some(change) = local_rx.recv() => {
                 if let Err(e) = handle_local_change(&mut engine, &mut touched, &change).await {
-                    warn!("Live local change error for {}: {}", change.path, e);
+                    warn!("Live local change error for {}: {}", change.path(), e);
                     notify_sync_error_telegram(
                         &config,
                         Some(&path),
-                        &format!("Live local change error for {}: {}", change.path, e),
+                        &format!("Live local change error for {}: {}", change.path(), e),
                     )
                     .await;
                     notify_sync_error_matrix(
                         &config,
                         Some(&path),
-                        &format!("Live local change error for {}: {}", change.path, e),
+                        &format!("Live local change error for {}: {}", change.path(), e),
                     )
                     .await;
                 }
@@ -1160,15 +1160,15 @@ async fn handle_local_change(
     touched: &mut TouchTracker,
     change: &Change,
 ) -> Result<()> {
-    let mtime = local_mtime(engine.root_dir(), &change.path);
-    if touched.is_touched(&change.path, mtime) {
+    let mtime = local_mtime(engine.root_dir(), change.path());
+    if touched.is_touched(change.path(), mtime) {
         return Ok(());
     }
 
-    match change.change_type {
+    match change.change_type() {
         ChangeType::Created | ChangeType::Modified | ChangeType::Deleted => {
             if let Err(e) = engine.apply_local_change(change).await {
-                warn!("Failed to apply local change {}: {}", change.path, e);
+                warn!("Failed to apply local change {}: {}", change.path(), e);
             }
         }
     }
@@ -1185,7 +1185,7 @@ async fn handle_remote_change(
     let change = entry.change;
     let seq = entry.seq;
 
-    let local_path = engine.remote_to_local_path(&change.path);
+    let local_path = engine.remote_to_local_path(change.path());
     let local_rel = local_path.trim_start_matches('/').to_string();
 
     if ignore_matcher.should_ignore(Path::new(&local_rel)) {
@@ -1194,9 +1194,7 @@ async fn handle_remote_change(
     }
 
     if let Some(state) = engine.get_file_state(&local_rel)? {
-        if let (Some(remote_rev), Some(local_rev)) =
-            (change.rev.as_deref(), state.couch_rev.as_deref())
-        {
+        if let (Some(remote_rev), Some(local_rev)) = (change.rev(), state.couch_rev.as_deref()) {
             if remote_rev == local_rev {
                 engine.save_checkpoint(&seq)?;
                 return Ok(());
@@ -1204,7 +1202,7 @@ async fn handle_remote_change(
         }
     }
 
-    match change.change_type {
+    match change.change_type() {
         ChangeType::Deleted => {
             touched.mark(&local_rel, SystemTime::now());
             engine.apply_remote_change(&change).await?;
@@ -1217,7 +1215,7 @@ async fn handle_remote_change(
                 .and_then(|meta| meta.modified().ok())
                 .unwrap_or_else(SystemTime::now);
             let remote_mtime = change
-                .mtime
+                .mtime()
                 .map(|dt| UNIX_EPOCH + Duration::from_millis(dt.timestamp_millis() as u64));
 
             let apply_remote = match remote_mtime {

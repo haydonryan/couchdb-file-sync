@@ -128,42 +128,38 @@ pub fn triage_changes(
     remote_prefix: &str,
 ) -> TriageResult {
     // Build lookup maps
-    let local_map: HashMap<&str, &Change> =
-        local_changes.iter().map(|c| (c.path.as_str(), c)).collect();
-    let remote_map: HashMap<&str, &Change> = remote_changes
-        .iter()
-        .map(|c| (c.path.as_str(), c))
-        .collect();
+    let local_map: HashMap<&str, &Change> = local_changes.iter().map(|c| (c.path(), c)).collect();
+    let remote_map: HashMap<&str, &Change> = remote_changes.iter().map(|c| (c.path(), c)).collect();
 
     let mut result = TriageResult::default();
 
     // ── Process local changes ──────────────────────────────────────────
     for lc in local_changes {
         let remote_path = if remote_prefix.is_empty() {
-            lc.path.clone()
+            lc.path().to_string()
         } else {
-            format!("{}{}", remote_prefix, lc.path)
+            format!("{}{}", remote_prefix, lc.path())
         };
 
         // Local delete → always upload (no content comparison needed)
-        if lc.change_type == ChangeType::Deleted {
+        if lc.change_type() == ChangeType::Deleted {
             result.uploads.push(lc.clone());
             continue;
         }
 
-        let stored_state = stored_states.get(&lc.path);
+        let stored_state = stored_states.get(lc.path());
 
         // Check if the remote side also changed for this path
         let remote_also_changed = remote_map
             .get(remote_path.as_str())
-            .map(|rc| remote_is_newer(rc.mtime, stored_state))
+            .map(|rc| remote_is_newer(rc.mtime().copied(), stored_state))
             .unwrap_or(false);
 
         if remote_also_changed {
             // Both sides changed — the caller must compare content hashes
             let rc = remote_map.get(remote_path.as_str()).unwrap();
             result.needs_comparison.push(TriageDecision {
-                path: lc.path.clone(),
+                path: lc.path().to_string(),
                 outcome: TriageOutcome::NeedsComparison,
                 local_change: Some(lc.clone()),
                 remote_change: Some((*rc).clone()),
@@ -176,7 +172,7 @@ pub fn triage_changes(
 
     // ── Process remote changes not in local changes ────────────────────
     for rc in remote_changes {
-        let local_path = remote_path_to_local_path(&rc.path, remote_prefix);
+        let local_path = remote_path_to_local_path(rc.path(), remote_prefix);
 
         // Skip if also in local changes (handled above)
         if local_map.contains_key(local_path.as_str()) {
@@ -185,11 +181,11 @@ pub fn triage_changes(
 
         let stored_state = stored_states.get(&local_path);
 
-        if rc.change_type == ChangeType::Deleted {
+        if rc.change_type() == ChangeType::Deleted {
             // Remote delete — check if it should be applied locally
             let relative_path = local_path.trim_start_matches('/');
             let file_path = std::path::Path::new(relative_path);
-            if should_apply_remote_delete(stored_state, rc.mtime, file_path.exists()) {
+            if should_apply_remote_delete(stored_state, rc.mtime().copied(), file_path.exists()) {
                 result.remote_deletes.push(rc.clone());
             } else {
                 result.skipped.push(TriageDecision {
@@ -205,7 +201,7 @@ pub fn triage_changes(
         // Remote change not in local changes — check if it should be downloaded
         let should_download = match stored_state {
             Some(state) => {
-                let remote_rev = rc.rev.as_deref();
+                let remote_rev = rc.rev();
                 let stored_rev = state.couch_rev.as_deref();
                 remote_revision_changed(remote_rev, stored_rev)
             }
@@ -288,7 +284,8 @@ pub fn plan_local_rebuild(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::ChangeSource;
+    use crate::models::file::CouchRev;
+
     use chrono::{Duration, NaiveDateTime, Utc};
 
     // ── Helper helpers ──────────────────────────────────────────────
@@ -299,21 +296,21 @@ mod tests {
             hash: "abc".to_string(),
             size: 1,
             modified_at: last_sync_at,
-            couch_rev: Some("1-abc".to_string()),
+            couch_rev: Some(CouchRev::new("1-abc").unwrap()),
             last_sync_at,
         }
     }
 
     fn local_change(path: &str, change_type: ChangeType) -> Change {
-        Change::new(
-            path.to_string(),
-            change_type,
-            ChangeSource::Local,
-            Some("hash-local".to_string()),
-            Some(100),
-            None,
-            None,
-        )
+        match change_type {
+            ChangeType::Created => {
+                Change::local_created(path.to_string(), "hash-local".to_string(), 100)
+            }
+            ChangeType::Modified => {
+                Change::local_modified(path.to_string(), "hash-local".to_string(), 100)
+            }
+            ChangeType::Deleted => Change::local_deleted(path.to_string()),
+        }
     }
 
     fn remote_change(
@@ -322,15 +319,23 @@ mod tests {
         mtime: Option<DateTime<Utc>>,
         rev: Option<&str>,
     ) -> Change {
-        Change::new(
-            path.to_string(),
-            change_type,
-            ChangeSource::Remote,
-            Some("hash-remote".to_string()),
-            Some(200),
-            mtime,
-            rev.map(|s| s.to_string()),
-        )
+        match change_type {
+            ChangeType::Created => Change::remote_created(
+                path.to_string(),
+                "hash-remote".to_string(),
+                200,
+                mtime.unwrap_or_else(Utc::now),
+                rev.unwrap_or("").to_string(),
+            ),
+            ChangeType::Modified => Change::remote_modified(
+                path.to_string(),
+                "hash-remote".to_string(),
+                200,
+                mtime.unwrap_or_else(Utc::now),
+                rev.unwrap_or("").to_string(),
+            ),
+            ChangeType::Deleted => Change::remote_deleted(path.to_string(), mtime),
+        }
     }
 
     fn utc(ymd: &str) -> DateTime<Utc> {
@@ -456,7 +461,7 @@ mod tests {
         let result = triage_changes(&local, &[], &HashMap::new(), "");
 
         assert_eq!(result.uploads.len(), 1);
-        assert_eq!(result.uploads[0].path, "f.txt");
+        assert_eq!(result.uploads[0].path(), "f.txt");
         assert!(result.needs_comparison.is_empty());
         assert!(result.downloads.is_empty());
     }
@@ -469,7 +474,7 @@ mod tests {
         let result = triage_changes(&local, &[], &HashMap::new(), "");
 
         assert_eq!(result.uploads.len(), 1);
-        assert_eq!(result.uploads[0].path, "f.txt");
+        assert_eq!(result.uploads[0].path(), "f.txt");
     }
 
     #[test]
@@ -529,7 +534,7 @@ mod tests {
         let result = triage_changes(&[], &remote, &HashMap::new(), "remote/");
 
         assert_eq!(result.downloads.len(), 1);
-        assert_eq!(result.downloads[0].path, "remote/f.txt");
+        assert_eq!(result.downloads[0].path(), "remote/f.txt");
     }
 
     #[test]
@@ -542,7 +547,7 @@ mod tests {
         )];
         let mut states = HashMap::new();
         let mut state = make_state("f.txt", utc("2026-07-28 10:00:00"));
-        state.couch_rev = Some("1-abc".to_string());
+        state.couch_rev = Some(CouchRev::new("1-abc").unwrap());
         states.insert("f.txt".to_string(), state);
 
         let result = triage_changes(&[], &remote, &states, "");
@@ -560,7 +565,7 @@ mod tests {
         )];
         let mut states = HashMap::new();
         let mut state = make_state("f.txt", utc("2026-07-28 10:00:00"));
-        state.couch_rev = Some("1-abc".to_string());
+        state.couch_rev = Some(CouchRev::new("1-abc").unwrap());
         states.insert("f.txt".to_string(), state);
 
         let result = triage_changes(&[], &remote, &states, "");
@@ -644,7 +649,7 @@ mod tests {
 
         // Remote mtime is before last sync → upload local
         assert_eq!(result.uploads.len(), 1);
-        assert_eq!(result.uploads[0].path, "doc.txt");
+        assert_eq!(result.uploads[0].path(), "doc.txt");
     }
 
     // ── plan_remote_rebuild ─────────────────────────────────────────
@@ -777,7 +782,7 @@ mod tests {
 
         // Local delete queued for upload
         assert_eq!(result.uploads.len(), 2);
-        let upload_paths: Vec<&str> = result.uploads.iter().map(|c| c.path.as_str()).collect();
+        let upload_paths: Vec<&str> = result.uploads.iter().map(|c| c.path()).collect();
         assert!(upload_paths.contains(&"delete_me.txt"));
         assert!(upload_paths.contains(&"new_file.txt"));
 
@@ -787,10 +792,10 @@ mod tests {
 
         // Remote new file queued for download
         assert_eq!(result.downloads.len(), 1);
-        assert_eq!(result.downloads[0].path, "remote_new.txt");
+        assert_eq!(result.downloads[0].path(), "remote_new.txt");
 
         // Remote delete applied
         assert_eq!(result.remote_deletes.len(), 1);
-        assert_eq!(result.remote_deletes[0].path, "remote_delete.txt");
+        assert_eq!(result.remote_deletes[0].path(), "remote_delete.txt");
     }
 }

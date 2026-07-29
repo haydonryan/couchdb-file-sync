@@ -37,6 +37,16 @@ impl std::fmt::Display for ResolutionStrategy {
     }
 }
 
+/// Notification mode for conflicts
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[derive(Default)]
+pub enum NotificationMode {
+    #[default]
+    Pending,
+    Notified,
+}
+
 /// A conflict between local and remote state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conflict {
@@ -44,7 +54,8 @@ pub struct Conflict {
     pub local_state: FileState,
     pub remote_state: RemoteState,
     pub detected_at: DateTime<Utc>,
-    pub notified: bool,
+    #[serde(default)]
+    pub notification_mode: NotificationMode,
 }
 
 impl Conflict {
@@ -54,12 +65,16 @@ impl Conflict {
             local_state,
             remote_state,
             detected_at: Utc::now(),
-            notified: false,
+            notification_mode: NotificationMode::Pending,
         }
     }
 
+    pub fn is_notified(&self) -> bool {
+        self.notification_mode == NotificationMode::Notified
+    }
+
     pub fn mark_notified(&mut self) {
-        self.notified = true;
+        self.notification_mode = NotificationMode::Notified;
     }
 }
 
@@ -82,6 +97,7 @@ pub struct ConflictStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::file::CouchRev;
     use chrono::Utc;
 
     #[test]
@@ -89,11 +105,10 @@ mod tests {
         let local_state =
             FileState::new("/path/to/file.txt".into(), "hash1".into(), 100, Utc::now());
         let remote_state = RemoteState {
-            path: "/path/to/file.txt".into(),
             hash: "hash2".into(),
             size: 200,
             modified_at: Utc::now(),
-            couch_rev: "1-abc".into(),
+            couch_rev: CouchRev::new("1-abc").unwrap(),
             deleted: false,
         };
         let conflict = Conflict::new(
@@ -102,10 +117,10 @@ mod tests {
             remote_state.clone(),
         );
         assert_eq!(conflict.path, "/path/to/file.txt");
-        assert!(!conflict.notified);
+        assert_eq!(conflict.notification_mode, NotificationMode::Pending);
         // Verify the states are stored
         assert_eq!(conflict.local_state.path, local_state.path);
-        assert_eq!(conflict.remote_state.path, remote_state.path);
+        assert_eq!(conflict.path, "/path/to/file.txt");
     }
 
     #[test]
@@ -113,17 +128,16 @@ mod tests {
         let local_state =
             FileState::new("/path/to/file.txt".into(), "hash1".into(), 100, Utc::now());
         let remote_state = RemoteState {
-            path: "/path/to/file.txt".into(),
             hash: "hash2".into(),
             size: 200,
             modified_at: Utc::now(),
-            couch_rev: "1-abc".into(),
+            couch_rev: CouchRev::new("1-abc").unwrap(),
             deleted: false,
         };
         let mut conflict = Conflict::new("/path/to/file.txt".into(), local_state, remote_state);
-        assert!(!conflict.notified);
+        assert_eq!(conflict.notification_mode, NotificationMode::Pending);
         conflict.mark_notified();
-        assert!(conflict.notified);
+        assert!(conflict.is_notified());
     }
 
     #[test]
@@ -131,11 +145,10 @@ mod tests {
         let local_state =
             FileState::new("/path/to/file.txt".into(), "hash1".into(), 100, Utc::now());
         let remote_state = RemoteState {
-            path: "/path/to/file.txt".into(),
             hash: "hash2".into(),
             size: 200,
             modified_at: Utc::now(),
-            couch_rev: "1-abc".into(),
+            couch_rev: CouchRev::new("1-abc").unwrap(),
             deleted: false,
         };
         let conflict = Conflict::new("/path/to/file.txt".into(), local_state, remote_state);

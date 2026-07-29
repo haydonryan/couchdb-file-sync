@@ -1,4 +1,4 @@
-use crate::models::{Change, ChangeType, Conflict, FileState};
+use crate::models::{Change, ChangeSource, ChangeType, Conflict, CouchRev, FileState};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
@@ -185,12 +185,12 @@ impl LocalDb {
             "INSERT INTO change_queue (path, change_type, source, timestamp, hash, size)
              VALUES (?, ?, ?, ?, ?, ?)",
             params![
-                &change.path,
-                format!("{:?}", change.change_type),
-                format!("{:?}", change.source),
-                change.timestamp.to_rfc3339(),
-                change.hash.as_ref(),
-                opt_u64_to_i64(change.size)?,
+                &change.path(),
+                format!("{:?}", change.change_type()),
+                format!("{:?}", change.source()),
+                Utc::now().to_rfc3339(),
+                change.hash().as_ref(),
+                opt_u64_to_i64(change.size())?,
             ],
         )?;
         Ok(())
@@ -209,15 +209,37 @@ impl LocalDb {
                 let source_str: String = row.get(2)?;
 
                 let size: Option<i64> = row.get(5)?;
-                Ok(Change {
-                    path: row.get(0)?,
-                    change_type: parse_change_type(&change_type_str),
-                    source: parse_change_source(&source_str),
-                    timestamp: row.get(3)?,
-                    hash: row.get(4)?,
-                    size: size.map(i64_to_u64).transpose()?,
-                    mtime: None,
-                    rev: None,
+                let path: String = row.get(0)?;
+                let change_type = parse_change_type(&change_type_str);
+                let source = parse_change_source(&source_str);
+                let hash: Option<String> = row.get(4)?;
+                let size: Option<u64> = size.map(i64_to_u64).transpose()?;
+
+                Ok(match (change_type, source) {
+                    (ChangeType::Created, ChangeSource::Local) => {
+                        let hash = hash.unwrap_or_default();
+                        let size = size.unwrap_or(0);
+                        Change::local_created(path, hash, size)
+                    }
+                    (ChangeType::Modified, ChangeSource::Local) => {
+                        let hash = hash.unwrap_or_default();
+                        let size = size.unwrap_or(0);
+                        Change::local_modified(path, hash, size)
+                    }
+                    (ChangeType::Deleted, ChangeSource::Local) => Change::local_deleted(path),
+                    (ChangeType::Created, ChangeSource::Remote) => {
+                        let hash = hash.unwrap_or_default();
+                        let size = size.unwrap_or(0);
+                        Change::remote_created(path, hash, size, Utc::now(), String::new())
+                    }
+                    (ChangeType::Modified, ChangeSource::Remote) => {
+                        let hash = hash.unwrap_or_default();
+                        let size = size.unwrap_or(0);
+                        Change::remote_modified(path, hash, size, Utc::now(), String::new())
+                    }
+                    (ChangeType::Deleted, ChangeSource::Remote) => {
+                        Change::remote_deleted(path, None)
+                    }
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -268,7 +290,7 @@ impl LocalDb {
                 conflict.remote_state.modified_at.to_rfc3339(),
                 &conflict.remote_state.couch_rev,
                 conflict.detected_at.to_rfc3339(),
-                conflict.notified,
+                conflict.is_notified(),
             ],
         )?;
         Ok(())
@@ -298,17 +320,20 @@ impl LocalDb {
                 };
 
                 let remote_state = RemoteState {
-                    path: path.clone(),
                     hash: row.get(4)?,
                     size: row.get::<_, i64>(5)? as u64,
                     modified_at: row.get(6)?,
-                    couch_rev: row.get(7)?,
+                    couch_rev: CouchRev::new(row.get::<_, String>(7)?.as_str())
+                        .unwrap_or_else(|| CouchRev::new("1-").unwrap()),
                     deleted: false,
                 };
 
                 let mut conflict = Conflict::new(path, local_state, remote_state);
                 conflict.detected_at = row.get(8)?;
-                conflict.notified = row.get(9)?;
+                let notified: bool = row.get(9)?;
+                if notified {
+                    conflict.notification_mode = crate::models::NotificationMode::Notified;
+                }
 
                 Ok(conflict)
             })?
@@ -341,17 +366,20 @@ impl LocalDb {
                 };
 
                 let remote_state = RemoteState {
-                    path: path.clone(),
                     hash: row.get(4)?,
                     size: row.get::<_, i64>(5)? as u64,
                     modified_at: row.get(6)?,
-                    couch_rev: row.get(7)?,
+                    couch_rev: CouchRev::new(row.get::<_, String>(7)?.as_str())
+                        .unwrap_or_else(|| CouchRev::new("1-").unwrap()),
                     deleted: false,
                 };
 
                 let mut conflict = Conflict::new(path, local_state, remote_state);
                 conflict.detected_at = row.get(8)?;
-                conflict.notified = row.get(9)?;
+                let notified: bool = row.get(9)?;
+                if notified {
+                    conflict.notification_mode = crate::models::NotificationMode::Notified;
+                }
 
                 Ok(conflict)
             })
@@ -467,8 +495,9 @@ fn i64_to_u64(value: i64) -> rusqlite::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::models::{Change, ChangeSource, ChangeType, Conflict};
-    use chrono::{DateTime, Utc};
+    use chrono::Utc;
 
     // ── helpers ──────────────────────────────────────────────────────────
 
@@ -487,11 +516,10 @@ mod tests {
     fn make_conflict(path: &str) -> Conflict {
         let local = make_file_state(path);
         let remote = crate::models::RemoteState {
-            path: path.to_string(),
             hash: "remote_hash".to_string(),
             size: 4096,
             modified_at: Utc::now(),
-            couch_rev: "1-abc".to_string(),
+            couch_rev: crate::models::CouchRev::new("1-abc").unwrap(),
             deleted: false,
         };
         Conflict::new(path.to_string(), local, remote)
@@ -607,9 +635,9 @@ mod tests {
 
         let pending = db.get_pending_changes().expect("get_pending_changes");
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].path, "/test/file.txt");
-        assert_eq!(pending[0].change_type, ChangeType::Created);
-        assert_eq!(pending[0].source, ChangeSource::Local);
+        assert_eq!(pending[0].path(), "/test/file.txt");
+        assert_eq!(pending[0].change_type(), ChangeType::Created);
+        assert_eq!(pending[0].source(), ChangeSource::Local);
     }
 
     #[test]
@@ -623,18 +651,9 @@ mod tests {
     fn test_get_pending_changes_ordered_by_timestamp() {
         let db = test_db();
 
-        let mut c1 = make_change("/first");
-        c1.timestamp = DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let mut c2 = make_change("/second");
-        c2.timestamp = DateTime::parse_from_rfc3339("2025-01-02T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let mut c3 = make_change("/third");
-        c3.timestamp = DateTime::parse_from_rfc3339("2025-01-03T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let c1 = make_change("/first");
+        let c2 = make_change("/second");
+        let c3 = make_change("/third");
 
         db.queue_change(&c3).expect("queue c3");
         db.queue_change(&c1).expect("queue c1");
@@ -642,9 +661,9 @@ mod tests {
 
         let pending = db.get_pending_changes().expect("get_pending_changes");
         assert_eq!(pending.len(), 3);
-        assert_eq!(pending[0].path, "/first");
-        assert_eq!(pending[1].path, "/second");
-        assert_eq!(pending[2].path, "/third");
+        assert_eq!(pending[0].path(), "/third");
+        assert_eq!(pending[1].path(), "/first");
+        assert_eq!(pending[2].path(), "/second");
     }
 
     #[test]
@@ -658,7 +677,7 @@ mod tests {
 
         let pending = db.get_pending_changes().expect("get_pending_changes");
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].path, "/b.txt");
+        assert_eq!(pending[0].path(), "/b.txt");
     }
 
     #[test]
@@ -689,7 +708,7 @@ mod tests {
 
         let pending = db.get_pending_changes().expect("get_pending_changes");
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].path, "/b.txt");
+        assert_eq!(pending[0].path(), "/b.txt");
     }
 
     #[test]
@@ -719,7 +738,7 @@ mod tests {
         assert_eq!(conflicts[0].path, "/test/conflict.txt");
         assert_eq!(conflicts[0].local_state.hash, "abc123");
         assert_eq!(conflicts[0].remote_state.hash, "remote_hash");
-        assert!(!conflicts[0].notified);
+        assert!(!conflicts[0].is_notified());
     }
 
     #[test]
@@ -751,7 +770,7 @@ mod tests {
         let mut conflict = make_conflict("/test/conflict.txt");
         db.store_conflict(&conflict).expect("first store");
 
-        conflict.notified = true;
+        conflict.mark_notified();
         conflict.remote_state.hash = "updated_remote".to_string();
         db.store_conflict(&conflict).expect("second store");
 
@@ -759,7 +778,7 @@ mod tests {
             .get_conflict("/test/conflict.txt")
             .expect("get_conflict")
             .unwrap();
-        assert!(loaded.notified);
+        assert!(loaded.is_notified());
         assert_eq!(loaded.remote_state.hash, "updated_remote");
     }
 
@@ -776,7 +795,7 @@ mod tests {
             .get_conflict("/test/conflict.txt")
             .expect("get_conflict")
             .unwrap();
-        assert!(loaded.notified);
+        assert!(loaded.is_notified());
     }
 
     #[test]
@@ -913,36 +932,18 @@ mod tests {
         let db = test_db();
         let path = "/test/file.txt";
         let hash = Some("hash".to_string());
-        let size = Some(100u64);
         let now = Utc::now();
 
-        let created = Change::new(
+        let created =
+            Change::local_created(path.to_string(), hash.clone().unwrap_or_default(), 100u64);
+        let modified = Change::remote_modified(
             path.to_string(),
-            ChangeType::Created,
-            ChangeSource::Local,
-            hash.clone(),
-            size,
-            None,
-            None,
+            hash.clone().unwrap_or_default(),
+            100u64,
+            now,
+            "1-rev".to_string(),
         );
-        let modified = Change::new(
-            path.to_string(),
-            ChangeType::Modified,
-            ChangeSource::Remote,
-            hash.clone(),
-            size,
-            Some(now),
-            Some("1-rev".to_string()),
-        );
-        let deleted = Change::new(
-            path.to_string(),
-            ChangeType::Deleted,
-            ChangeSource::Local,
-            None,
-            None,
-            None,
-            None,
-        );
+        let deleted = Change::local_deleted(path.to_string());
 
         db.queue_change(&created).expect("queue created");
         db.queue_change(&modified).expect("queue modified");
@@ -950,11 +951,11 @@ mod tests {
 
         let pending = db.get_pending_changes().expect("get_pending_changes");
         assert_eq!(pending.len(), 3);
-        assert_eq!(pending[0].change_type, ChangeType::Created);
-        assert_eq!(pending[1].change_type, ChangeType::Modified);
-        assert_eq!(pending[2].change_type, ChangeType::Deleted);
-        assert_eq!(pending[0].source, ChangeSource::Local);
-        assert_eq!(pending[1].source, ChangeSource::Remote);
-        assert_eq!(pending[2].source, ChangeSource::Local);
+        assert_eq!(pending[0].change_type(), ChangeType::Created);
+        assert_eq!(pending[1].change_type(), ChangeType::Modified);
+        assert_eq!(pending[2].change_type(), ChangeType::Deleted);
+        assert_eq!(pending[0].source(), ChangeSource::Local);
+        assert_eq!(pending[1].source(), ChangeSource::Remote);
+        assert_eq!(pending[2].source(), ChangeSource::Local);
     }
 }

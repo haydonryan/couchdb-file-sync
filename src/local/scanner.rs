@@ -475,11 +475,11 @@ mod tests {
 
         let changes = scanner.detect_changes(&current, &stored);
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].path, "new.txt");
-        assert_eq!(changes[0].change_type, ChangeType::Created);
-        assert_eq!(changes[0].source, ChangeSource::Local);
-        assert_eq!(changes[0].hash.as_deref(), Some("hash1"));
-        assert_eq!(changes[0].size, Some(42));
+        assert_eq!(changes[0].path(), "new.txt");
+        assert_eq!(changes[0].change_type(), ChangeType::Created);
+        assert_eq!(changes[0].source(), ChangeSource::Local);
+        assert_eq!(changes[0].hash(), Some("hash1"));
+        assert_eq!(changes[0].size(), Some(42));
     }
 
     #[test]
@@ -502,11 +502,11 @@ mod tests {
 
         let changes = scanner.detect_changes(&current, &stored);
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].path, "edit.txt");
-        assert_eq!(changes[0].change_type, ChangeType::Modified);
-        assert_eq!(changes[0].source, ChangeSource::Local);
-        assert_eq!(changes[0].hash.as_deref(), Some("new_hash"));
-        assert_eq!(changes[0].size, Some(20));
+        assert_eq!(changes[0].path(), "edit.txt");
+        assert_eq!(changes[0].change_type(), ChangeType::Modified);
+        assert_eq!(changes[0].source(), ChangeSource::Local);
+        assert_eq!(changes[0].hash(), Some("new_hash"));
+        assert_eq!(changes[0].size(), Some(20));
     }
 
     #[test]
@@ -524,9 +524,9 @@ mod tests {
 
         let changes = scanner.detect_changes(&current, &stored);
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].path, "gone.txt");
-        assert_eq!(changes[0].change_type, ChangeType::Deleted);
-        assert_eq!(changes[0].source, ChangeSource::Local);
+        assert_eq!(changes[0].path(), "gone.txt");
+        assert_eq!(changes[0].change_type(), ChangeType::Deleted);
+        assert_eq!(changes[0].source(), ChangeSource::Local);
     }
 
     #[test]
@@ -552,7 +552,7 @@ mod tests {
 
         let changes = scanner.detect_changes(&current, &stored);
         assert_eq!(changes.len(), 3);
-        let change_paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
+        let change_paths: Vec<&str> = changes.iter().map(|c| c.path()).collect();
         assert!(change_paths.contains(&"create.txt"));
         assert!(change_paths.contains(&"modify.txt"));
         assert!(change_paths.contains(&"delete.txt"));
