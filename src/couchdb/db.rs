@@ -1,4 +1,4 @@
-use crate::models::{Change, ChangeSource, ChangeType, ChunkDoc, FileDoc, RemoteState};
+use crate::models::{Change, ChunkDoc, FileDoc, RemoteState};
 use anyhow::Result;
 use couch_rs::database::Database;
 use couch_rs::Client;
@@ -165,7 +165,7 @@ impl CouchDb {
 
             if row.deleted.unwrap_or(false) {
                 entries.push(ChangeFeedEntry {
-                    change: Change::remote_deleted(row.id),
+                    change: Change::remote_deleted(row.id, None),
                     seq: seq_to_string(&row.seq),
                 });
                 continue;
@@ -182,7 +182,7 @@ impl CouchDb {
 
             if doc.deleted {
                 entries.push(ChangeFeedEntry {
-                    change: Change::remote_deleted(doc.id),
+                    change: Change::remote_deleted(doc.id.clone(), Some(doc.modified_at())),
                     seq: seq_to_string(&row.seq),
                 });
                 continue;
@@ -312,17 +312,9 @@ impl CouchDb {
             .into_iter()
             .map(|doc| {
                 let mtime = doc.modified_at();
-                let rev = doc.rev.unwrap_or_default();
+                let rev = doc.rev.clone().unwrap_or_default();
                 if doc.deleted {
-                    Change::new(
-                        doc.id,
-                        ChangeType::Deleted,
-                        ChangeSource::Remote,
-                        None,
-                        None,
-                        Some(mtime),
-                        Some(rev),
-                    )
+                    Change::remote_deleted(doc.id.clone(), Some(doc.modified_at()))
                 } else {
                     crate::models::Change::remote_modified(
                         doc.id,
@@ -517,7 +509,7 @@ impl CouchDb {
             id: chunk_id.clone(),
             rev: None,
             data: content_str.to_string(),
-            doc_type: "leaf".to_string(),
+            doc_type: crate::models::DocType::Leaf,
         };
 
         self.save_chunk(&chunk).await?;

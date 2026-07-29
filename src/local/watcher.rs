@@ -396,9 +396,9 @@ mod tests {
 
         let event = WatcherEvent::FileCreated(PathBuf::from("/root/new.txt"));
         let change = w.event_to_change(event).unwrap();
-        assert_eq!(change.path, "new.txt");
-        assert_eq!(change.change_type, ChangeType::Created);
-        assert_eq!(change.source, ChangeSource::Local);
+        assert_eq!(change.path(), "new.txt");
+        assert_eq!(change.change_type(), ChangeType::Created);
+        assert_eq!(change.source(), ChangeSource::Local);
     }
 
     #[test]
@@ -408,9 +408,9 @@ mod tests {
 
         let event = WatcherEvent::FileModified(PathBuf::from("/root/existing.txt"));
         let change = w.event_to_change(event).unwrap();
-        assert_eq!(change.path, "existing.txt");
-        assert_eq!(change.change_type, ChangeType::Modified);
-        assert_eq!(change.source, ChangeSource::Local);
+        assert_eq!(change.path(), "existing.txt");
+        assert_eq!(change.change_type(), ChangeType::Modified);
+        assert_eq!(change.source(), ChangeSource::Local);
     }
 
     #[test]
@@ -420,9 +420,9 @@ mod tests {
 
         let event = WatcherEvent::FileDeleted(PathBuf::from("/root/gone.txt"));
         let change = w.event_to_change(event).unwrap();
-        assert_eq!(change.path, "gone.txt");
-        assert_eq!(change.change_type, ChangeType::Deleted);
-        assert_eq!(change.source, ChangeSource::Local);
+        assert_eq!(change.path(), "gone.txt");
+        assert_eq!(change.change_type(), ChangeType::Deleted);
+        assert_eq!(change.source(), ChangeSource::Local);
     }
 
     #[test]
@@ -436,9 +436,9 @@ mod tests {
         );
         let change = w.event_to_change(event).unwrap();
         // Renamed produces a local_created for the destination
-        assert_eq!(change.path, "new.txt");
-        assert_eq!(change.change_type, ChangeType::Created);
-        assert_eq!(change.source, ChangeSource::Local);
+        assert_eq!(change.path(), "new.txt");
+        assert_eq!(change.change_type(), ChangeType::Created);
+        assert_eq!(change.source(), ChangeSource::Local);
     }
 
     #[test]

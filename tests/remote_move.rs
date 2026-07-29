@@ -84,7 +84,7 @@ async fn remote_move_deletes_old_local_path() -> Result<()> {
         new_doc.id = new_remote.clone();
         new_doc.rev = None;
         new_doc.path = new_remote.clone();
-        new_doc.mtime = now;
+        new_doc.mtime = couchdb_file_sync::models::TimestampMillis::new(now);
         new_doc.deleted = false;
         couchdb.save_file(&mut new_doc).await?;
 
@@ -92,7 +92,7 @@ async fn remote_move_deletes_old_local_path() -> Result<()> {
         cleanup_chunks.extend(new_doc.children.clone());
 
         old_doc.deleted = true;
-        old_doc.mtime = now;
+        old_doc.mtime = couchdb_file_sync::models::TimestampMillis::new(now);
         couchdb.save_file(&mut old_doc).await?;
 
         let local_db = LocalDb::open(&state_db)?;
