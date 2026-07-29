@@ -1,4 +1,5 @@
 use anyhow::Result;
+use couchdb_file_sync::models::SyncDirPath;
 use couchdb_file_sync::{CouchDb, LocalDb, SyncEngine};
 use std::collections::HashSet;
 use std::env;
@@ -61,7 +62,11 @@ async fn remote_move_deletes_old_local_path() -> Result<()> {
 
     let test_result: Result<()> = async {
         let local_db = LocalDb::open(&state_db)?;
-        let mut engine = SyncEngine::new(couchdb, local_db, test_dir.path.clone());
+        let mut engine = SyncEngine::new(
+            couchdb,
+            local_db,
+            SyncDirPath::new(test_dir.path.clone()).unwrap(),
+        );
         engine.sync().await?;
 
         // Simulate a remote move: copy doc to new ID and mark old ID deleted.
@@ -104,7 +109,11 @@ async fn remote_move_deletes_old_local_path() -> Result<()> {
             &remote_path,
         )
         .await?;
-        let mut engine = SyncEngine::new(couchdb, local_db, test_dir.path.clone());
+        let mut engine = SyncEngine::new(
+            couchdb,
+            local_db,
+            SyncDirPath::new(test_dir.path.clone()).unwrap(),
+        );
         engine.sync().await?;
 
         let new_local = test_dir.join("new.txt");

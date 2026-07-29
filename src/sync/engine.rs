@@ -2,20 +2,19 @@ use crate::couchdb::CouchDb;
 use crate::local::{compute_bytes_hash, compute_file_hash, LocalDb, Scanner};
 use crate::models::{
     Change, ChangeType, Conflict, CouchRev, FileState, IgnoreMatcher, RemoteState,
-    ResolutionStrategy,
+    ResolutionStrategy, SyncDirPath,
 };
 use crate::sync::triage;
 use anyhow::Result;
 use chrono::Utc;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
 
 /// The main sync engine
 pub struct SyncEngine {
     couchdb: CouchDb,
     local_db: LocalDb,
-    root_dir: PathBuf,
+    root_dir: SyncDirPath,
     ignore_matcher: IgnoreMatcher,
 }
 
@@ -32,7 +31,7 @@ pub struct SyncReport {
 
 impl SyncEngine {
     /// Create a new sync engine
-    pub fn new(couchdb: CouchDb, local_db: LocalDb, root_dir: PathBuf) -> Self {
+    pub fn new(couchdb: CouchDb, local_db: LocalDb, root_dir: SyncDirPath) -> Self {
         Self::with_ignore(couchdb, local_db, root_dir, IgnoreMatcher::empty())
     }
 
@@ -40,7 +39,7 @@ impl SyncEngine {
     pub fn with_ignore(
         couchdb: CouchDb,
         local_db: LocalDb,
-        root_dir: PathBuf,
+        root_dir: SyncDirPath,
         ignore_matcher: IgnoreMatcher,
     ) -> Self {
         Self {
@@ -209,7 +208,7 @@ impl SyncEngine {
         let mut report = SyncReport::default();
 
         for local_path in local_deletes {
-            let file_path = self.root_dir.join(&local_path);
+            let file_path = self.root_dir.as_path().join(&local_path);
             if file_path.exists() {
                 tokio::fs::remove_file(&file_path).await?;
                 report.deleted_local += 1;
@@ -330,12 +329,6 @@ impl SyncEngine {
         for lc in local_changes {
             if !paths_to_lookup.contains(&lc.path()) {
                 paths_to_lookup.push(lc.path());
-            }
-        }
-        for rc in remote_changes {
-            let local_path = self.couchdb.get_local_path(rc.path());
-            if !paths_to_lookup.contains(&local_path.as_str()) {
-                // Need to clone to satisfy borrow checker; collect then lookup
             }
         }
         // Actually load all stored states individually (keeps existing pattern)
@@ -558,7 +551,7 @@ impl SyncEngine {
         for rc in &triage_result.remote_deletes {
             let local_path = self.couchdb.get_local_path(rc.path());
             let relative_path = local_path.trim_start_matches('/');
-            let file_path = self.root_dir.join(relative_path);
+            let file_path = self.root_dir.as_path().join(relative_path);
             let stored_state = stored_states.get(&local_path);
             if triage::should_apply_remote_delete(
                 stored_state,
@@ -591,7 +584,7 @@ impl SyncEngine {
     async fn get_local_state(&self, path: &str) -> Result<FileState> {
         // Strip leading / to prevent absolute path issues
         let relative_path = path.trim_start_matches('/');
-        let file_path = self.root_dir.join(relative_path);
+        let file_path = self.root_dir.as_path().join(relative_path);
         let hash = compute_file_hash(&file_path).map_err(|e| {
             anyhow::anyhow!("Failed to compute hash for {}: {}", file_path.display(), e)
         })?;
@@ -613,7 +606,7 @@ impl SyncEngine {
         remote_path: &str,
     ) -> Result<(usize, Option<String>)> {
         let relative_path = local_path.trim_start_matches('/');
-        let file_path = self.root_dir.join(relative_path);
+        let file_path = self.root_dir.as_path().join(relative_path);
         let metadata = std::fs::metadata(&file_path)?;
         let mtime = metadata
             .modified()?
@@ -701,7 +694,7 @@ impl SyncEngine {
         };
 
         let relative_path = local_path.trim_start_matches('/');
-        let file_path = self.root_dir.join(relative_path);
+        let file_path = self.root_dir.as_path().join(relative_path);
         if let Some(parent) = file_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -769,7 +762,7 @@ impl SyncEngine {
         let remote_path = change.path();
         let local_path = self.couchdb.get_local_path(remote_path);
         let relative_path = local_path.trim_start_matches('/');
-        let file_path = self.root_dir.join(relative_path);
+        let file_path = self.root_dir.as_path().join(relative_path);
 
         debug!("[DOWNLOAD] Remote is newer, downloading chunked file");
         debug!("[DOWNLOAD] {} -> {}", remote_path, local_path);
@@ -848,7 +841,7 @@ impl SyncEngine {
     }
 
     /// Get the root directory
-    pub fn root_dir(&self) -> &PathBuf {
+    pub fn root_dir(&self) -> &SyncDirPath {
         &self.root_dir
     }
 
@@ -931,11 +924,16 @@ mod tests {
         LocalDb::open_in_memory().expect("in-memory LocalDb should construct")
     }
 
+    fn test_root(path: &str) -> SyncDirPath {
+        std::fs::create_dir_all(path).expect("create test dir");
+        SyncDirPath::new(PathBuf::from(path)).expect("create SyncDirPath")
+    }
+
     #[test]
     fn engine_new_constructs_with_empty_ignore_matcher() {
         let couch = test_couchdb();
         let local = test_local_db();
-        let root = PathBuf::from("/tmp/test-sync-engine-new");
+        let root = test_root("/tmp/test-sync-engine-new");
 
         let engine = SyncEngine::new(couch, local, root.clone());
 
@@ -952,7 +950,7 @@ mod tests {
     fn engine_with_ignore_constructs_with_custom_ignore_matcher() {
         let couch = test_couchdb();
         let local = test_local_db();
-        let root = PathBuf::from("/tmp/test-sync-engine-with-ignore");
+        let root = test_root("/tmp/test-sync-engine-with-ignore");
 
         let matcher = IgnoreMatcher::from_content("*.log\nnode_modules/");
         let engine = SyncEngine::with_ignore(couch, local, root, matcher);
@@ -970,7 +968,7 @@ mod tests {
 
     #[test]
     fn engine_new_and_with_ignore_produce_same_root_dir() {
-        let root = PathBuf::from("/tmp/test-sync-engine-root");
+        let root = test_root("/tmp/test-sync-engine-root");
         let engine1 = SyncEngine::new(test_couchdb(), test_local_db(), root.clone());
         let engine2 = SyncEngine::with_ignore(
             test_couchdb(),
@@ -988,7 +986,7 @@ mod tests {
         let engine = SyncEngine::new(
             test_couchdb(),
             test_local_db(),
-            PathBuf::from("/tmp/test-sync-engine-state"),
+            test_root("/tmp/test-sync-engine-state"),
         );
 
         // Fresh engine should have no conflicts
@@ -1004,7 +1002,7 @@ mod tests {
         let engine = SyncEngine::new(
             test_couchdb(),
             test_local_db(),
-            PathBuf::from("/tmp/test-sync-engine-checkpoint"),
+            test_root("/tmp/test-sync-engine-checkpoint"),
         );
 
         // Save a checkpoint
@@ -1021,7 +1019,7 @@ mod tests {
         let engine = SyncEngine::new(
             test_couchdb(),
             test_local_db(),
-            PathBuf::from("/tmp/test-sync-engine-paths"),
+            test_root("/tmp/test-sync-engine-paths"),
         );
 
         // local_to_remote_path should prepend the prefix

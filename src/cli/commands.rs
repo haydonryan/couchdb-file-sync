@@ -2,7 +2,7 @@ use crate::config::{default_user_config_file, AppConfig, SyncPath};
 use crate::couchdb::{ChangeFeedEntry, CouchDb};
 use crate::local::{AsyncFileWatcher, LocalDb};
 use crate::matrix::MatrixNotifier;
-use crate::models::{Change, ChangeType, IgnoreMatcher, ResolutionStrategy};
+use crate::models::{Change, ChangeType, IgnoreMatcher, ResolutionStrategy, SyncDirPath};
 use crate::sync::{SyncEngine, SyncReport};
 use crate::telegram::TelegramNotifier;
 use anyhow::{Context, Result};
@@ -421,7 +421,12 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
     }
 
     // Run sync
-    let mut engine = SyncEngine::with_ignore(couchdb, local_db, path.clone(), ignore_matcher);
+    let mut engine = SyncEngine::with_ignore(
+        couchdb,
+        local_db,
+        SyncDirPath::new(path.clone()).unwrap(),
+        ignore_matcher,
+    );
     let report = engine.sync().await?;
 
     print_sync_report(&report);
@@ -457,7 +462,12 @@ pub async fn rebuild_remote(path: PathBuf, config: AppConfig) -> Result<SyncRepo
     )
     .await?;
 
-    let mut engine = SyncEngine::with_ignore(couchdb, local_db, path, ignore_matcher);
+    let mut engine = SyncEngine::with_ignore(
+        couchdb,
+        local_db,
+        SyncDirPath::new(path).unwrap(),
+        ignore_matcher,
+    );
     let report = engine.rebuild_remote_from_local().await?;
     print_sync_report(&report);
 
@@ -480,7 +490,12 @@ pub async fn rebuild_local(path: PathBuf, config: AppConfig) -> Result<SyncRepor
     )
     .await?;
 
-    let mut engine = SyncEngine::with_ignore(couchdb, local_db, path, ignore_matcher);
+    let mut engine = SyncEngine::with_ignore(
+        couchdb,
+        local_db,
+        SyncDirPath::new(path).unwrap(),
+        ignore_matcher,
+    );
     let report = engine.rebuild_local_from_remote().await?;
     print_sync_report(&report);
 
@@ -915,7 +930,12 @@ async fn daemon_sync(
     .await?;
 
     // Run sync
-    let mut engine = SyncEngine::with_ignore(couchdb, local_db, path.to_path_buf(), ignore_matcher);
+    let mut engine = SyncEngine::with_ignore(
+        couchdb,
+        local_db,
+        SyncDirPath::new(path.to_path_buf()).unwrap(),
+        ignore_matcher,
+    );
     let report = engine.sync().await?;
 
     print_sync_report(&report);
@@ -986,8 +1006,12 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
     )
     .await?;
 
-    let mut engine =
-        SyncEngine::with_ignore(couchdb, local_db, path.clone(), (*ignore_matcher).clone());
+    let mut engine = SyncEngine::with_ignore(
+        couchdb,
+        local_db,
+        SyncDirPath::new(path.clone()).unwrap(),
+        (*ignore_matcher).clone(),
+    );
     let initial_since = match engine.get_checkpoint()? {
         Some((seq, _)) => seq,
         None => {
@@ -999,7 +1023,7 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
     let (local_tx, mut local_rx) = mpsc::channel::<Change>(256);
     let (remote_tx, mut remote_rx) = mpsc::channel::<ChangeFeedEntry>(256);
 
-    let watcher_root = path.clone();
+    let watcher_root = SyncDirPath::new(path.clone()).unwrap();
     let watcher_ignore = ignore_matcher.clone();
     let debounce_ms = config.sync.debounce_ms;
     let watcher_config = config.clone();
@@ -1087,7 +1111,7 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
 }
 
 async fn run_local_watcher(
-    root: PathBuf,
+    root: SyncDirPath,
     ignore_matcher: Arc<IgnoreMatcher>,
     debounce_ms: u64,
     tx: mpsc::Sender<Change>,
@@ -1318,7 +1342,7 @@ pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
     )
     .await?;
 
-    let mut engine = SyncEngine::new(couchdb, local_db, path.clone());
+    let mut engine = SyncEngine::new(couchdb, local_db, SyncDirPath::new(path.clone()).unwrap());
 
     println!("Found {} conflict(s) to resolve:\n", conflicts.len());
 
@@ -1367,25 +1391,20 @@ pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
         print_side_by_side_diff(&local_content, &remote_content);
 
         // Ask user for action
-        let options = &[
-            "Keep Local",
-            "Keep Remote",
-            "Keep Both (merge manually)",
-            "Skip",
+        let strategies = [
+            (ResolutionStrategy::KeepLocal, "Keep Local"),
+            (ResolutionStrategy::KeepRemote, "Keep Remote"),
+            (ResolutionStrategy::KeepBoth, "Keep Both (merge manually)"),
+            (ResolutionStrategy::Skip, "Skip"),
         ];
+        let options: Vec<&str> = strategies.iter().map(|(_, label)| *label).collect();
         let selection = Select::with_theme(&ColorfulTheme::default())
             .with_prompt("How do you want to resolve this conflict?")
-            .items(options)
+            .items(&options)
             .default(0)
             .interact()?;
 
-        let strategy = match selection {
-            0 => ResolutionStrategy::KeepLocal,
-            1 => ResolutionStrategy::KeepRemote,
-            2 => ResolutionStrategy::KeepBoth,
-            3 => ResolutionStrategy::Skip,
-            _ => unreachable!(),
-        };
+        let strategy = strategies[selection].0;
 
         if strategy == ResolutionStrategy::Skip {
             println!("Skipped.\n");

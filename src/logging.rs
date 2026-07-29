@@ -7,12 +7,20 @@ use std::time::{Duration as StdDuration, Instant};
 
 const ROTATION_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 
+/// State of the underlying log file.
+enum LogFileState {
+    /// The log file is open and ready for writing.
+    Open(File),
+    /// The log file is closed (e.g. after a failed rotation).
+    Closed,
+}
+
 pub struct AppLogWriter {
     path: PathBuf,
     rotation: RotationConfig,
     opened_on: NaiveDate,
     last_rotation_at: Instant,
-    file: Option<File>,
+    file: LogFileState,
 }
 
 impl AppLogWriter {
@@ -31,7 +39,7 @@ impl AppLogWriter {
             rotation,
             opened_on: current_date,
             last_rotation_at: Instant::now(),
-            file: Some(file),
+            file: LogFileState::Open(file),
         })
     }
 
@@ -47,10 +55,10 @@ impl AppLogWriter {
     }
 
     fn rotate(&mut self, next_opened_on: NaiveDate) -> io::Result<()> {
-        if let Some(file) = self.file.as_mut() {
+        if let LogFileState::Open(file) = &mut self.file {
             file.flush()?;
         }
-        drop(self.file.take());
+        self.file = LogFileState::Closed;
 
         match self.rotation {
             RotationConfig::DailyDelete => match fs::remove_file(&self.path) {
@@ -70,7 +78,7 @@ impl AppLogWriter {
             RotationConfig::Never => {}
         }
 
-        self.file = Some(open_log_file(&self.path)?);
+        self.file = LogFileState::Open(open_log_file(&self.path)?);
         self.opened_on = next_opened_on;
         self.last_rotation_at = Instant::now();
         Ok(())
@@ -80,14 +88,23 @@ impl AppLogWriter {
 impl Write for AppLogWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.rotate_if_needed()?;
-        self.file
-            .as_mut()
-            .expect("log file should be open")
-            .write(buf)
+        match &mut self.file {
+            LogFileState::Open(file) => file.write(buf),
+            LogFileState::Closed => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "log file is closed",
+            )),
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.file.as_mut().expect("log file should be open").flush()
+        match &mut self.file {
+            LogFileState::Open(file) => file.flush(),
+            LogFileState::Closed => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "log file is closed",
+            )),
+        }
     }
 }
 

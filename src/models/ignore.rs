@@ -2,10 +2,19 @@ use globset::{Glob, GlobMatcher};
 use std::path::Path;
 use tracing::{debug, warn};
 
+/// A single ignore pattern entry with its negation flag.
+#[derive(Debug, Clone)]
+pub struct IgnoreEntry {
+    /// The compiled glob matcher for this pattern.
+    pub matcher: GlobMatcher,
+    /// Whether this is a negation pattern (prefixed with `!`).
+    pub is_negation: bool,
+}
+
 /// Manages ignore patterns from .sync-ignore files
 #[derive(Debug, Clone)]
 pub struct IgnoreMatcher {
-    patterns: Vec<(GlobMatcher, bool)>, // (matcher, is_negation)
+    patterns: Vec<IgnoreEntry>,
 }
 
 impl Default for IgnoreMatcher {
@@ -58,7 +67,10 @@ impl IgnoreMatcher {
                 }
             };
 
-            patterns.push((glob.compile_matcher(), is_negation));
+            patterns.push(IgnoreEntry {
+                matcher: glob.compile_matcher(),
+                is_negation,
+            });
             debug!("Added ignore pattern: {} (negation: {})", line, is_negation);
         }
 
@@ -96,9 +108,9 @@ impl IgnoreMatcher {
     pub fn is_ignored(&self, path: &str, _is_dir: bool) -> bool {
         let mut ignored = false;
 
-        for (matcher, is_negation) in &self.patterns {
-            if matcher.is_match(path) {
-                ignored = !is_negation;
+        for entry in &self.patterns {
+            if entry.matcher.is_match(path) {
+                ignored = !entry.is_negation;
             }
         }
 
