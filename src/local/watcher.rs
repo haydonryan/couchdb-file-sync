@@ -1,4 +1,4 @@
-use crate::models::{Change, IgnoreMatcher};
+use crate::models::{Change, IgnoreMatcher, SyncDirPath};
 use anyhow::Result;
 use notify_debouncer_full::{
     new_debouncer,
@@ -13,7 +13,7 @@ use tracing::{debug, error, trace};
 
 /// File system watcher with debouncing
 pub struct FileWatcher {
-    root_dir: PathBuf,
+    root_dir: SyncDirPath,
     #[allow(dead_code)]
     ignore_matcher: Arc<IgnoreMatcher>,
     event_rx: mpsc::Receiver<WatcherEvent>,
@@ -30,7 +30,11 @@ pub enum WatcherEvent {
 
 impl FileWatcher {
     /// Create a new file watcher
-    pub fn new(root_dir: PathBuf, ignore_matcher: IgnoreMatcher, debounce_ms: u64) -> Result<Self> {
+    pub fn new(
+        root_dir: SyncDirPath,
+        ignore_matcher: IgnoreMatcher,
+        debounce_ms: u64,
+    ) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::channel(100);
         let ignore_matcher = Arc::new(ignore_matcher);
         let root = root_dir.clone();
@@ -54,8 +58,11 @@ impl FileWatcher {
         )?;
 
         // Start watching
-        debouncer.watch(&root_dir, RecursiveMode::Recursive)?;
-        debug!("Started watching directory: {}", root_dir.display());
+        debouncer.watch(root_dir.as_path(), RecursiveMode::Recursive)?;
+        debug!(
+            "Started watching directory: {}",
+            root_dir.as_path().display()
+        );
 
         // Keep the debouncer alive by moving it into a static
         // (In a real implementation, you'd want to store this in the struct)
@@ -111,7 +118,7 @@ impl FileWatcher {
 
     /// Get path relative to root
     fn relative_path(&self, path: &Path) -> Option<PathBuf> {
-        path.strip_prefix(&self.root_dir)
+        path.strip_prefix(self.root_dir.as_path())
             .ok()
             .map(|p| p.to_path_buf())
     }
@@ -227,7 +234,7 @@ pub struct AsyncFileWatcher {
 impl AsyncFileWatcher {
     /// Create and start watching
     pub fn start(
-        root_dir: PathBuf,
+        root_dir: SyncDirPath,
         ignore_matcher: IgnoreMatcher,
         debounce_ms: u64,
     ) -> Result<Self> {
@@ -262,7 +269,7 @@ mod tests {
     fn test_watcher(root: PathBuf) -> FileWatcher {
         let (_tx, event_rx) = tokio::sync::mpsc::channel(100);
         FileWatcher {
-            root_dir: root,
+            root_dir: SyncDirPath::new(root).expect("valid test root"),
             ignore_matcher: Arc::new(IgnoreMatcher::empty()),
             event_rx,
         }
