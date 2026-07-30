@@ -161,7 +161,7 @@ jobs:
           steps.evaluate.outputs.needs_attention == 'true' &&
           env.SLACK_BOT_TOKEN != '' &&
           env.SLACK_CHANNEL_ID != ''
-        uses: slackapi/slack-github-action@v3.0.1
+        uses: slackapi/slack-github-action@v4.0.0
         with:
           method: chat.postMessage
           token: ${{ secrets.SLACK_BOT_TOKEN }}
