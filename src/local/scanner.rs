@@ -2,6 +2,7 @@ use crate::models::{Change, FileState, IgnoreMatcher, SyncDirPath};
 use anyhow::Result;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::Path;
 use tracing::{debug, info, trace, warn};
 use walkdir::WalkDir;
@@ -177,7 +178,14 @@ impl Scanner {
 pub fn compute_file_hash(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)?;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let bytes_read = file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
     let result = hasher.finalize();
     Ok(hex::encode(result))
 }
