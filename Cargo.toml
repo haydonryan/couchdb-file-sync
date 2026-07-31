@@ -87,3 +87,8 @@ publish = false
 tag-name = "v{{version}}"
 tag-message = "release: v{{version}}"
 pre-release-commit-message = "release: v{{version}}"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
