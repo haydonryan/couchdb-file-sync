@@ -2,8 +2,8 @@ use crate::models::{Change, IgnoreMatcher, SyncDirPath};
 use anyhow::Result;
 use notify_debouncer_full::{
     new_debouncer,
-    notify::{EventKind, RecursiveMode},
-    DebounceEventResult, DebouncedEvent,
+    notify::{EventKind, RecommendedWatcher, RecursiveMode},
+    DebounceEventResult, DebouncedEvent, Debouncer, NoCache,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,8 +14,8 @@ use tracing::{debug, error, trace};
 /// File system watcher with debouncing
 pub struct FileWatcher {
     root_dir: SyncDirPath,
-    #[allow(dead_code)]
-    ignore_matcher: Arc<IgnoreMatcher>,
+    /// The debouncer is stored to keep the watcher alive; dropped on `FileWatcher::drop`.
+    _debouncer: Option<Debouncer<RecommendedWatcher, NoCache>>,
     event_rx: mpsc::Receiver<WatcherEvent>,
 }
 
@@ -37,9 +37,8 @@ impl FileWatcher {
     ) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::channel(100);
         let ignore_matcher = Arc::new(ignore_matcher);
+        let closure_matcher = ignore_matcher;
         let root = root_dir.clone();
-
-        let closure_matcher = ignore_matcher.clone();
         let mut debouncer = new_debouncer(
             Duration::from_millis(debounce_ms),
             None,
@@ -64,13 +63,11 @@ impl FileWatcher {
             root_dir.as_path().display()
         );
 
-        // Keep the debouncer alive by moving it into a static
-        // (In a real implementation, you'd want to store this in the struct)
-        Box::leak(Box::new(debouncer));
+        // Stored in the struct so Drop cleans up the watcher thread.
 
         Ok(Self {
             root_dir,
-            ignore_matcher,
+            _debouncer: Some(debouncer),
             event_rx,
         })
     }
@@ -270,7 +267,7 @@ mod tests {
         let (_tx, event_rx) = tokio::sync::mpsc::channel(100);
         FileWatcher {
             root_dir: SyncDirPath::new(root).expect("valid test root"),
-            ignore_matcher: Arc::new(IgnoreMatcher::empty()),
+            _debouncer: None,
             event_rx,
         }
     }
