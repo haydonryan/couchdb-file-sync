@@ -14,7 +14,9 @@ use tracing::{debug, error, info, warn};
 pub struct SyncEngine {
     couchdb: CouchDb,
     local_db: LocalDb,
+    scanner: Scanner,
     root_dir: SyncDirPath,
+    /// Kept for backward compatibility; delegates to scanner.
     ignore_matcher: IgnoreMatcher,
 }
 
@@ -32,7 +34,15 @@ pub struct SyncReport {
 impl SyncEngine {
     /// Create a new sync engine
     pub fn new(couchdb: CouchDb, local_db: LocalDb, root_dir: SyncDirPath) -> Self {
-        Self::with_ignore(couchdb, local_db, root_dir, IgnoreMatcher::empty())
+        let ignore_matcher = IgnoreMatcher::empty();
+        let scanner = Scanner::new(root_dir.clone(), ignore_matcher.clone());
+        Self {
+            couchdb,
+            local_db,
+            scanner,
+            root_dir,
+            ignore_matcher,
+        }
     }
 
     /// Create a new sync engine with ignore patterns applied to full scans.
@@ -42,9 +52,11 @@ impl SyncEngine {
         root_dir: SyncDirPath,
         ignore_matcher: IgnoreMatcher,
     ) -> Self {
+        let scanner = Scanner::new(root_dir.clone(), ignore_matcher.clone());
         Self {
             couchdb,
             local_db,
+            scanner,
             root_dir,
             ignore_matcher,
         }
@@ -164,8 +176,7 @@ impl SyncEngine {
     pub async fn rebuild_remote_from_local(&mut self) -> Result<SyncReport> {
         info!("========== REMOTE REBUILD STARTING ==========");
 
-        let scanner = Scanner::new(self.root_dir.clone(), self.ignore_matcher.clone());
-        let local_states = scanner.full_scan()?;
+        let local_states = self.scanner.full_scan()?;
         let remote_docs = self.couchdb.get_all_files().await?;
         let (uploads, remote_deletes) =
             triage::plan_remote_rebuild(&local_states, &remote_docs, self.couchdb.remote_prefix());
@@ -197,8 +208,7 @@ impl SyncEngine {
     pub async fn rebuild_local_from_remote(&mut self) -> Result<SyncReport> {
         info!("========== LOCAL REBUILD STARTING ==========");
 
-        let scanner = Scanner::new(self.root_dir.clone(), self.ignore_matcher.clone());
-        let local_states = scanner.full_scan()?;
+        let local_states = self.scanner.full_scan()?;
         let remote_docs = self.couchdb.get_all_files().await?;
         let (local_deletes, remote_downloads) =
             triage::plan_local_rebuild(&local_states, &remote_docs);
@@ -236,8 +246,7 @@ impl SyncEngine {
 
     /// Scan for local changes
     async fn scan_local_changes(&self) -> Result<Vec<Change>> {
-        let scanner = Scanner::new(self.root_dir.clone(), self.ignore_matcher.clone());
-        let current_states = scanner.full_scan()?;
+        let current_states = self.scanner.full_scan()?;
         let stored_states = self.local_db.get_all_file_states()?;
         let remote_prefix = self.couchdb.remote_prefix();
         let mut valid_stored_states = Vec::with_capacity(stored_states.len());
@@ -269,7 +278,9 @@ impl SyncEngine {
             valid_stored_states.len()
         );
 
-        let changes = scanner.detect_changes(&current_states, &valid_stored_states);
+        let changes = self
+            .scanner
+            .detect_changes(&current_states, &valid_stored_states);
 
         debug!("Detected {} changes from local scan", changes.len());
         for change in &changes {
