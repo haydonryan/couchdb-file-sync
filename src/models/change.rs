@@ -213,10 +213,6 @@ impl ChangeBatch {
         self.changes.iter()
     }
 
-    pub fn into_inner(self) -> Vec<Change> {
-        self.changes
-    }
-
     pub fn local_changes(&self) -> Vec<Change> {
         self.changes
             .iter()

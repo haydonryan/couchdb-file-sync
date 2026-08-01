@@ -36,11 +36,6 @@ impl SyncDirPath {
     pub fn as_path_buf(&self) -> &PathBuf {
         &self.0
     }
-
-    /// Consume the wrapper and return the inner `PathBuf`.
-    pub fn into_inner(self) -> PathBuf {
-        self.0
-    }
 }
 
 impl Deref for SyncDirPath {
