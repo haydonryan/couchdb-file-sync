@@ -149,24 +149,20 @@ pub fn triage_changes(
 
         let stored_state = stored_states.get(lc.path());
 
-        // Check if the remote side also changed for this path
-        let remote_also_changed = remote_map
-            .get(remote_path.as_str())
-            .map(|rc| remote_is_newer(rc.mtime().copied(), stored_state))
-            .unwrap_or(false);
-
-        if remote_also_changed {
-            // Both sides changed — the caller must compare content hashes
-            let rc = remote_map.get(remote_path.as_str()).unwrap();
-            result.needs_comparison.push(TriageDecision {
-                path: lc.path().to_string(),
-                outcome: TriageOutcome::NeedsComparison,
-                local_change: Some(lc.clone()),
-                remote_change: Some((*rc).clone()),
-            });
-        } else {
-            // Remote unchanged → upload local change
-            result.uploads.push(lc.clone());
+        // Check if the remote side also changed for this path, performing a
+        // single remote_map lookup and reusing the borrow for needs_comparison.
+        match remote_map.get(remote_path.as_str()) {
+            Some(rc) if remote_is_newer(rc.mtime().copied(), stored_state) => {
+                // Both sides changed — the caller must compare content hashes
+                result.needs_comparison.push(TriageDecision {
+                    path: lc.path().to_string(),
+                    outcome: TriageOutcome::NeedsComparison,
+                    local_change: Some(lc.clone()),
+                    remote_change: Some((*rc).clone()),
+                });
+            }
+            // Remote unchanged or absent → upload local change
+            _ => result.uploads.push(lc.clone()),
         }
     }
 
