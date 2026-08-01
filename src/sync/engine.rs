@@ -680,7 +680,7 @@ impl SyncEngine {
         let hash = compute_file_hash(&file_path).map_err(|e| {
             anyhow::anyhow!("Failed to compute hash for {}: {}", file_path.display(), e)
         })?;
-        let metadata = std::fs::metadata(&file_path).map_err(|e| {
+        let metadata = tokio::fs::metadata(&file_path).await.map_err(|e| {
             anyhow::anyhow!("Failed to read metadata for {}: {}", file_path.display(), e)
         })?;
 
@@ -699,7 +699,7 @@ impl SyncEngine {
     ) -> Result<(usize, Option<String>)> {
         let relative_path = local_path.trim_start_matches('/');
         let file_path = self.root_dir.as_path().join(relative_path);
-        let metadata = std::fs::metadata(&file_path)?;
+        let metadata = tokio::fs::metadata(&file_path).await?;
         let mtime = metadata
             .modified()?
             .duration_since(std::time::UNIX_EPOCH)
@@ -817,7 +817,7 @@ impl SyncEngine {
         // of re-reading the file back from disk. This avoids a redundant disk
         // read and keeps the saved hash equal to the bytes actually transferred.
         let hash = compute_bytes_hash(&content);
-        let metadata = std::fs::metadata(&file_path)?;
+        let metadata = tokio::fs::metadata(&file_path).await?;
         let state = FileState {
             path: local_path.to_string(),
             hash,
