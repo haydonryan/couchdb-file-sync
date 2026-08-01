@@ -521,7 +521,10 @@ impl CouchDb {
             return Ok((Vec::new(), seq));
         }
 
-        debug!("Checkpoint found: {}, returning changes", since.unwrap());
+        debug!(
+            "Checkpoint found: {}, returning changes",
+            since.unwrap_or_default()
+        );
 
         // Return all files (including deleted) as potential changes (sync will compare revs)
         let changes: Vec<Change> = all_files
