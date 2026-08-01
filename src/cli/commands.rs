@@ -1200,7 +1200,7 @@ async fn handle_local_change(
     touched: &mut TouchTracker,
     change: &Change,
 ) -> Result<()> {
-    let mtime = local_mtime(engine.root_dir(), change.path());
+    let mtime = local_mtime(engine.root_dir(), change.path()).await;
     if touched.is_touched(change.path(), mtime) {
         return Ok(());
     }
@@ -1249,9 +1249,9 @@ async fn handle_remote_change(
         }
         ChangeType::Created | ChangeType::Modified => {
             let file_path = engine.root_dir().join(&local_rel);
-            let local_meta = std::fs::metadata(&file_path).ok();
+            let local_meta = tokio::fs::metadata(&file_path).await.ok();
             let local_exists = local_meta.is_some();
-            let local_mtime = local_meta
+            let local_mtime_val = local_meta
                 .and_then(|meta| meta.modified().ok())
                 .unwrap_or_else(SystemTime::now);
             let remote_mtime = change
@@ -1263,7 +1263,7 @@ async fn handle_remote_change(
                     if !local_exists {
                         true
                     } else {
-                        let local_ms = local_mtime
+                        let local_ms = local_mtime_val
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_millis() as i64;
@@ -1297,9 +1297,10 @@ async fn handle_remote_change(
     Ok(())
 }
 
-fn local_mtime(root: &Path, relative_path: &str) -> SystemTime {
+async fn local_mtime(root: &Path, relative_path: &str) -> SystemTime {
     let file_path = root.join(relative_path);
-    std::fs::metadata(&file_path)
+    tokio::fs::metadata(&file_path)
+        .await
         .and_then(|meta| meta.modified())
         .unwrap_or_else(|_| SystemTime::now())
 }
@@ -1883,34 +1884,34 @@ mod tests {
 
     // ── local_mtime ───────────────────────────────────────────────────────
 
-    #[test]
-    fn test_local_mtime_file_exists() {
+    #[tokio::test]
+    async fn test_local_mtime_file_exists() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("test.txt"), "content").unwrap();
-        let mtime = local_mtime(root, "test.txt");
+        let mtime = local_mtime(root, "test.txt").await;
         let now = SystemTime::now();
         let diff = now.duration_since(mtime).unwrap_or_default();
         assert!(diff.as_secs() < 5);
     }
 
-    #[test]
-    fn test_local_mtime_file_not_exists() {
+    #[tokio::test]
+    async fn test_local_mtime_file_not_exists() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let mtime = local_mtime(root, "nonexistent.txt");
+        let mtime = local_mtime(root, "nonexistent.txt").await;
         let now = SystemTime::now();
         let diff = now.duration_since(mtime).unwrap_or_default();
         assert!(diff.as_secs() < 5);
     }
 
-    #[test]
-    fn test_local_mtime_nested_path() {
+    #[tokio::test]
+    async fn test_local_mtime_nested_path() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("subdir")).unwrap();
         std::fs::write(root.join("subdir/file.txt"), "content").unwrap();
-        let mtime = local_mtime(root, "subdir/file.txt");
+        let mtime = local_mtime(root, "subdir/file.txt").await;
         let now = SystemTime::now();
         let diff = now.duration_since(mtime).unwrap_or_default();
         assert!(diff.as_secs() < 5);
