@@ -8,6 +8,7 @@ use tracing::{debug, info, trace, warn};
 use walkdir::WalkDir;
 
 /// Scans the filesystem for changes
+#[derive(Clone)]
 pub struct Scanner {
     root_dir: SyncDirPath,
     ignore_matcher: IgnoreMatcher,
@@ -22,8 +23,19 @@ impl Scanner {
         }
     }
 
-    /// Perform a full scan of the directory
-    pub fn full_scan(&self) -> Result<Vec<FileState>> {
+    /// Perform a full scan of the directory.
+    ///
+    /// The blocking walkdir/hash work runs on tokio's blocking thread pool via
+    /// [`tokio::task::spawn_blocking`] so the async executor is never stalled by
+    /// the scan.
+    pub async fn full_scan(&self) -> Result<Vec<FileState>> {
+        let scanner = self.clone();
+        tokio::task::spawn_blocking(move || scanner.scan_blocking()).await?
+    }
+
+    /// Walk the directory tree and hash every file using blocking filesystem
+    /// calls. Called on a blocking thread pool by [`Self::full_scan`].
+    fn scan_blocking(&self) -> Result<Vec<FileState>> {
         let mut states = Vec::new();
 
         for entry in WalkDir::new(&self.root_dir).follow_links(false) {
@@ -300,8 +312,8 @@ mod tests {
 
     // ---- full_scan tests ----
 
-    #[test]
-    fn test_full_scan_returns_all_files() {
+    #[tokio::test]
+    async fn test_full_scan_returns_all_files() {
         let temp_dir = TempDir::new().unwrap();
         std::fs::write(temp_dir.path().join("a.txt"), b"aaa").unwrap();
         std::fs::write(temp_dir.path().join("b.txt"), b"bbb").unwrap();
@@ -311,7 +323,7 @@ mod tests {
             SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
             IgnoreMatcher::empty(),
         );
-        let states = scanner.full_scan().unwrap();
+        let states = scanner.full_scan().await.unwrap();
 
         assert_eq!(states.len(), 3);
         let paths: Vec<&str> = states.iter().map(|s| s.path.as_str()).collect();
@@ -320,8 +332,8 @@ mod tests {
         assert!(paths.contains(&"c.txt"));
     }
 
-    #[test]
-    fn test_full_scan_with_nested_directories() {
+    #[tokio::test]
+    async fn test_full_scan_with_nested_directories() {
         let temp_dir = TempDir::new().unwrap();
         std::fs::create_dir_all(temp_dir.path().join("nested")).unwrap();
         std::fs::write(temp_dir.path().join("root.txt"), b"root").unwrap();
@@ -331,7 +343,7 @@ mod tests {
             SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
             IgnoreMatcher::empty(),
         );
-        let states = scanner.full_scan().unwrap();
+        let states = scanner.full_scan().await.unwrap();
 
         assert_eq!(states.len(), 2);
         let paths: Vec<&str> = states.iter().map(|s| s.path.as_str()).collect();
@@ -339,8 +351,8 @@ mod tests {
         assert!(paths.contains(&"nested/child.txt"));
     }
 
-    #[test]
-    fn test_full_scan_skips_directories() {
+    #[tokio::test]
+    async fn test_full_scan_skips_directories() {
         let temp_dir = TempDir::new().unwrap();
         std::fs::create_dir_all(temp_dir.path().join("empty_dir")).unwrap();
         std::fs::write(temp_dir.path().join("file.txt"), b"data").unwrap();
@@ -349,14 +361,14 @@ mod tests {
             SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
             IgnoreMatcher::empty(),
         );
-        let states = scanner.full_scan().unwrap();
+        let states = scanner.full_scan().await.unwrap();
 
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].path, "file.txt");
     }
 
-    #[test]
-    fn test_full_scan_respects_ignore_patterns() {
+    #[tokio::test]
+    async fn test_full_scan_respects_ignore_patterns() {
         let temp_dir = TempDir::new().unwrap();
         std::fs::write(temp_dir.path().join("keep.txt"), b"keep").unwrap();
         std::fs::write(temp_dir.path().join("ignore.log"), b"log data").unwrap();
@@ -367,7 +379,7 @@ mod tests {
             SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
             matcher,
         );
-        let states = scanner.full_scan().unwrap();
+        let states = scanner.full_scan().await.unwrap();
 
         let paths: Vec<&str> = states.iter().map(|s| s.path.as_str()).collect();
         assert!(paths.contains(&"keep.txt"));
@@ -375,8 +387,8 @@ mod tests {
         assert!(!paths.contains(&"ignore.log"));
     }
 
-    #[test]
-    fn test_full_scan_skips_dotfiles() {
+    #[tokio::test]
+    async fn test_full_scan_skips_dotfiles() {
         let temp_dir = TempDir::new().unwrap();
         std::fs::write(temp_dir.path().join("visible.txt"), b"seen").unwrap();
         std::fs::write(temp_dir.path().join(".hidden"), b"hidden").unwrap();
@@ -385,21 +397,21 @@ mod tests {
             SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
             IgnoreMatcher::empty(),
         );
-        let states = scanner.full_scan().unwrap();
+        let states = scanner.full_scan().await.unwrap();
 
         let paths: Vec<&str> = states.iter().map(|s| s.path.as_str()).collect();
         assert!(paths.contains(&"visible.txt"));
         assert!(!paths.contains(&".hidden"));
     }
 
-    #[test]
-    fn test_full_scan_empty_directory() {
+    #[tokio::test]
+    async fn test_full_scan_empty_directory() {
         let temp_dir = TempDir::new().unwrap();
         let scanner = Scanner::new(
             SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
             IgnoreMatcher::empty(),
         );
-        let states = scanner.full_scan().unwrap();
+        let states = scanner.full_scan().await.unwrap();
 
         assert!(
             states.is_empty(),

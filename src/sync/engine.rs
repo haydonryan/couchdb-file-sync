@@ -236,7 +236,7 @@ impl SyncEngine {
     pub async fn rebuild_remote_from_local(&mut self) -> Result<SyncReport> {
         info!("========== REMOTE REBUILD STARTING ==========");
 
-        let local_states = self.scanner.full_scan()?;
+        let local_states = self.scanner.full_scan().await?;
         let remote_docs = self.couchdb.get_all_files().await?;
         let (uploads, remote_deletes) =
             triage::plan_remote_rebuild(&local_states, &remote_docs, self.couchdb.remote_prefix());
@@ -268,7 +268,7 @@ impl SyncEngine {
     pub async fn rebuild_local_from_remote(&mut self) -> Result<SyncReport> {
         info!("========== LOCAL REBUILD STARTING ==========");
 
-        let local_states = self.scanner.full_scan()?;
+        let local_states = self.scanner.full_scan().await?;
         let remote_docs = self.couchdb.get_all_files().await?;
         let (local_deletes, remote_downloads) =
             triage::plan_local_rebuild(&local_states, &remote_docs);
@@ -310,7 +310,7 @@ impl SyncEngine {
     /// cleanups (removing polluted/ignored entries and re-saving unchanged
     /// states) are skipped so that nothing is written to the state DB.
     async fn scan_local_changes(&self, dry_run: bool) -> Result<Vec<Change>> {
-        let current_states = self.scanner.full_scan()?;
+        let current_states = self.scanner.full_scan().await?;
         let stored_states = self.local_db.get_all_file_states()?;
         let remote_prefix = self.couchdb.remote_prefix();
         let mut valid_stored_states = Vec::with_capacity(stored_states.len());
