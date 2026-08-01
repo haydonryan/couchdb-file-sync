@@ -484,8 +484,8 @@ mod tests {
             RotationConfig::DailyDelete,
         ];
         for variant in &variants {
-            let yaml = serde_yaml::to_string(variant).unwrap();
-            let deserialized: RotationConfig = serde_yaml::from_str(&yaml).unwrap();
+            let yaml = serde_norway::to_string(variant).unwrap();
+            let deserialized: RotationConfig = serde_norway::from_str(&yaml).unwrap();
             assert_eq!(*variant, deserialized);
         }
     }
@@ -493,21 +493,21 @@ mod tests {
     #[test]
     fn test_log_level_serde_lowercase() {
         let yaml = "debug\n";
-        let level: LogLevel = serde_yaml::from_str(yaml).unwrap();
+        let level: LogLevel = serde_norway::from_str(yaml).unwrap();
         assert_eq!(level, LogLevel::Debug);
     }
 
     #[test]
     fn test_conflict_strategy_serde_kebab() {
         let yaml = "keep-local\n";
-        let strategy: ConflictStrategy = serde_yaml::from_str(yaml).unwrap();
+        let strategy: ConflictStrategy = serde_norway::from_str(yaml).unwrap();
         assert_eq!(strategy, ConflictStrategy::KeepLocal);
     }
 
     #[test]
     fn test_matrix_message_type_serde() {
         let yaml = "m.text\n";
-        let msg_type: MatrixMessageType = serde_yaml::from_str(yaml).unwrap();
+        let msg_type: MatrixMessageType = serde_norway::from_str(yaml).unwrap();
         assert_eq!(msg_type, MatrixMessageType::Text);
     }
 
@@ -519,8 +519,8 @@ mod tests {
             bot_token: "123:abc".into(),
             chat_id: "-456".into(),
         };
-        let yaml = serde_yaml::to_string(&creds).unwrap();
-        let deserialized: TelegramCredentials = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = serde_norway::to_string(&creds).unwrap();
+        let deserialized: TelegramCredentials = serde_norway::from_str(&yaml).unwrap();
         assert_eq!(deserialized.bot_token, "123:abc");
         assert_eq!(deserialized.chat_id, "-456");
     }
@@ -532,8 +532,8 @@ mod tests {
             access_token: "syt_token".into(),
             room_id: "!room:example.com".into(),
         };
-        let yaml = serde_yaml::to_string(&creds).unwrap();
-        let deserialized: MatrixCredentials = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = serde_norway::to_string(&creds).unwrap();
+        let deserialized: MatrixCredentials = serde_norway::from_str(&yaml).unwrap();
         assert_eq!(deserialized.homeserver_url, "https://matrix.example.com");
         assert_eq!(deserialized.access_token, "syt_token");
         assert_eq!(deserialized.room_id, "!room:example.com");
@@ -545,8 +545,8 @@ mod tests {
             username: "admin".into(),
             password: "secret".into(),
         };
-        let yaml = serde_yaml::to_string(&auth).unwrap();
-        let deserialized: CouchDbAuth = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = serde_norway::to_string(&auth).unwrap();
+        let deserialized: CouchDbAuth = serde_norway::from_str(&yaml).unwrap();
         assert_eq!(deserialized.username, "admin");
         assert_eq!(deserialized.password, "secret");
     }
@@ -656,7 +656,7 @@ mod tests {
         let yaml = r#"
 local: /home/user/docs
 "#;
-        let sync_path: SyncPath = serde_yaml::from_str(yaml).unwrap();
+        let sync_path: SyncPath = serde_norway::from_str(yaml).unwrap();
         assert_eq!(sync_path.local, PathBuf::from("/home/user/docs"));
         assert_eq!(
             sync_path.remote, "",
@@ -670,8 +670,8 @@ local: /home/user/docs
             local: PathBuf::from("/data/photos"),
             remote: "photos/".to_string(),
         };
-        let yaml = serde_yaml::to_string(&original).unwrap();
-        let deserialized: SyncPath = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = serde_norway::to_string(&original).unwrap();
+        let deserialized: SyncPath = serde_norway::from_str(&yaml).unwrap();
         assert_eq!(original.local, deserialized.local);
         assert_eq!(original.remote, deserialized.remote);
     }
@@ -789,7 +789,7 @@ auth:
   password: secret
 database: my_db
 "#;
-        let config: CouchDbConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: CouchDbConfig = serde_norway::from_str(yaml).unwrap();
         assert_eq!(config.url, "https://couch.example.com:6984");
         assert!(config.auth.is_some());
         let auth = config.auth.unwrap();
@@ -804,7 +804,7 @@ database: my_db
 url: "https://couch.example.com:6984"
 database: my_db
 "#;
-        let config: CouchDbConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: CouchDbConfig = serde_norway::from_str(yaml).unwrap();
         assert_eq!(config.url, "https://couch.example.com:6984");
         assert!(config.auth.is_none());
         assert_eq!(config.database, "my_db");
@@ -819,7 +819,7 @@ credentials:
   bot_token: "123:abc"
   chat_id: "-456"
 "#;
-        let config: TelegramConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: TelegramConfig = serde_norway::from_str(yaml).unwrap();
         assert!(config.credentials.is_some());
         let creds = config.credentials.unwrap();
         assert_eq!(creds.bot_token, "123:abc");
@@ -843,7 +843,7 @@ credentials:
   room_id: "!room:example.com"
 message_type: "m.text"
 "#;
-        let config: MatrixConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: MatrixConfig = serde_norway::from_str(yaml).unwrap();
         assert!(config.credentials.is_some());
         let creds = config.credentials.unwrap();
         assert_eq!(creds.homeserver_url, "https://matrix.example.com");
@@ -860,7 +860,7 @@ credentials:
   access_token: "syt_token"
   room_id: "!room:example.com"
 "#;
-        let config: MatrixConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: MatrixConfig = serde_norway::from_str(yaml).unwrap();
         assert_eq!(config.message_type, MatrixMessageType::Notice);
     }
 }
