@@ -50,6 +50,8 @@ async fn dry_run_does_not_modify_state_db_or_remote_couchdb() -> Result<()> {
         pass.as_deref(),
         &db_name,
         &remote_path,
+        30,
+        3,
     )
     .await?;
     assert!(couchdb.ping().await?, "CouchDB ping failed");
@@ -109,6 +111,8 @@ async fn dry_run_does_not_modify_state_db_or_remote_couchdb() -> Result<()> {
             pass.as_deref(),
             &db_name,
             &remote_path,
+            30,
+            3,
         )
         .await?;
         let remote_docs = verify.get_all_files().await?;
@@ -129,6 +133,8 @@ async fn dry_run_does_not_modify_state_db_or_remote_couchdb() -> Result<()> {
         pass.as_deref(),
         &db_name,
         &remote_path,
+        30,
+        3,
     )
     .await?;
     let cleanup_docs = cleanup_couchdb

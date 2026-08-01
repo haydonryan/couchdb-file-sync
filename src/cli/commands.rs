@@ -418,6 +418,8 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
         config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
         &DatabaseName::new(&config.couchdb.database),
         &RemotePath::new(&config.couchdb.remote_path),
+        config.couchdb.timeout_seconds,
+        config.couchdb.retry_attempts,
     )
     .await?;
 
@@ -467,6 +469,8 @@ pub async fn rebuild_remote(path: PathBuf, config: AppConfig) -> Result<SyncRepo
         config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
         &DatabaseName::new(&config.couchdb.database),
         &RemotePath::new(&config.couchdb.remote_path),
+        config.couchdb.timeout_seconds,
+        config.couchdb.retry_attempts,
     )
     .await?;
 
@@ -495,6 +499,8 @@ pub async fn rebuild_local(path: PathBuf, config: AppConfig) -> Result<SyncRepor
         config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
         &DatabaseName::new(&config.couchdb.database),
         &RemotePath::new(&config.couchdb.remote_path),
+        config.couchdb.timeout_seconds,
+        config.couchdb.retry_attempts,
     )
     .await?;
 
@@ -934,6 +940,8 @@ async fn daemon_sync(
         config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
         &DatabaseName::new(&config.couchdb.database),
         &RemotePath::new(&config.couchdb.remote_path),
+        config.couchdb.timeout_seconds,
+        config.couchdb.retry_attempts,
     )
     .await?;
 
@@ -1011,6 +1019,8 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
         config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
         &DatabaseName::new(&config.couchdb.database),
         &RemotePath::new(&config.couchdb.remote_path),
+        config.couchdb.timeout_seconds,
+        config.couchdb.retry_attempts,
     )
     .await?;
 
@@ -1151,6 +1161,8 @@ async fn run_remote_changes(
         config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
         &DatabaseName::new(&config.couchdb.database),
         &RemotePath::new(&config.couchdb.remote_path),
+        config.couchdb.timeout_seconds,
+        config.couchdb.retry_attempts,
     )
     .await?;
 
@@ -1347,6 +1359,8 @@ pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
         config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
         &DatabaseName::new(&config.couchdb.database),
         &RemotePath::new(&config.couchdb.remote_path),
+        config.couchdb.timeout_seconds,
+        config.couchdb.retry_attempts,
     )
     .await?;
 

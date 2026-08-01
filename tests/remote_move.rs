@@ -56,6 +56,8 @@ async fn remote_move_deletes_old_local_path() -> Result<()> {
         pass.as_deref(),
         &db_name,
         &remote_path,
+        30,
+        3,
     )
     .await?;
     assert!(couchdb.ping().await?, "CouchDB ping failed");
@@ -76,6 +78,8 @@ async fn remote_move_deletes_old_local_path() -> Result<()> {
             pass.as_deref(),
             &db_name,
             &remote_path,
+            30,
+            3,
         )
         .await?;
 
@@ -107,6 +111,8 @@ async fn remote_move_deletes_old_local_path() -> Result<()> {
             pass.as_deref(),
             &db_name,
             &remote_path,
+            30,
+            3,
         )
         .await?;
         let mut engine = SyncEngine::new(
@@ -227,7 +233,7 @@ async fn cleanup_remote(
     doc_ids: &[String],
     chunk_ids: &[String],
 ) -> Result<()> {
-    let couchdb = CouchDb::new(url, user, pass, db_name, remote_path).await?;
+    let couchdb = CouchDb::new(url, user, pass, db_name, remote_path, 30, 3).await?;
     if !chunk_ids.is_empty() {
         couchdb.delete_chunks(chunk_ids).await?;
     }
