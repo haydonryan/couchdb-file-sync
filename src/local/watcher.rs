@@ -706,4 +706,28 @@ mod tests {
 
         assert!(rx.try_recv().is_err());
     }
+
+    // -----------------------------------------------------------------------
+    // Debouncer ownership (story #2663 regression guard)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn file_watcher_owns_debouncer() {
+        // FileWatcher must own the notify Debouncer (not Box::leak it) so the
+        // watcher thread is cleaned up when FileWatcher is dropped. If the
+        // debouncer were leaked again and the struct field removed, this test
+        // would stop compiling; if a watcher were constructed without owning
+        // the debouncer, this assertion would fail at runtime.
+        let tmp = tempfile::tempdir().expect("temporary dir");
+        let watcher = FileWatcher::new(
+            SyncDirPath::new(tmp.path().to_path_buf()).expect("valid test root"),
+            IgnoreMatcher::empty(),
+            100,
+        )
+        .expect("watcher starts");
+
+        assert!(
+            watcher._debouncer.is_some(),
+            "FileWatcher must hold the notify debouncer so it is cleaned up on Drop"
+        );
+    }
 }
