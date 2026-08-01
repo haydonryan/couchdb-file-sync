@@ -99,10 +99,6 @@ impl TimestampMillis {
     pub fn to_datetime(&self) -> DateTime<Utc> {
         DateTime::from_timestamp_millis(self.0 as i64).unwrap_or_else(Utc::now)
     }
-
-    pub fn from_datetime(dt: &DateTime<Utc>) -> Self {
-        TimestampMillis(dt.timestamp_millis() as u64)
-    }
 }
 
 impl fmt::Display for TimestampMillis {
