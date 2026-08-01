@@ -52,7 +52,12 @@ impl RateLimitedWarn {
     /// Returns `true` when a warning may be emitted now, claiming the cooldown
     /// so concurrent callers cannot all log at once.
     fn should_emit(&self) -> bool {
-        let mut last = self.last.lock().expect("rate-limit lock poisoned");
+        // Recover the inner value if another thread panicked while holding the
+        // lock (Mutex poisoning) instead of panicking on the live watcher hot path.
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Instant::now();
         if let Some(prev) = *last {
             if now.duration_since(prev) < self.interval {
@@ -864,8 +869,13 @@ mod tests {
             sender.send(WatcherEvent::FileCreated(path.clone()));
         });
 
-        let output = String::from_utf8(buffer.lock().expect("buffer lock poisoned").clone())
-            .expect("tracing output is utf-8");
+        let output = String::from_utf8(
+            buffer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        )
+        .expect("tracing output is utf-8");
         assert!(
             output.contains("dropped file-watcher event"),
             "expected a drop warning to be logged, got: {output}"
@@ -895,12 +905,49 @@ mod tests {
             }
         });
 
-        let output = String::from_utf8(buffer.lock().expect("buffer lock poisoned").clone())
-            .expect("tracing output is utf-8");
+        let output = String::from_utf8(
+            buffer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        )
+        .expect("tracing output is utf-8");
         let warn_count = output.matches("dropped file-watcher event").count();
         assert_eq!(
             warn_count, 1,
             "expected a single rate-limited warning, got {warn_count} in: {output}"
+        );
+    }
+    // -----------------------------------------------------------------------
+    // Rate-limit warning survives a poisoned lock (story #2933)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_drop_warning_survives_poisoned_lock() {
+        let warn = RateLimitedWarn::new(Duration::from_secs(1));
+
+        // Poison the rate-limit mutex by panicking while holding its guard, as
+        // would happen if another thread panicked mid-warning on the watcher
+        // hot path. catch_unwind prevents the panic from failing this test.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = warn
+                .last
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            panic!("poison the rate-limit lock");
+        }));
+
+        // should_emit must not panic on the poisoned lock: the first call has
+        // nothing to suppress and should claim the cooldown and emit.
+        assert!(
+            warn.should_emit(),
+            "should_emit must return true (emit) after the lock is poisoned"
+        );
+
+        // A second call within the 1s cooldown window must still be suppressed,
+        // proving the rate limiter keeps working after poisoning.
+        assert!(
+            !warn.should_emit(),
+            "should_emit must suppress a second warning within the cooldown after poisoning"
         );
     }
 }
