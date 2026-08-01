@@ -5,7 +5,14 @@ use couch_rs::Client;
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use serde_json::Value;
+use std::future::Future;
+use std::time::Duration;
 use tracing::{debug, warn};
+
+/// Base delay in milliseconds for retry backoff; doubles after each retry.
+/// Only used in non-test builds; tests use a fixed tiny delay (`test_backoff`).
+#[cfg(not(test))]
+const RETRY_BASE_BACKOFF_MS: u64 = 250;
 
 /// CouchDB client wrapper
 pub struct CouchDb {
@@ -18,6 +25,11 @@ pub struct CouchDb {
     auth: Option<(String, String)>,
     /// Remote path prefix to sync (e.g., "notes/" or "obsidian/")
     remote_path: RemotePath,
+    /// Request timeout in seconds applied to all CouchDB HTTP operations.
+    timeout_seconds: u64,
+    /// Maximum total attempts (including the initial one) for a CouchDB
+    /// operation before giving up on transient connectivity failures.
+    retry_attempts: u32,
     /// Test-only canned responses used to exercise the sync pipeline without a
     /// live CouchDB server. Only present in test builds.
     #[cfg(test)]
@@ -26,6 +38,10 @@ pub struct CouchDb {
     /// Only present in test builds.
     #[cfg(test)]
     test_write_calls: std::sync::atomic::AtomicUsize,
+    /// Test-only override for the retry backoff delay. Only present in test
+    /// builds so retry unit tests run quickly without real sleeps.
+    #[cfg(test)]
+    test_backoff: Duration,
 }
 
 /// Test-only canned responses for the CouchDB client.
@@ -73,17 +89,30 @@ fn seq_to_string(value: &Value) -> String {
 }
 
 impl CouchDb {
-    /// Create a new CouchDB client
+    /// Create a new CouchDB client.
+    ///
+    /// `timeout_seconds` is applied as the request timeout for every CouchDB
+    /// HTTP operation (both the direct reqwest client and the `couch_rs`
+    /// client). `retry_attempts` caps the total number of attempts made for an
+    /// operation when it fails with a transient connectivity error (see
+    /// [`Self::retry_transient`]); the operation is attempted at most
+    /// `retry_attempts` times in total, with exponential backoff between
+    /// attempts.
     pub async fn new(
         url: &str,
         username: Option<&str>,
         password: Option<&str>,
         db_name: &str,
         remote_path: &str,
+        timeout_seconds: u64,
+        retry_attempts: u32,
     ) -> Result<Self> {
+        let timeout = Duration::from_secs(timeout_seconds);
         let client = match (username, password) {
-            (Some(u), Some(p)) => Client::new(url, u, p)?,
-            _ => Client::new_no_auth(url)?,
+            (Some(u), Some(p)) => {
+                Client::new_with_timeout(url, Some(u), Some(p), Some(timeout_seconds))?
+            }
+            _ => Client::new_with_timeout(url, None, None, Some(timeout_seconds))?,
         };
 
         // Get or create database
@@ -104,20 +133,26 @@ impl CouchDb {
         Ok(Self {
             client,
             db,
-            http_client: HttpClient::new(),
+            http_client: HttpClient::builder().timeout(timeout).build()?,
             base_db_url,
             db_name: DatabaseName::new(db_name.to_string()),
             auth,
             remote_path: RemotePath::new(remote_path.to_string()),
+            timeout_seconds,
+            retry_attempts,
             #[cfg(test)]
             test_state: None,
             #[cfg(test)]
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            test_backoff: Duration::from_millis(1),
         })
     }
 
     async fn get_update_seq(&self) -> Result<String> {
-        let info = self.client.get_info(&self.db_name).await?;
+        let info = self
+            .retry_transient(|| self.client.get_info(&self.db_name))
+            .await?;
         Ok(info.update_seq)
     }
 
@@ -141,10 +176,14 @@ impl CouchDb {
             db_name: DatabaseName::new("unittest"),
             auth: None,
             remote_path: RemotePath::new(remote_path.to_string()),
+            timeout_seconds: 30,
+            retry_attempts: 3,
             #[cfg(test)]
             test_state: None,
             #[cfg(test)]
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            test_backoff: Duration::from_millis(1),
         }
     }
 
@@ -177,19 +216,28 @@ impl CouchDb {
     ) -> Result<(Vec<ChangeFeedEntry>, String)> {
         let url = format!("{}/_changes", self.base_db_url);
 
-        let mut request = self.http_client.get(&url).query(&[
-            ("since", since),
-            ("include_docs", "true"),
-            ("feed", "longpoll"),
-            ("timeout", &timeout_ms.to_string()),
-        ]);
+        let body = self
+            .retry_transient::<_, _, ChangesResponse<FileDoc>, anyhow::Error>(|| {
+                let mut request = self.http_client.get(&url).query(&[
+                    ("since", since),
+                    ("include_docs", "true"),
+                    ("feed", "longpoll"),
+                    ("timeout", &timeout_ms.to_string()),
+                ]);
 
-        if let Some((username, password)) = &self.auth {
-            request = request.basic_auth(username, Some(password));
-        }
+                if let Some((username, password)) = &self.auth {
+                    request = request.basic_auth(username, Some(password));
+                }
 
-        let response = request.send().await?.error_for_status()?;
-        let body = response.json::<ChangesResponse<FileDoc>>().await?;
+                async move {
+                    let response = request.send().await?.error_for_status()?;
+                    response
+                        .json::<ChangesResponse<FileDoc>>()
+                        .await
+                        .map_err(Into::into)
+                }
+            })
+            .await?;
 
         let mut entries = Vec::new();
         for row in body.results {
@@ -249,6 +297,91 @@ impl CouchDb {
         &self.remote_path
     }
 
+    /// Configured request timeout in seconds applied to CouchDB operations.
+    pub fn timeout_seconds(&self) -> u64 {
+        self.timeout_seconds
+    }
+
+    /// Maximum total attempts (including the initial one) made for a CouchDB
+    /// operation when it fails with a transient connectivity error.
+    pub fn retry_attempts(&self) -> u32 {
+        self.retry_attempts
+    }
+
+    /// Run `op`, retrying transient connectivity failures with exponential
+    /// backoff.
+    ///
+    /// The operation is attempted at most [`Self::retry_attempts`] times in
+    /// total (the initial attempt plus retries; never fewer than one). Only
+    /// failures classified as transient by [`Self::is_transient`] are retried;
+    /// persistent errors are returned immediately.
+    async fn retry_transient<F, Fut, T, E>(&self, op: F) -> std::result::Result<T, E>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = std::result::Result<T, E>>,
+        E: std::fmt::Display,
+    {
+        let mut attempts: u32 = 0;
+        let total = self.retry_attempts.max(1);
+        let mut op = op;
+        loop {
+            match op().await {
+                Ok(value) => return Ok(value),
+                Err(e) if Self::is_transient(&e) && attempts + 1 < total => {
+                    attempts += 1;
+                    let backoff = self.backoff(attempts);
+                    warn!(
+                        "CouchDB transient failure (attempt {}/{}): {}; retrying in {:?}",
+                        attempts, total, e, backoff
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Delay to wait before the next retry attempt (pathological: real sleeps
+    /// in production, a tiny fixed delay in test builds to keep tests fast).
+    fn backoff(&self, attempts: u32) -> Duration {
+        #[cfg(test)]
+        {
+            let _ = attempts;
+            self.test_backoff
+        }
+        #[cfg(not(test))]
+        {
+            Duration::from_millis(
+                RETRY_BASE_BACKOFF_MS.saturating_mul(1u64 << (attempts - 1).min(6)),
+            )
+        }
+    }
+
+    /// Whether `err` represents a transient connectivity failure that is safe
+    /// to retry (connection refused/reset, timeouts, DNS failures, and CouchDB
+    /// 429/5xx responses).
+    fn is_transient<E: std::fmt::Display>(err: &E) -> bool {
+        let lower = err.to_string().to_ascii_lowercase();
+        lower.contains("timeout")
+            || lower.contains("timed out")
+            || lower.contains("connection refused")
+            || lower.contains("connection reset")
+            || lower.contains("connection closed")
+            || lower.contains("broken pipe")
+            || lower.contains("eof while")
+            || lower.contains("network is unreachable")
+            || lower.contains("temporary failure in name resolution")
+            || lower.contains("name or service not known")
+            || lower.contains(" 502 ")
+            || lower.contains(" 503 ")
+            || lower.contains(" 504 ")
+            || lower.contains(" 429 ")
+            || lower.contains("502 bad gateway")
+            || lower.contains("503 service unavailable")
+            || lower.contains("504 gateway timeout")
+            || lower.contains("too many requests")
+    }
+
     /// Get the full remote path for a local file
     pub fn get_remote_path(&self, local_path: &str) -> String {
         if self.remote_path.is_empty() {
@@ -279,7 +412,7 @@ impl CouchDb {
             return Ok(None);
         }
 
-        match self.db.get(path).await {
+        match self.retry_transient(|| self.db.get(path)).await {
             Ok(doc) => Ok(Some(doc)),
             Err(e) => {
                 // Check if it's a 404
@@ -303,7 +436,27 @@ impl CouchDb {
         }
 
         debug!("Saving file to CouchDB: {}", doc.id);
-        let _details = self.db.save(doc).await?;
+
+        // `doc` is borrowed mutably across the save, which cannot be returned
+        // from a lazy closure, so apply the retry contract inline here: at most
+        // `retry_attempts` total attempts, retrying only transient failures.
+        let mut attempts: u32 = 0;
+        let total = self.retry_attempts.max(1);
+        loop {
+            match self.db.save(doc).await {
+                Ok(_details) => break,
+                Err(e) if Self::is_transient(&e) && attempts + 1 < total => {
+                    attempts += 1;
+                    let backoff = self.backoff(attempts);
+                    warn!(
+                        "CouchDB transient failure while saving {} (attempt {}/{}): {}; retrying in {:?}",
+                        doc.id, attempts, total, e, backoff
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
         Ok(())
     }
 
@@ -327,7 +480,9 @@ impl CouchDb {
     /// Get all documents (files only - not chunks, including deleted)
     /// Filtered by the configured remote path
     pub async fn get_all_files(&self) -> Result<Vec<FileDoc>> {
-        let collection = self.db.get_all::<FileDoc>().await?;
+        let collection = self
+            .retry_transient(|| self.db.get_all::<FileDoc>())
+            .await?;
         Ok(collection
             .rows
             .into_iter()
@@ -410,7 +565,7 @@ impl CouchDb {
 
         debug!("[FETCH METADATA] Fetching metadata for: {}", path);
 
-        match self.db.get::<FileDoc>(path).await {
+        match self.retry_transient(|| self.db.get::<FileDoc>(path)).await {
             Ok(doc) => {
                 debug!("[FETCH METADATA] Retrieved metadata:");
                 debug!("  path: {}", doc.path);
@@ -437,7 +592,7 @@ impl CouchDb {
     /// Test connection to CouchDB
     pub async fn ping(&self) -> Result<bool> {
         // Get all files (limit 1) to test connection
-        match self.db.get_all::<FileDoc>().await {
+        match self.retry_transient(|| self.db.get_all::<FileDoc>()).await {
             Ok(_) => Ok(true),
             Err(_) => Ok(false),
         }
@@ -449,36 +604,47 @@ impl CouchDb {
     pub async fn get_attachment(&self, doc_id: &str, attachment_name: &str) -> Result<Vec<u8>> {
         let url = format!("{}/{}/{}", self.base_db_url, doc_id, attachment_name);
 
-        let mut request = self.http_client.get(&url);
+        let bytes = self
+            .retry_transient::<_, _, Vec<u8>, anyhow::Error>(|| {
+                let mut request = self.http_client.get(&url);
 
-        if let Some((username, password)) = &self.auth {
-            request = request.basic_auth(username, Some(password));
-        }
+                if let Some((username, password)) = &self.auth {
+                    request = request.basic_auth(username, Some(password));
+                }
 
-        let response = request.send().await?;
+                async move {
+                    let response = request.send().await?;
 
-        if !response.status().is_success() {
-            anyhow::bail!(
-                "Failed to fetch attachment {}/{}: {}",
-                doc_id,
-                attachment_name,
-                response.status()
-            );
-        }
+                    if !response.status().is_success() {
+                        anyhow::bail!(
+                            "Failed to fetch attachment {}/{}: {}",
+                            doc_id,
+                            attachment_name,
+                            response.status()
+                        );
+                    }
 
-        Ok(response.bytes().await?.to_vec())
+                    Ok(response.bytes().await?.to_vec())
+                }
+            })
+            .await?;
+
+        Ok(bytes)
     }
 
     /// Get a chunk document by ID
     async fn get_chunk(&self, chunk_id: &str) -> Result<Option<ChunkDoc>> {
         let url = format!("{}/{}", self.base_db_url, chunk_id);
 
-        let mut request = self.http_client.get(&url);
-        if let Some((username, password)) = &self.auth {
-            request = request.basic_auth(username, Some(password));
-        }
-
-        let response = request.send().await?;
+        let response = self
+            .retry_transient::<_, _, reqwest::Response, anyhow::Error>(|| {
+                let mut request = self.http_client.get(&url);
+                if let Some((username, password)) = &self.auth {
+                    request = request.basic_auth(username, Some(password));
+                }
+                async move { request.send().await.map_err(Into::into) }
+            })
+            .await?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
@@ -541,15 +707,22 @@ impl CouchDb {
     async fn save_chunk(&self, chunk: &ChunkDoc) -> Result<()> {
         let url = format!("{}/{}", self.base_db_url, chunk.id);
 
-        let mut request = self.http_client.put(&url);
-        if let Some((username, password)) = &self.auth {
-            request = request.basic_auth(username, Some(password));
-        }
+        let response = self
+            .retry_transient::<_, _, reqwest::Response, anyhow::Error>(|| {
+                let mut request = self.http_client.put(&url);
+                if let Some((username, password)) = &self.auth {
+                    request = request.basic_auth(username, Some(password));
+                }
 
-        let response = request
-            .header("Content-Type", "application/json")
-            .json(chunk)
-            .send()
+                async move {
+                    request
+                        .header("Content-Type", "application/json")
+                        .json(chunk)
+                        .send()
+                        .await
+                        .map_err(Into::into)
+                }
+            })
             .await?;
 
         if !response.status().is_success() {
@@ -637,8 +810,11 @@ mod tests {
             db_name: DatabaseName::new("test_db"),
             auth: None,
             remote_path: RemotePath::new(remote_path.to_string()),
+            timeout_seconds: 30,
+            retry_attempts: 3,
             test_state: None,
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),
+            test_backoff: Duration::from_millis(1),
         }
     }
 
@@ -820,5 +996,134 @@ mod tests {
         let result = db.fetch_metadata("config/secrets.md").await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 10831/10832/10833: timeout_seconds and retry_attempts wiring
+    // -----------------------------------------------------------------------
+
+    /// Build a test client with explicit timeout/retry settings.
+    fn test_couchdb_with_settings(timeout_seconds: u64, retry_attempts: u32) -> CouchDb {
+        let mut db = test_couchdb("");
+        db.timeout_seconds = timeout_seconds;
+        db.retry_attempts = retry_attempts;
+        db
+    }
+
+    #[test]
+    fn configured_timeout_and_retry_are_threaded_into_client() {
+        let db = test_couchdb_with_settings(42, 5);
+        assert_eq!(db.timeout_seconds(), 42);
+        assert_eq!(db.retry_attempts(), 5);
+    }
+
+    #[tokio::test]
+    async fn retry_transient_injects_n_failures_and_retries_up_to_retry_attempts() {
+        // Verify behavior: N = retry_attempts - 1 transient failures are
+        // tolerated, and the operation succeeds on the last allowed attempt.
+        let db = test_couchdb_with_settings(30, 3);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let result = db
+            .retry_transient::<_, _, u32, String>(|| {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if n < 2 {
+                        Err("connection refused".to_string())
+                    } else {
+                        Ok(42u32)
+                    }
+                }
+            })
+            .await;
+
+        assert_eq!(result, Ok(42));
+        // 2 transient failures + 1 success == retry_attempts total attempts.
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "client should retry up to retry_attempts total attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_transient_gives_up_after_retry_attempts_transient_failures() {
+        let db = test_couchdb_with_settings(30, 2);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let result = db
+            .retry_transient::<_, _, (), String>(|| {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    let _ = n;
+                    Err("connection reset by peer".to_string())
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "client must give up after retry_attempts total attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_transient_does_not_retry_non_transient_errors() {
+        let db = test_couchdb_with_settings(30, 5);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let result = db
+            .retry_transient::<_, _, (), String>(|| {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    let _ = n;
+                    Err("400 bad request: invalid document".to_string())
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "non-transient errors must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_transient_always_performs_at_least_one_attempt() {
+        let db = test_couchdb_with_settings(30, 0);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let result = db
+            .retry_transient::<_, _, (), String>(|| {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    let _ = n;
+                    Err("connection refused".to_string())
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "zero retry_attempts is clamped to a single attempt"
+        );
+    }
+
+    #[test]
+    fn timeout_is_classified_as_transient() {
+        assert!(CouchDb::is_transient(&"operation timed out".to_string()));
+        assert!(CouchDb::is_transient(
+            &"error sending request: request timed out".to_string()
+        ));
+        assert!(CouchDb::is_transient(&"connection refused".to_string()));
+        assert!(CouchDb::is_transient(&"502 bad gateway".to_string()));
+        assert!(!CouchDb::is_transient(&"400 bad request".to_string()));
+        assert!(!CouchDb::is_transient(&"JSON parse error".to_string()));
     }
 }
