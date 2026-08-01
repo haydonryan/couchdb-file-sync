@@ -802,8 +802,11 @@ impl SyncEngine {
                 data
             }
             Err(e) => {
-                debug!("No content for {}: {}, using empty file", remote_path, e);
-                Vec::new()
+                // A content-fetch failure is a real sync failure, not "no
+                // content": propagate it instead of swallowing it. Otherwise a
+                // transient network/auth/server error would silently truncate
+                // a valid local file to zero bytes and record it as synced.
+                anyhow::bail!("failed to fetch content for {}: {}", remote_path, e);
             }
         };
 
@@ -1330,6 +1333,7 @@ mod tests {
                 remote_path.to_string(),
                 b"remote-content".to_vec(),
             )]),
+            content_errors: std::collections::HashSet::new(),
         };
         let mut engine = SyncEngine::with_ignore(
             test_canned_couch("prefix/", canned),
@@ -1397,6 +1401,7 @@ mod tests {
                 remote_path.to_string(),
                 b"same-content".to_vec(),
             )]),
+            content_errors: std::collections::HashSet::new(),
         };
         let mut engine = SyncEngine::with_ignore(
             test_canned_couch("prefix/", canned),
@@ -1502,6 +1507,7 @@ mod tests {
             last_seq: "1".to_string(),
             metadata: std::collections::HashMap::from([(remote_path.to_string(), remote_doc)]),
             contents: std::collections::HashMap::from([(remote_path.to_string(), content.clone())]),
+            content_errors: std::collections::HashSet::new(),
         };
         let local = test_local_db();
         let mut engine = SyncEngine::with_ignore(
@@ -1529,5 +1535,107 @@ mod tests {
             "saved download hash must equal the hash of the transferred content buffer"
         );
         assert_eq!(state.size, content.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn download_remote_file_content_fetch_error_propagates_without_writing() {
+        // Regression for #2898: a failed content fetch must propagate as an
+        // error instead of being swallowed into an empty-file write plus
+        // synced state (which would silently truncate a valid local file).
+        let root = test_root("/tmp/cfs-download-fetch-error");
+
+        // Scenario A: existing valid local file with tracked state. The failed
+        // content fetch must surface as an error and leave file + state intact.
+        let remote_path = "prefix/err.txt";
+        let local_path = "err.txt";
+        std::fs::write(root.as_path().join(local_path), "original-content").unwrap();
+
+        let mut remote_doc = FileDoc::new(remote_path.to_string(), String::new(), 16);
+        remote_doc.rev = Some("1-abc".to_string());
+        remote_doc.path = remote_path.to_string();
+
+        let local_a = test_local_db();
+        let mut stored = FileState::new(
+            local_path.to_string(),
+            "originalhash".to_string(),
+            16,
+            Utc::now() - Duration::days(1),
+        );
+        stored.couch_rev = Some(CouchRev::new("1-abc").unwrap());
+        stored.last_sync_at = Utc::now() - Duration::days(1);
+        local_a.save_file_state(&stored).unwrap();
+
+        let canned_a = CannedCouch {
+            changes: Vec::new(),
+            last_seq: "1".to_string(),
+            metadata: std::collections::HashMap::from([(remote_path.to_string(), remote_doc)]),
+            contents: std::collections::HashMap::new(),
+            content_errors: std::collections::HashSet::from([remote_path.to_string()]),
+        };
+        let mut engine_a = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned_a),
+            local_a,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let err = engine_a
+            .download_remote_file(remote_path, local_path, true)
+            .await
+            .expect_err("content fetch failure should propagate as Err");
+        assert!(
+            format!("{err:#}").contains("failed to fetch content"),
+            "error should identify the failed content fetch: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read(root.as_path().join(local_path)).unwrap(),
+            b"original-content",
+            "failed content fetch must not truncate the existing local file"
+        );
+        let stored = engine_a
+            .get_file_state(local_path)
+            .unwrap()
+            .expect("seeded state must still be present");
+        assert_eq!(
+            stored.couch_rev.map(|r| r.to_string()),
+            Some("1-abc".to_string()),
+            "failed content fetch must not update saved sync state"
+        );
+
+        // Scenario B: brand-new remote file with no local file or state. The
+        // failed content fetch must not create an empty file nor save any
+        // FileState.
+        let remote_path2 = "prefix/new.txt";
+        let local_path2 = "new.txt";
+        let mut remote_doc2 = FileDoc::new(remote_path2.to_string(), String::new(), 3);
+        remote_doc2.rev = Some("1-new".to_string());
+        remote_doc2.path = remote_path2.to_string();
+
+        let canned_b = CannedCouch {
+            changes: Vec::new(),
+            last_seq: "1".to_string(),
+            metadata: std::collections::HashMap::from([(remote_path2.to_string(), remote_doc2)]),
+            contents: std::collections::HashMap::new(),
+            content_errors: std::collections::HashSet::from([remote_path2.to_string()]),
+        };
+        let mut engine_b = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned_b),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        engine_b
+            .download_remote_file(remote_path2, local_path2, true)
+            .await
+            .expect_err("content fetch failure should propagate as Err");
+        assert!(
+            !root.as_path().join(local_path2).exists(),
+            "failed content fetch must not create an empty local file"
+        );
+        assert!(
+            engine_b.get_file_state(local_path2).unwrap().is_none(),
+            "failed content fetch must not save any FileState"
+        );
     }
 }

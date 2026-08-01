@@ -57,6 +57,9 @@ pub struct CannedCouch {
     pub metadata: std::collections::HashMap<String, crate::models::FileDoc>,
     /// File content returned by `get_file_content`, keyed by remote path.
     pub contents: std::collections::HashMap<String, Vec<u8>>,
+    /// Paths for which `get_file_content` should return a fetch error instead
+    /// of content, simulating a failed network/auth/server content download.
+    pub content_errors: std::collections::HashSet<String>,
 }
 
 /// Entry from a CouchDB changes feed
@@ -632,6 +635,9 @@ impl CouchDb {
     pub async fn get_file_content(&self, path: &str) -> Result<Vec<u8>> {
         #[cfg(test)]
         if let Some(state) = &self.test_state {
+            if state.content_errors.contains(path) {
+                anyhow::bail!("simulated content fetch failure for {path}");
+            }
             return Ok(state.contents.get(path).cloned().unwrap_or_default());
         }
 
