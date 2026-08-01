@@ -395,7 +395,12 @@ impl InstallPaths {
     }
 }
 
-/// Run a one-time sync
+/// Run a one-time sync.
+///
+/// When `dry_run` is true the full sync pipeline (triage, upload/download/
+/// delete detection, and conflict identification) is walked through without
+/// writing anything to CouchDB, the local filesystem, or the state DB, and a
+/// summary of what would happen is printed instead.
 pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<SyncReport> {
     info!("Running sync in: {}", path.display());
 
@@ -416,33 +421,34 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
     )
     .await?;
 
-    if dry_run {
-        println!("Dry run mode - no changes will be made");
-        // TODO: Implement dry-run logic
-        return Ok(SyncReport::default());
-    }
-
-    // Run sync
+    // Run sync (dry-run walks the pipeline without writing)
     let mut engine = SyncEngine::with_ignore(
         couchdb,
         local_db,
         SyncDirPath::new(path.clone()).unwrap(),
         ignore_matcher,
     );
-    let report = engine.sync().await?;
+    let report = if dry_run {
+        engine.sync_dry_run().await?
+    } else {
+        engine.sync().await?
+    };
 
-    print_sync_report(&report);
+    print_sync_report(&report, dry_run);
 
-    if !report.errors.is_empty() {
-        let summary = format_sync_error_summary(&report.errors);
-        notify_sync_error_telegram(&config, Some(&path), &summary).await;
-        notify_sync_error_matrix(&config, Some(&path), &summary).await;
-    }
+    // In dry-run mode no notifications are sent and no state is updated.
+    if !dry_run {
+        if !report.errors.is_empty() {
+            let summary = format_sync_error_summary(&report.errors);
+            notify_sync_error_telegram(&config, Some(&path), &summary).await;
+            notify_sync_error_matrix(&config, Some(&path), &summary).await;
+        }
 
-    // Send Telegram notifications for conflicts (one-time sync uses DB tracking)
-    if report.conflicts > 0 {
-        notify_conflicts_telegram(&config, &db_path, &path, None).await;
-        notify_conflicts_matrix(&config, &db_path, &path, None).await;
+        // Send Telegram notifications for conflicts (one-time sync uses DB tracking)
+        if report.conflicts > 0 {
+            notify_conflicts_telegram(&config, &db_path, &path, None).await;
+            notify_conflicts_matrix(&config, &db_path, &path, None).await;
+        }
     }
 
     Ok(report)
@@ -471,7 +477,7 @@ pub async fn rebuild_remote(path: PathBuf, config: AppConfig) -> Result<SyncRepo
         ignore_matcher,
     );
     let report = engine.rebuild_remote_from_local().await?;
-    print_sync_report(&report);
+    print_sync_report(&report, false);
 
     Ok(report)
 }
@@ -499,7 +505,7 @@ pub async fn rebuild_local(path: PathBuf, config: AppConfig) -> Result<SyncRepor
         ignore_matcher,
     );
     let report = engine.rebuild_local_from_remote().await?;
-    print_sync_report(&report);
+    print_sync_report(&report, false);
 
     Ok(report)
 }
@@ -940,7 +946,7 @@ async fn daemon_sync(
     );
     let report = engine.sync().await?;
 
-    print_sync_report(&report);
+    print_sync_report(&report, false);
 
     if !report.errors.is_empty() {
         let summary = format_sync_error_summary(&report.errors);
@@ -1586,14 +1592,25 @@ fn state_db_path(root: &Path) -> PathBuf {
     state_dir(root).join("state.db")
 }
 
-/// Helper to print sync report
-fn print_sync_report(report: &SyncReport) {
+/// Helper to print sync report.
+///
+/// When `dry_run` is true the counts are labelled as "would" actions and the
+/// summary makes clear that no changes were made.
+fn print_sync_report(report: &SyncReport, dry_run: bool) {
     println!();
-    println!("Sync complete ✓");
-    println!("  Uploaded:  {}", report.uploaded.0);
-    println!("  Downloaded: {}", report.downloaded.0);
-    println!("  Deleted (local): {}", report.deleted_local);
-    println!("  Deleted (remote): {}", report.deleted_remote);
+    if dry_run {
+        println!("Dry run complete — no changes were made");
+        println!("  Would upload:  {}", report.uploaded.0);
+        println!("  Would download: {}", report.downloaded.0);
+        println!("  Would delete (local): {}", report.deleted_local);
+        println!("  Would delete (remote): {}", report.deleted_remote);
+    } else {
+        println!("Sync complete ✓");
+        println!("  Uploaded:  {}", report.uploaded.0);
+        println!("  Downloaded: {}", report.downloaded.0);
+        println!("  Deleted (local): {}", report.deleted_local);
+        println!("  Deleted (remote): {}", report.deleted_remote);
+    }
 
     if report.conflicts > 0 {
         println!("  Conflicts: {} ⚠️", report.conflicts);
@@ -1721,7 +1738,7 @@ mod tests {
     fn test_print_sync_report_empty() {
         let report = SyncReport::default();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            print_sync_report(&report);
+            print_sync_report(&report, false);
         }));
     }
 
@@ -1736,7 +1753,7 @@ mod tests {
             errors: vec!["timeout".to_string(), "permission denied".to_string()],
         };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            print_sync_report(&report);
+            print_sync_report(&report, false);
         }));
     }
 
@@ -1751,7 +1768,7 @@ mod tests {
             errors: vec![],
         };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            print_sync_report(&report);
+            print_sync_report(&report, false);
         }));
     }
 
@@ -1766,7 +1783,7 @@ mod tests {
             errors: vec![],
         };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            print_sync_report(&report);
+            print_sync_report(&report, false);
         }));
     }
 
