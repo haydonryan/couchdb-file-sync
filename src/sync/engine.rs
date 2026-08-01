@@ -8,12 +8,13 @@ use crate::sync::triage;
 use anyhow::Result;
 use chrono::Utc;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
 
 /// The main sync engine
 pub struct SyncEngine {
     couchdb: CouchDb,
-    local_db: LocalDb,
+    local_db: AsyncLocalDb,
     scanner: Scanner,
     root_dir: SyncDirPath,
     /// Kept for backward compatibility; delegates to scanner.
@@ -31,6 +32,98 @@ pub struct SyncReport {
     pub errors: Vec<String>,
 }
 
+/// Shared handle to the blocking SQLite-backed [`LocalDb`].
+///
+/// `rusqlite::Connection` performs synchronous disk I/O, so calling it
+/// directly from an async `SyncEngine` method would stall a tokio worker
+/// thread for the duration of every query/statement. This wrapper keeps the
+/// database behind an `Arc<Mutex<..>>` and runs each operation on tokio's
+/// blocking thread pool via `spawn_blocking`. The mutex serializes access so
+/// return values, operation ordering, and sync/conflict semantics are
+/// identical to the original straight-line synchronous calls.
+#[derive(Clone)]
+struct AsyncLocalDb {
+    inner: Arc<Mutex<LocalDb>>,
+}
+
+impl AsyncLocalDb {
+    fn new(local_db: LocalDb) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(local_db)),
+        }
+    }
+
+    /// Run one blocking LocalDb operation on the blocking thread pool,
+    /// holding the mutex for the full duration of the call so operations are
+    /// serialized exactly as they were on the single sync executor thread.
+    async fn run<T, F>(&self, op: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&LocalDb) -> Result<T> + Send + 'static,
+    {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let db = inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("LocalDb mutex poisoned"))?;
+            op(&db)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("LocalDb blocking task panicked: {e}"))?
+    }
+
+    async fn get_all_file_states(&self) -> Result<Vec<FileState>> {
+        self.run(|db| db.get_all_file_states()).await
+    }
+
+    async fn get_file_state(&self, path: &str) -> Result<Option<FileState>> {
+        let path = path.to_string();
+        self.run(move |db| db.get_file_state(&path)).await
+    }
+
+    async fn save_file_state(&self, state: &FileState) -> Result<()> {
+        let state = state.clone();
+        self.run(move |db| db.save_file_state(&state)).await
+    }
+
+    async fn delete_file_state(&self, path: &str) -> Result<()> {
+        let path = path.to_string();
+        self.run(move |db| db.delete_file_state(&path)).await
+    }
+
+    async fn get_checkpoint(&self) -> Result<Option<Checkpoint>> {
+        self.run(|db| db.get_checkpoint()).await
+    }
+
+    async fn save_checkpoint(&self, seq: &str) -> Result<()> {
+        let seq = seq.to_string();
+        self.run(move |db| db.save_checkpoint(&seq)).await
+    }
+
+    async fn store_conflict(&self, conflict: &Conflict) -> Result<()> {
+        let conflict = conflict.clone();
+        self.run(move |db| db.store_conflict(&conflict)).await
+    }
+
+    async fn delete_conflict(&self, path: &str) -> Result<()> {
+        let path = path.to_string();
+        self.run(move |db| db.delete_conflict(&path)).await
+    }
+
+    async fn get_conflicts(&self) -> Result<Vec<Conflict>> {
+        self.run(|db| db.get_conflicts()).await
+    }
+
+    async fn get_conflict(&self, path: &str) -> Result<Option<Conflict>> {
+        let path = path.to_string();
+        self.run(move |db| db.get_conflict(&path)).await
+    }
+
+    async fn reset_sync_state(&self) -> Result<()> {
+        self.run(|db| db.reset_sync_state()).await
+    }
+}
+
 impl SyncEngine {
     /// Create a new sync engine
     pub fn new(couchdb: CouchDb, local_db: LocalDb, root_dir: SyncDirPath) -> Self {
@@ -38,7 +131,7 @@ impl SyncEngine {
         let scanner = Scanner::new(root_dir.clone(), ignore_matcher.clone());
         Self {
             couchdb,
-            local_db,
+            local_db: AsyncLocalDb::new(local_db),
             scanner,
             root_dir,
             ignore_matcher,
@@ -55,7 +148,7 @@ impl SyncEngine {
         let scanner = Scanner::new(root_dir.clone(), ignore_matcher.clone());
         Self {
             couchdb,
-            local_db,
+            local_db: AsyncLocalDb::new(local_db),
             scanner,
             root_dir,
             ignore_matcher,
@@ -126,7 +219,7 @@ impl SyncEngine {
         for conflict in &conflicts {
             info!("CONFLICT: {}", conflict.path);
             if !dry_run {
-                self.local_db.store_conflict(conflict)?;
+                self.local_db.store_conflict(conflict).await?;
             }
         }
 
@@ -146,7 +239,7 @@ impl SyncEngine {
                 report.deleted_remote += 1;
                 if !dry_run {
                     match self.apply_to_couchdb(&change).await {
-                        Ok(_) => self.local_db.delete_file_state(change.path())?,
+                        Ok(_) => self.local_db.delete_file_state(change.path()).await?,
                         Err(e) => {
                             error!("Failed to upload {}: {}", change.path(), e);
                             report
@@ -214,7 +307,7 @@ impl SyncEngine {
 
         // 7. Update checkpoint (skipped in dry-run)
         if !dry_run {
-            self.local_db.save_checkpoint(&last_seq)?;
+            self.local_db.save_checkpoint(&last_seq).await?;
         }
 
         if dry_run {
@@ -241,7 +334,7 @@ impl SyncEngine {
         let (uploads, remote_deletes) =
             triage::plan_remote_rebuild(&local_states, &remote_docs, self.couchdb.remote_prefix());
 
-        self.local_db.reset_sync_state()?;
+        self.local_db.reset_sync_state().await?;
 
         let mut report = SyncReport::default();
 
@@ -273,7 +366,7 @@ impl SyncEngine {
         let (local_deletes, remote_downloads) =
             triage::plan_local_rebuild(&local_states, &remote_docs);
 
-        self.local_db.reset_sync_state()?;
+        self.local_db.reset_sync_state().await?;
 
         let mut report = SyncReport::default();
 
@@ -311,7 +404,7 @@ impl SyncEngine {
     /// states) are skipped so that nothing is written to the state DB.
     async fn scan_local_changes(&self, dry_run: bool) -> Result<Vec<Change>> {
         let current_states = self.scanner.full_scan().await?;
-        let stored_states = self.local_db.get_all_file_states()?;
+        let stored_states = self.local_db.get_all_file_states().await?;
         let remote_prefix = self.couchdb.remote_prefix();
         let mut valid_stored_states = Vec::with_capacity(stored_states.len());
 
@@ -322,7 +415,7 @@ impl SyncEngine {
                     state.path, remote_prefix
                 );
                 if !dry_run {
-                    self.local_db.delete_file_state(&state.path)?;
+                    self.local_db.delete_file_state(&state.path).await?;
                 }
             } else if self
                 .ignore_matcher
@@ -333,7 +426,7 @@ impl SyncEngine {
                     state.path
                 );
                 if !dry_run {
-                    self.local_db.delete_file_state(&state.path)?;
+                    self.local_db.delete_file_state(&state.path).await?;
                 }
             } else {
                 valid_stored_states.push(state);
@@ -383,7 +476,7 @@ impl SyncEngine {
                         couch_rev,
                         last_sync_at: state.last_sync_at,
                     };
-                    self.local_db.save_file_state(&preserved_state)?;
+                    self.local_db.save_file_state(&preserved_state).await?;
                 }
             }
         }
@@ -393,7 +486,7 @@ impl SyncEngine {
 
     /// Fetch remote changes from CouchDB
     async fn fetch_remote_changes(&self) -> Result<(Vec<Change>, String)> {
-        let checkpoint = self.local_db.get_checkpoint()?;
+        let checkpoint = self.local_db.get_checkpoint().await?;
         let since = checkpoint.map(|cp| cp.last_seq);
 
         self.couchdb.get_changes(since.as_deref()).await
@@ -422,7 +515,7 @@ impl SyncEngine {
         // Actually load all stored states individually (keeps existing pattern)
         for lc in local_changes {
             if !stored_states.contains_key(lc.path()) {
-                if let Some(state) = self.local_db.get_file_state(lc.path())? {
+                if let Some(state) = self.local_db.get_file_state(lc.path()).await? {
                     stored_states.insert(lc.path().to_string(), state);
                 }
             }
@@ -433,7 +526,7 @@ impl SyncEngine {
             if let std::collections::hash_map::Entry::Vacant(e) =
                 stored_states.entry(local_path.clone())
             {
-                if let Some(state) = self.local_db.get_file_state(&local_path)? {
+                if let Some(state) = self.local_db.get_file_state(&local_path).await? {
                     e.insert(state);
                 }
             }
@@ -599,7 +692,7 @@ impl SyncEngine {
                         couch_rev: remote_doc.rev.as_deref().and_then(CouchRev::new),
                         last_sync_at: Utc::now(),
                     };
-                    self.local_db.save_file_state(&updated_state)?;
+                    self.local_db.save_file_state(&updated_state).await?;
                 }
             } else {
                 info!(
@@ -773,7 +866,7 @@ impl SyncEngine {
             couch_rev: doc.rev.as_deref().and_then(CouchRev::new),
             last_sync_at: Utc::now(),
         };
-        self.local_db.save_file_state(&state)?;
+        self.local_db.save_file_state(&state).await?;
         debug!("[UPLOAD] Updated local state with rev: {:?}", doc.rev);
 
         Ok((content.len(), doc.rev))
@@ -833,7 +926,7 @@ impl SyncEngine {
             couch_rev: doc.rev.as_deref().and_then(CouchRev::new),
             last_sync_at: Utc::now(),
         };
-        self.local_db.save_file_state(&state)?;
+        self.local_db.save_file_state(&state).await?;
 
         Ok(Some(content.len()))
     }
@@ -859,7 +952,7 @@ impl SyncEngine {
             ChangeType::Deleted => {
                 debug!("[DELETE] Remote: {}", remote_path);
                 self.couchdb.delete_file(&remote_path).await?;
-                self.local_db.delete_file_state(change.path())?;
+                self.local_db.delete_file_state(change.path()).await?;
                 info!("[DELETE] SUCCESS: {} -> {}", change.path(), remote_path);
             }
         }
@@ -896,7 +989,7 @@ impl SyncEngine {
                 if file_path.exists() {
                     tokio::fs::remove_file(&file_path).await?;
                 }
-                self.local_db.delete_file_state(&local_path)?;
+                self.local_db.delete_file_state(&local_path).await?;
                 info!("[LOCAL DELETE] SUCCESS: {} -> {}", remote_path, local_path);
             }
         }
@@ -904,8 +997,8 @@ impl SyncEngine {
     }
 
     /// Get list of conflicts
-    pub fn get_conflicts(&self) -> Result<Vec<Conflict>> {
-        self.local_db.get_conflicts()
+    pub async fn get_conflicts(&self) -> Result<Vec<Conflict>> {
+        self.local_db.get_conflicts().await
     }
 
     /// Apply a local change immediately (live sync)
@@ -919,18 +1012,18 @@ impl SyncEngine {
     }
 
     /// Get local tracked file state
-    pub fn get_file_state(&self, path: &str) -> Result<Option<FileState>> {
-        self.local_db.get_file_state(path)
+    pub async fn get_file_state(&self, path: &str) -> Result<Option<FileState>> {
+        self.local_db.get_file_state(path).await
     }
 
     /// Save sync checkpoint
-    pub fn save_checkpoint(&self, seq: &str) -> Result<()> {
-        self.local_db.save_checkpoint(seq)
+    pub async fn save_checkpoint(&self, seq: &str) -> Result<()> {
+        self.local_db.save_checkpoint(seq).await
     }
 
     /// Get sync checkpoint
-    pub fn get_checkpoint(&self) -> Result<Option<Checkpoint>> {
-        self.local_db.get_checkpoint()
+    pub async fn get_checkpoint(&self) -> Result<Option<Checkpoint>> {
+        self.local_db.get_checkpoint().await
     }
 
     /// Convert local path to remote path using the configured prefix
@@ -967,7 +1060,7 @@ impl SyncEngine {
         local_path: &str,
         strategy: ResolutionStrategy,
     ) -> Result<()> {
-        let _conflict = match self.local_db.get_conflict(local_path)? {
+        let _conflict = match self.local_db.get_conflict(local_path).await? {
             Some(c) => c,
             None => {
                 anyhow::bail!("No conflict found for path: {}", local_path);
@@ -1009,7 +1102,7 @@ impl SyncEngine {
         }
 
         // Remove conflict record
-        self.local_db.delete_conflict(local_path)?;
+        self.local_db.delete_conflict(local_path).await?;
 
         Ok(())
     }
@@ -1040,8 +1133,8 @@ mod tests {
         SyncDirPath::new(PathBuf::from(path)).expect("create SyncDirPath")
     }
 
-    #[test]
-    fn engine_new_constructs_with_empty_ignore_matcher() {
+    #[tokio::test]
+    async fn engine_new_constructs_with_empty_ignore_matcher() {
         let couch = test_couchdb();
         let local = test_local_db();
         let root = test_root("/tmp/test-sync-engine-new");
@@ -1049,7 +1142,7 @@ mod tests {
         let engine = SyncEngine::new(couch, local, root.clone());
 
         assert_eq!(engine.root_dir(), &root);
-        assert!(engine.get_conflicts().unwrap().is_empty());
+        assert!(engine.get_conflicts().await.unwrap().is_empty());
         // with_ignore uses IgnoreMatcher::empty() internally
         // The default empty matcher should not ignore anything
         assert!(!engine
@@ -1092,8 +1185,8 @@ mod tests {
         assert_eq!(engine2.root_dir(), &root);
     }
 
-    #[test]
-    fn engine_initial_state_has_no_conflicts_and_no_file_states() {
+    #[tokio::test]
+    async fn engine_initial_state_has_no_conflicts_and_no_file_states() {
         let engine = SyncEngine::new(
             test_couchdb(),
             test_local_db(),
@@ -1101,15 +1194,23 @@ mod tests {
         );
 
         // Fresh engine should have no conflicts
-        assert!(engine.get_conflicts().unwrap().is_empty());
+        assert!(engine.get_conflicts().await.unwrap().is_empty());
 
         // Fresh engine should have no file states
-        assert!(engine.get_file_state("nonexistent.txt").unwrap().is_none());
-        assert!(engine.get_file_state("other/path.md").unwrap().is_none());
+        assert!(engine
+            .get_file_state("nonexistent.txt")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(engine
+            .get_file_state("other/path.md")
+            .await
+            .unwrap()
+            .is_none());
     }
 
-    #[test]
-    fn engine_with_ignore_can_checkpoint() {
+    #[tokio::test]
+    async fn engine_with_ignore_can_checkpoint() {
         let engine = SyncEngine::new(
             test_couchdb(),
             test_local_db(),
@@ -1117,10 +1218,10 @@ mod tests {
         );
 
         // Save a checkpoint
-        engine.save_checkpoint("123-abc").unwrap();
+        engine.save_checkpoint("123-abc").await.unwrap();
 
         // Read it back
-        let cp = engine.get_checkpoint().unwrap();
+        let cp = engine.get_checkpoint().await.unwrap();
         assert!(cp.is_some());
         assert_eq!(cp.unwrap().last_seq, "123-abc");
     }
@@ -1224,16 +1325,16 @@ mod tests {
         // Trieage ran: the planned upload is the new file.
         // Dry run wrote nothing to the state DB:
         assert!(
-            engine.get_file_state("new.txt").unwrap().is_none(),
+            engine.get_file_state("new.txt").await.unwrap().is_none(),
             "dry run must not save file states"
         );
         assert!(
-            engine.get_file_state("gone.txt").unwrap().is_some(),
+            engine.get_file_state("gone.txt").await.unwrap().is_some(),
             "dry run must not delete existing file states"
         );
-        assert!(engine.get_conflicts().unwrap().is_empty());
+        assert!(engine.get_conflicts().await.unwrap().is_empty());
         assert!(
-            engine.get_checkpoint().unwrap().is_none(),
+            engine.get_checkpoint().await.unwrap().is_none(),
             "dry run must not save a checkpoint"
         );
         // Dry run issued no CouchDB writes:
@@ -1315,16 +1416,16 @@ mod tests {
         );
         // State DB untouched (checkpoint still the seeded one, rev unchanged):
         assert_eq!(
-            engine.get_checkpoint().unwrap().unwrap().last_seq,
+            engine.get_checkpoint().await.unwrap().unwrap().last_seq,
             "100-before",
             "dry run must not advance the checkpoint"
         );
-        let foo_state = engine.get_file_state("foo.txt").unwrap().unwrap();
+        let foo_state = engine.get_file_state("foo.txt").await.unwrap().unwrap();
         assert_eq!(
             foo_state.couch_rev.map(|r| r.to_string()),
             Some("1-abc".to_string())
         );
-        assert!(engine.get_conflicts().unwrap().is_empty());
+        assert!(engine.get_conflicts().await.unwrap().is_empty());
         assert_eq!(
             engine.couchdb.test_write_calls(),
             0,
@@ -1387,10 +1488,10 @@ mod tests {
 
         // Conflict identified but NOT persisted to the state DB:
         assert!(
-            engine.get_conflicts().unwrap().is_empty(),
+            engine.get_conflicts().await.unwrap().is_empty(),
             "dry run must not store conflicts"
         );
-        let stored = engine.get_file_state("both.txt").unwrap().unwrap();
+        let stored = engine.get_file_state("both.txt").await.unwrap().unwrap();
         assert_eq!(
             stored.couch_rev.map(|r| r.to_string()),
             Some("1-abc".to_string()),
@@ -1454,13 +1555,13 @@ mod tests {
         assert_eq!(report.downloaded.0, 0);
 
         // The silent-sync state update must also be skipped in dry-run:
-        let stored = engine.get_file_state("same.txt").unwrap().unwrap();
+        let stored = engine.get_file_state("same.txt").await.unwrap().unwrap();
         assert_eq!(
             stored.couch_rev.map(|r| r.to_string()),
             Some("1-abc".to_string()),
             "identical-content dry run must not update the local state"
         );
-        assert!(engine.get_conflicts().unwrap().is_empty());
+        assert!(engine.get_conflicts().await.unwrap().is_empty());
         assert_eq!(
             engine.couchdb.test_write_calls(),
             0,
@@ -1518,6 +1619,7 @@ mod tests {
 
         let state = engine
             .get_file_state("up.txt")
+            .await
             .unwrap()
             .expect("upload should save a FileState");
         assert_eq!(
@@ -1564,6 +1666,7 @@ mod tests {
 
         let state = engine
             .get_file_state("dl.txt")
+            .await
             .unwrap()
             .expect("download should save a FileState");
         assert_eq!(
@@ -1631,6 +1734,7 @@ mod tests {
         );
         let stored = engine_a
             .get_file_state(local_path)
+            .await
             .unwrap()
             .expect("seeded state must still be present");
         assert_eq!(
@@ -1671,7 +1775,11 @@ mod tests {
             "failed content fetch must not create an empty local file"
         );
         assert!(
-            engine_b.get_file_state(local_path2).unwrap().is_none(),
+            engine_b
+                .get_file_state(local_path2)
+                .await
+                .unwrap()
+                .is_none(),
             "failed content fetch must not save any FileState"
         );
     }
@@ -1719,11 +1827,191 @@ mod tests {
         );
         let stored = engine
             .get_file_state("empty.txt")
+            .await
             .unwrap()
             .expect("empty-content download should save FileState");
         assert_eq!(
             stored.size, 0,
             "empty-content FileState should record size 0"
         );
+    }
+
+    // ── Regressions for moving blocking LocalDb (rusqlite) I/O off the
+    // async executor (#2937) ─────────────────────────────────────────────
+
+    /// get_conflicts() synthesizes `local_state.last_sync_at` with `Utc::now()`
+    /// on every read (that field is not persisted in the conflicts table), so
+    /// strip it from both sides before comparing retrieved conflicts.
+    fn conflicts_without_volatile_last_sync(conflicts: &[Conflict]) -> serde_json::Value {
+        let mut value = serde_json::to_value(conflicts).unwrap();
+        if let serde_json::Value::Array(items) = &mut value {
+            for item in items {
+                if let Some(local_state) =
+                    item.get_mut("local_state").and_then(|v| v.as_object_mut())
+                {
+                    local_state.remove("last_sync_at");
+                }
+            }
+        }
+        value
+    }
+
+    #[tokio::test]
+    async fn async_local_db_returns_identical_results_to_direct_sqlite() {
+        // Seed a real LocalDb with file states, a checkpoint, and a conflict,
+        // then confirm every value read back through the AsyncLocalDb wrapper
+        // (which runs each rusqlite call on tokio's blocking thread pool) is
+        // identical to the direct synchronous SQLite API.
+        let db = test_local_db();
+        let mut state_a = FileState::new("a.txt".to_string(), "hash-a".to_string(), 3, Utc::now());
+        state_a.couch_rev = Some(CouchRev::new("1-abc").unwrap());
+        db.save_file_state(&state_a).unwrap();
+        let mut state_b = FileState::new("b.bin".to_string(), "hash-b".to_string(), 99, Utc::now());
+        state_b.last_sync_at = Utc::now() - Duration::days(2);
+        db.save_file_state(&state_b).unwrap();
+        db.save_checkpoint("1024-seq").unwrap();
+
+        let conflict = Conflict::new(
+            "c.txt".to_string(),
+            FileState::new("c.txt".to_string(), "local-hash".to_string(), 5, Utc::now()),
+            RemoteState {
+                hash: "remote-hash".to_string(),
+                size: 6,
+                modified_at: Utc::now() - Duration::hours(1),
+                couch_rev: CouchRev::new("2-def").unwrap(),
+                deleted: false,
+            },
+        );
+        db.store_conflict(&conflict).unwrap();
+
+        // Snapshot every converted path with the direct (blocking) API.
+        let direct_states = db.get_all_file_states().unwrap();
+        let direct_checkpoint = db.get_checkpoint().unwrap();
+        let direct_conflicts = db.get_conflicts().unwrap();
+
+        // Wrap the *same* database and re-read through the async wrapper.
+        let async_db = AsyncLocalDb::new(db);
+        let async_states = async_db.get_all_file_states().await.unwrap();
+        let async_checkpoint = async_db.get_checkpoint().await.unwrap();
+        let async_conflicts = async_db.get_conflicts().await.unwrap();
+
+        // FileState/Conflict/Checkpoint are not PartialEq, so compare their
+        // serialized forms for exact equality.
+        assert_eq!(
+            serde_json::to_value(&async_states).unwrap(),
+            serde_json::to_value(&direct_states).unwrap(),
+            "file-state retrieval must be identical after moving SQLite off the executor"
+        );
+        match (&async_checkpoint, &direct_checkpoint) {
+            (Some(async_cp), Some(direct_cp)) => {
+                assert_eq!(
+                    async_cp.last_seq, direct_cp.last_seq,
+                    "checkpoint last_seq must be identical after moving SQLite off the executor"
+                );
+                assert_eq!(
+                    async_cp.last_sync_at, direct_cp.last_sync_at,
+                    "checkpoint last_sync_at must be identical after moving SQLite off the executor"
+                );
+            }
+            (None, None) => {}
+            (a, d) => panic!(
+                "checkpoint presence differs after moving SQLite off the executor: {a:?} vs {d:?}"
+            ),
+        }
+        assert_eq!(
+            conflicts_without_volatile_last_sync(&async_conflicts),
+            conflicts_without_volatile_last_sync(&direct_conflicts),
+            "conflict retrieval must be identical after moving SQLite off the executor"
+        );
+
+        // Individual lookups and writes through the async wrapper behave
+        // exactly like the direct API.
+        assert_eq!(
+            serde_json::to_value(async_db.get_file_state("a.txt").await.unwrap()).unwrap(),
+            serde_json::to_value(Some(state_a)).unwrap(),
+        );
+        let mut new_state =
+            FileState::new("d.txt".to_string(), "hash-d".to_string(), 1, Utc::now());
+        new_state.couch_rev = Some(CouchRev::new("3-ghi").unwrap());
+        async_db.save_file_state(&new_state).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(async_db.get_file_state("d.txt").await.unwrap()).unwrap(),
+            serde_json::to_value(Some(new_state)).unwrap(),
+        );
+        async_db.delete_file_state("a.txt").await.unwrap();
+        assert!(async_db.get_file_state("a.txt").await.unwrap().is_none());
+
+        async_db.save_checkpoint("2048-seq").await.unwrap();
+        assert_eq!(
+            async_db.get_checkpoint().await.unwrap().unwrap().last_seq,
+            "2048-seq"
+        );
+        async_db.delete_conflict("c.txt").await.unwrap();
+        assert!(async_db.get_conflicts().await.unwrap().is_empty());
+        async_db.reset_sync_state().await.unwrap();
+        assert!(async_db.get_checkpoint().await.unwrap().is_none());
+        assert!(async_db.get_all_file_states().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_engine_async_accessors_return_identical_state_after_blocking_move() {
+        // Exercise the converted public accessors (get_file_state,
+        // save_checkpoint, get_checkpoint, get_conflicts) end-to-end through a
+        // SyncEngine: reads and writes go through spawn_blocking and must
+        // return/update identical data.
+        let root = test_root("/tmp/cfs-engine-accessors");
+        let local = test_local_db();
+        local.save_checkpoint("42-seq").unwrap();
+        let conflict = Conflict::new(
+            "conflict.txt".to_string(),
+            FileState::new(
+                "conflict.txt".to_string(),
+                "lhash".to_string(),
+                4,
+                Utc::now(),
+            ),
+            RemoteState {
+                hash: "rhash".to_string(),
+                size: 5,
+                modified_at: Utc::now(),
+                couch_rev: CouchRev::new("9-zzz").unwrap(),
+                deleted: false,
+            },
+        );
+        local.store_conflict(&conflict).unwrap();
+
+        let engine = SyncEngine::new(test_couchdb(), local, root.clone());
+
+        let cp = engine
+            .get_checkpoint()
+            .await
+            .unwrap()
+            .expect("seeded checkpoint");
+        assert_eq!(
+            cp.last_seq, "42-seq",
+            "checkpoint read via engine must match the seeded value"
+        );
+
+        let conflicts = engine.get_conflicts().await.unwrap();
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "seeded conflict must be readable via engine"
+        );
+        assert_eq!(conflicts[0].path, conflict.path);
+        assert_eq!(conflicts[0].local_state.hash, conflict.local_state.hash);
+        assert_eq!(conflicts[0].remote_state.hash, conflict.remote_state.hash);
+
+        engine.save_checkpoint("43-seq").await.unwrap();
+        assert_eq!(
+            engine.get_checkpoint().await.unwrap().unwrap().last_seq,
+            "43-seq",
+            "checkpoint write via engine must be read back unchanged"
+        );
+        assert!(engine
+            .get_file_state("nonexistent.txt")
+            .await
+            .unwrap()
+            .is_none());
     }
 }

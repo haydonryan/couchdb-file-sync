@@ -81,19 +81,19 @@ async fn dry_run_does_not_modify_state_db_or_remote_couchdb() -> Result<()> {
         // The state DB must be unchanged: no file states saved for a.txt,
         // the gone.txt state must still be present, no conflicts, no checkpoint.
         assert!(
-            engine.get_file_state("a.txt")?.is_none(),
+            engine.get_file_state("a.txt").await?.is_none(),
             "dry run must not record new file states"
         );
         assert!(
-            engine.get_file_state("gone.txt")?.is_some(),
+            engine.get_file_state("gone.txt").await?.is_some(),
             "dry run must not delete existing file states"
         );
         assert!(
-            engine.get_conflicts()?.is_empty(),
+            engine.get_conflicts().await?.is_empty(),
             "dry run must not store conflicts"
         );
         assert!(
-            engine.get_checkpoint()?.is_none(),
+            engine.get_checkpoint().await?.is_none(),
             "dry run must not advance the checkpoint"
         );
 
