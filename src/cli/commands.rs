@@ -1026,7 +1026,7 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
         sync_dir.clone(),
         (*ignore_matcher).clone(),
     );
-    let initial_since: String = match engine.get_checkpoint()? {
+    let initial_since: String = match engine.get_checkpoint().await? {
         Some(cp) => cp.last_seq,
         None => {
             info!("No checkpoint found, starting changes feed from 'now'");
@@ -1229,14 +1229,14 @@ async fn handle_remote_change(
     let local_rel = local_path.trim_start_matches('/').to_string();
 
     if ignore_matcher.should_ignore(Path::new(&local_rel)) {
-        engine.save_checkpoint(&seq)?;
+        engine.save_checkpoint(&seq).await?;
         return Ok(());
     }
 
-    if let Some(state) = engine.get_file_state(&local_rel)? {
+    if let Some(state) = engine.get_file_state(&local_rel).await? {
         if let (Some(remote_rev), Some(local_rev)) = (change.rev(), state.couch_rev.as_deref()) {
             if remote_rev == local_rev {
-                engine.save_checkpoint(&seq)?;
+                engine.save_checkpoint(&seq).await?;
                 return Ok(());
             }
         }
@@ -1293,7 +1293,7 @@ async fn handle_remote_change(
         }
     }
 
-    engine.save_checkpoint(&seq)?;
+    engine.save_checkpoint(&seq).await?;
     Ok(())
 }
 
