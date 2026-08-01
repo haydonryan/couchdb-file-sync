@@ -10,3 +10,6 @@ move-test-local/
 _testdata/
 couchfs.yaml
 testing/
+
+# Generated coverage artifacts
+cobertura.xml
