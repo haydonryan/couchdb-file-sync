@@ -395,6 +395,16 @@ impl InstallPaths {
     }
 }
 
+/// Resolve the sync root directory for a CLI command.
+///
+/// Canonicalizes the given path into a [`SyncDirPath`], returning a
+/// contextual, user-facing error instead of panicking when the path is empty
+/// or cannot be resolved (e.g. `sync ""`).
+fn resolve_sync_dir(path: &Path) -> Result<SyncDirPath> {
+    SyncDirPath::new(path.to_path_buf())
+        .with_context(|| format!("cannot resolve sync directory '{}'", path.display()))
+}
+
 /// Run a one-time sync.
 ///
 /// When `dry_run` is true the full sync pipeline (triage, upload/download/
@@ -424,12 +434,8 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
     .await?;
 
     // Run sync (dry-run walks the pipeline without writing)
-    let mut engine = SyncEngine::with_ignore(
-        couchdb,
-        local_db,
-        SyncDirPath::new(path.clone()).unwrap(),
-        ignore_matcher,
-    );
+    let mut engine =
+        SyncEngine::with_ignore(couchdb, local_db, resolve_sync_dir(&path)?, ignore_matcher);
     let report = if dry_run {
         engine.sync_dry_run().await?
     } else {
@@ -474,12 +480,8 @@ pub async fn rebuild_remote(path: PathBuf, config: AppConfig) -> Result<SyncRepo
     )
     .await?;
 
-    let mut engine = SyncEngine::with_ignore(
-        couchdb,
-        local_db,
-        SyncDirPath::new(path).unwrap(),
-        ignore_matcher,
-    );
+    let mut engine =
+        SyncEngine::with_ignore(couchdb, local_db, resolve_sync_dir(&path)?, ignore_matcher);
     let report = engine.rebuild_remote_from_local().await?;
     print_sync_report(&report, false);
 
@@ -504,12 +506,8 @@ pub async fn rebuild_local(path: PathBuf, config: AppConfig) -> Result<SyncRepor
     )
     .await?;
 
-    let mut engine = SyncEngine::with_ignore(
-        couchdb,
-        local_db,
-        SyncDirPath::new(path).unwrap(),
-        ignore_matcher,
-    );
+    let mut engine =
+        SyncEngine::with_ignore(couchdb, local_db, resolve_sync_dir(&path)?, ignore_matcher);
     let report = engine.rebuild_local_from_remote().await?;
     print_sync_report(&report, false);
 
@@ -946,12 +944,8 @@ async fn daemon_sync(
     .await?;
 
     // Run sync
-    let mut engine = SyncEngine::with_ignore(
-        couchdb,
-        local_db,
-        SyncDirPath::new(path.to_path_buf()).unwrap(),
-        ignore_matcher,
-    );
+    let mut engine =
+        SyncEngine::with_ignore(couchdb, local_db, resolve_sync_dir(path)?, ignore_matcher);
     let report = engine.sync().await?;
 
     print_sync_report(&report, false);
@@ -1024,10 +1018,12 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
     )
     .await?;
 
+    let sync_dir = resolve_sync_dir(&path)?;
+
     let mut engine = SyncEngine::with_ignore(
         couchdb,
         local_db,
-        SyncDirPath::new(path.clone()).unwrap(),
+        sync_dir.clone(),
         (*ignore_matcher).clone(),
     );
     let initial_since: String = match engine.get_checkpoint()? {
@@ -1041,7 +1037,7 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
     let (local_tx, mut local_rx) = mpsc::channel::<Change>(256);
     let (remote_tx, mut remote_rx) = mpsc::channel::<ChangeFeedEntry>(256);
 
-    let watcher_root = SyncDirPath::new(path.clone()).unwrap();
+    let watcher_root = sync_dir;
     let watcher_ignore = ignore_matcher.clone();
     let debounce_ms = config.sync.debounce_ms;
     let watcher_config = config.clone();
@@ -1364,7 +1360,7 @@ pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
     )
     .await?;
 
-    let mut engine = SyncEngine::new(couchdb, local_db, SyncDirPath::new(path.clone()).unwrap());
+    let mut engine = SyncEngine::new(couchdb, local_db, resolve_sync_dir(&path)?);
 
     println!("Found {} conflict(s) to resolve:\n", conflicts.len());
 
@@ -1646,6 +1642,35 @@ mod tests {
     use super::*;
     use crate::models::{DownloadCount, UploadCount};
     use std::time::SystemTime;
+
+    // ── resolve_sync_dir (CLI path resolution) ────────────────────────────
+
+    // Regression test for story #2844: `sync ""` / any bad sync path must
+    // surface a clean, contextual error instead of panicking on
+    // `SyncDirPath::new(path).unwrap()`.
+    #[test]
+    fn cli_sync_rejects_empty_path_without_panicking() {
+        let result = resolve_sync_dir(Path::new(""));
+        let err = match result {
+            Ok(dir) => panic!("expected empty path to fail, resolved to {}", dir.display()),
+            Err(e) => e,
+        };
+        // The error must be user-facing and contextual, not a panic message.
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("cannot resolve sync directory"),
+            "expected contextual error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_sync_dir_accepts_valid_directory() {
+        let dir = std::env::temp_dir().join(format!("resolve-sync-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let resolved = resolve_sync_dir(&dir).expect("valid directory should resolve");
+        assert_eq!(resolved.as_path(), dir.canonicalize().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // ── truncate_str ──────────────────────────────────────────────────────
 
