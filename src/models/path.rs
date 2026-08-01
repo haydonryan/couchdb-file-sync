@@ -92,3 +92,35 @@ impl std::fmt::Display for SyncDirPath {
         write!(f, "{}", self.0.display())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression test for story #2842: an unresolvable sync path must
+    // produce a typed Err instead of panicking. canonicalize() fails for a
+    // non-existent path, and the absolute() fallback still rejects an empty
+    // path ("cannot make an empty path absolute"), so `PathBuf::from("")` is
+    // the reproducible unresolvable case here.
+    #[test]
+    fn sync_dir_path_new_rejects_unresolvable_path() {
+        let err = SyncDirPath::new(PathBuf::from(""))
+            .expect_err("SyncDirPath::new should reject an unresolvable path");
+        // The error is contextual, not a panic.
+        assert!(
+            !err.to_string().is_empty(),
+            "expected a contextual error message"
+        );
+    }
+
+    #[test]
+    fn sync_dir_path_new_accepts_valid_directory() {
+        let dir = std::env::temp_dir().join(format!("sync-dir-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let sync_dir = SyncDirPath::new(dir.clone()).expect("valid directory should resolve");
+        assert_eq!(sync_dir.as_path(), dir.canonicalize().unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
