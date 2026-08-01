@@ -1,4 +1,4 @@
-use crate::models::{Change, ChunkDoc, DatabaseName, FileDoc, RemotePath, RemoteState};
+use crate::models::{Change, ChunkDoc, DatabaseName, FileDoc, RemotePath};
 use anyhow::Result;
 use couch_rs::database::Database;
 use couch_rs::Client;
@@ -551,14 +551,6 @@ impl CouchDb {
         // Return the CouchDB update sequence so live sync can resume safely.
         let seq = self.get_update_seq().await?;
         Ok((changes, seq))
-    }
-
-    /// Get remote state for comparison
-    pub async fn get_remote_state(&self, path: &str) -> Result<Option<RemoteState>> {
-        match self.get_file(path).await? {
-            Some(doc) => Ok(Some(RemoteState::from(doc))),
-            None => Ok(None),
-        }
     }
 
     /// Fetch remote file metadata (without downloading chunks)
