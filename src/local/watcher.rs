@@ -3,7 +3,7 @@ use anyhow::Result;
 use notify_debouncer_full::{
     new_debouncer,
     notify::{EventKind, RecommendedWatcher, RecursiveMode},
-    DebounceEventResult, DebouncedEvent, Debouncer, NoCache,
+    DebounceEventResult, DebouncedEvent, Debouncer, RecommendedCache,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -15,7 +15,7 @@ use tracing::{debug, error, trace, warn};
 pub struct FileWatcher {
     root_dir: SyncDirPath,
     /// The debouncer is stored to keep the watcher alive; dropped on `FileWatcher::drop`.
-    _debouncer: Option<Debouncer<RecommendedWatcher, NoCache>>,
+    _debouncer: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
     event_rx: mpsc::Receiver<WatcherEvent>,
 }
 
