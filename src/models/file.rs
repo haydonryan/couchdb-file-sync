@@ -19,6 +19,13 @@ pub enum DocType {
 pub struct CouchRev(String);
 
 impl CouchRev {
+    /// The default initial revision for newly created CouchDB documents.
+    ///
+    /// This literal is non-empty, so it is always a valid `CouchRev`.
+    /// Construct it via [`CouchRev::default`] so call sites never need the
+    /// panic-prone `CouchRev::new(Self::DEFAULT_REV).unwrap()` pattern.
+    pub const DEFAULT_REV: &str = "1-";
+
     /// Create a new CouchRev. Returns None if the revision string is empty.
     pub fn new(rev: &str) -> Option<Self> {
         if rev.is_empty() {
@@ -31,6 +38,14 @@ impl CouchRev {
     /// Return the revision string.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl Default for CouchRev {
+    /// The single validated default revision, constructed directly from the
+    /// known-valid `DEFAULT_REV` literal so this cannot panic.
+    fn default() -> Self {
+        CouchRev(Self::DEFAULT_REV.to_string())
     }
 }
 
@@ -234,7 +249,7 @@ impl From<FileDoc> for RemoteState {
             .rev
             .as_deref()
             .and_then(CouchRev::new)
-            .unwrap_or_else(|| CouchRev::new("1-").unwrap());
+            .unwrap_or_default();
         Self {
             hash: String::new(), // Hash not stored in CouchDB, computed locally
             size: doc.size,
@@ -249,6 +264,18 @@ impl From<FileDoc> for RemoteState {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn test_couch_rev_default() {
+        assert_eq!(CouchRev::DEFAULT_REV, "1-");
+        assert_eq!(CouchRev::default().as_str(), "1-");
+    }
+
+    #[test]
+    fn test_couch_rev_new_empty() {
+        assert!(CouchRev::new("").is_none());
+        assert!(CouchRev::new("1-abc").is_some());
+    }
 
     #[test]
     fn test_file_doc_new() {

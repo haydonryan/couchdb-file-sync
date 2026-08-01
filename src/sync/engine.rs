@@ -620,8 +620,10 @@ impl SyncEngine {
                     hash: remote_hash,
                     size: remote_content.len() as u64,
                     modified_at: remote_modified_at,
-                    couch_rev: CouchRev::new(remote_doc.rev.as_deref().unwrap_or("1-"))
-                        .unwrap_or(CouchRev::new("1-").unwrap()),
+                    couch_rev: CouchRev::new(
+                        remote_doc.rev.as_deref().unwrap_or(CouchRev::DEFAULT_REV),
+                    )
+                    .unwrap_or_default(),
                     deleted: remote_doc.deleted,
                 };
                 debug!("  REMOTE STATE:");

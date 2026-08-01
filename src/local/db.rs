@@ -323,8 +323,7 @@ impl LocalDb {
                     hash: row.get(4)?,
                     size: row.get::<_, i64>(5)? as u64,
                     modified_at: row.get(6)?,
-                    couch_rev: CouchRev::new(row.get::<_, String>(7)?.as_str())
-                        .unwrap_or_else(|| CouchRev::new("1-").unwrap()),
+                    couch_rev: CouchRev::new(row.get::<_, String>(7)?.as_str()).unwrap_or_default(),
                     deleted: false,
                 };
 
@@ -369,8 +368,7 @@ impl LocalDb {
                     hash: row.get(4)?,
                     size: row.get::<_, i64>(5)? as u64,
                     modified_at: row.get(6)?,
-                    couch_rev: CouchRev::new(row.get::<_, String>(7)?.as_str())
-                        .unwrap_or_else(|| CouchRev::new("1-").unwrap()),
+                    couch_rev: CouchRev::new(row.get::<_, String>(7)?.as_str()).unwrap_or_default(),
                     deleted: false,
                 };
 
