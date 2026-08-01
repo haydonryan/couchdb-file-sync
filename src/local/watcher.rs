@@ -6,10 +6,10 @@ use notify_debouncer_full::{
     DebounceEventResult, DebouncedEvent, Debouncer, NoCache,
 };
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 
 /// File system watcher with debouncing
 pub struct FileWatcher {
@@ -28,6 +28,72 @@ pub enum WatcherEvent {
     FileRenamed(PathBuf, PathBuf), // from, to
 }
 
+/// How often the "dropped file-watcher event" warning may fire while the
+/// internal 100-capacity event channel stays full. Repeated drops during a
+/// burst are pulled into a single rate-limited warning instead of spamming
+/// the log per dropped event.
+const DROP_WARN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A minimal cooldown guard: once a warning fires, further warnings are
+/// suppressed until `interval` has elapsed since the last emitted warning.
+struct RateLimitedWarn {
+    interval: Duration,
+    last: Mutex<Option<Instant>>,
+}
+
+impl RateLimitedWarn {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last: Mutex::new(None),
+        }
+    }
+
+    /// Returns `true` when a warning may be emitted now, claiming the cooldown
+    /// so concurrent callers cannot all log at once.
+    fn should_emit(&self) -> bool {
+        let mut last = self.last.lock().expect("rate-limit lock poisoned");
+        let now = Instant::now();
+        if let Some(prev) = *last {
+            if now.duration_since(prev) < self.interval {
+                return false;
+            }
+        }
+        *last = Some(now);
+        true
+    }
+}
+
+/// Couples the debounced-event channel with the rate-limited drop warning so
+/// every `try_send` failure in `process_event` routes through a single,
+/// rate-limited warning point instead of being silently discarded.
+struct EventSender {
+    tx: mpsc::Sender<WatcherEvent>,
+    drop_warn: RateLimitedWarn,
+}
+
+impl EventSender {
+    fn new(tx: mpsc::Sender<WatcherEvent>, warn_interval: Duration) -> Self {
+        Self {
+            tx,
+            drop_warn: RateLimitedWarn::new(warn_interval),
+        }
+    }
+
+    /// Try to enqueue `event`; on failure log a rate-limited warning rather
+    /// than silently dropping the event (which would be lost to sync).
+    fn send(&self, event: WatcherEvent) {
+        if let Err(err) = self.tx.try_send(event) {
+            if self.drop_warn.should_emit() {
+                warn!(
+                    error = %err,
+                    "dropped file-watcher event: internal event channel is full; event will not be synced"
+                );
+            }
+        }
+    }
+}
+
 impl FileWatcher {
     /// Create a new file watcher
     pub fn new(
@@ -39,13 +105,14 @@ impl FileWatcher {
         let ignore_matcher = Arc::new(ignore_matcher);
         let closure_matcher = ignore_matcher;
         let root = root_dir.clone();
+        let sender = EventSender::new(event_tx, DROP_WARN_INTERVAL);
         let mut debouncer = new_debouncer(
             Duration::from_millis(debounce_ms),
             None,
             move |result: DebounceEventResult| match result {
                 Ok(events) => {
                     for event in events {
-                        let _ = process_event(event, &event_tx, &closure_matcher, &root);
+                        let _ = process_event(event, &sender, &closure_matcher, &root);
                     }
                 }
                 Err(errors) => {
@@ -124,7 +191,7 @@ impl FileWatcher {
 /// Process a debounced event and send to channel
 fn process_event(
     event: DebouncedEvent,
-    tx: &mpsc::Sender<WatcherEvent>,
+    sender: &EventSender,
     matcher: &IgnoreMatcher,
     root: &Path,
 ) -> Result<()> {
@@ -137,7 +204,7 @@ fn process_event(
                     continue;
                 }
                 let event = WatcherEvent::FileCreated(path.to_path_buf());
-                let _ = tx.try_send(event);
+                sender.send(event);
             }
         }
         EventKind::Modify(modify_kind) => {
@@ -153,7 +220,7 @@ fn process_event(
                                 if should_ignore(path, matcher, root) {
                                     continue;
                                 }
-                                let _ = tx.try_send(WatcherEvent::FileDeleted(path.to_path_buf()));
+                                sender.send(WatcherEvent::FileDeleted(path.to_path_buf()));
                             }
                         }
                         RenameMode::To => {
@@ -162,18 +229,16 @@ fn process_event(
                                 if should_ignore(path, matcher, root) {
                                     continue;
                                 }
-                                let _ = tx.try_send(WatcherEvent::FileCreated(path.to_path_buf()));
+                                sender.send(WatcherEvent::FileCreated(path.to_path_buf()));
                             }
                         }
                         RenameMode::Both if paths.len() >= 2 => {
                             // Both paths in one event - first is old, second is new
                             if !should_ignore(paths[0], matcher, root) {
-                                let _ =
-                                    tx.try_send(WatcherEvent::FileDeleted(paths[0].to_path_buf()));
+                                sender.send(WatcherEvent::FileDeleted(paths[0].to_path_buf()));
                             }
                             if !should_ignore(paths[1], matcher, root) {
-                                let _ =
-                                    tx.try_send(WatcherEvent::FileCreated(paths[1].to_path_buf()));
+                                sender.send(WatcherEvent::FileCreated(paths[1].to_path_buf()));
                             }
                         }
                         RenameMode::Both => {}
@@ -186,7 +251,7 @@ fn process_event(
                         if should_ignore(path, matcher, root) {
                             continue;
                         }
-                        let _ = tx.try_send(WatcherEvent::FileModified(path.to_path_buf()));
+                        sender.send(WatcherEvent::FileModified(path.to_path_buf()));
                     }
                 }
             }
@@ -197,7 +262,7 @@ fn process_event(
                     continue;
                 }
                 let event = WatcherEvent::FileDeleted(path.to_path_buf());
-                let _ = tx.try_send(event);
+                sender.send(event);
             }
         }
         _ => {}
@@ -258,7 +323,11 @@ mod tests {
         CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode,
     };
     use notify_debouncer_full::notify::{Event, EventKind};
-    use std::time::Instant;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::fmt::writer::MakeWriter;
 
     // -----------------------------------------------------------------------
     // Helper: construct a minimal FileWatcher for testing
@@ -460,6 +529,7 @@ mod tests {
     #[test]
     fn test_process_event_create_sends_file_created() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let sender = EventSender::new(tx, Duration::from_secs(1));
         let matcher = IgnoreMatcher::empty();
         let root = Path::new("/root");
 
@@ -468,7 +538,7 @@ mod tests {
             vec![PathBuf::from("/root/new.txt")],
         );
 
-        process_event(event, &tx, &matcher, root).unwrap();
+        process_event(event, &sender, &matcher, root).unwrap();
 
         let received = rx.try_recv().unwrap();
         match received {
@@ -480,6 +550,7 @@ mod tests {
     #[test]
     fn test_process_event_create_ignored_path_skipped() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let sender = EventSender::new(tx, Duration::from_secs(1));
         let matcher = IgnoreMatcher::from_content("*.tmp");
         let root = Path::new("/root");
 
@@ -488,7 +559,7 @@ mod tests {
             vec![PathBuf::from("/root/file.tmp")],
         );
 
-        process_event(event, &tx, &matcher, root).unwrap();
+        process_event(event, &sender, &matcher, root).unwrap();
 
         assert!(rx.try_recv().is_err());
     }
@@ -496,6 +567,7 @@ mod tests {
     #[test]
     fn test_process_event_create_path_outside_root_skipped() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let sender = EventSender::new(tx, Duration::from_secs(1));
         let matcher = IgnoreMatcher::empty();
         let root = Path::new("/root");
 
@@ -504,7 +576,7 @@ mod tests {
             vec![PathBuf::from("/outside/file.txt")],
         );
 
-        process_event(event, &tx, &matcher, root).unwrap();
+        process_event(event, &sender, &matcher, root).unwrap();
 
         assert!(rx.try_recv().is_err());
     }
@@ -515,6 +587,7 @@ mod tests {
     #[test]
     fn test_process_event_modify_data_sends_file_modified() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let sender = EventSender::new(tx, Duration::from_secs(1));
         let matcher = IgnoreMatcher::empty();
         let root = Path::new("/root");
 
@@ -523,7 +596,7 @@ mod tests {
             vec![PathBuf::from("/root/file.txt")],
         );
 
-        process_event(event, &tx, &matcher, root).unwrap();
+        process_event(event, &sender, &matcher, root).unwrap();
 
         let received = rx.try_recv().unwrap();
         match received {
@@ -535,6 +608,7 @@ mod tests {
     #[test]
     fn test_process_event_modify_any_sends_file_modified() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let sender = EventSender::new(tx, Duration::from_secs(1));
         let matcher = IgnoreMatcher::empty();
         let root = Path::new("/root");
 
@@ -543,7 +617,7 @@ mod tests {
             vec![PathBuf::from("/root/file.txt")],
         );
 
-        process_event(event, &tx, &matcher, root).unwrap();
+        process_event(event, &sender, &matcher, root).unwrap();
 
         let received = rx.try_recv().unwrap();
         match received {
@@ -558,6 +632,7 @@ mod tests {
     #[test]
     fn test_process_event_rename_from_sends_file_deleted() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let sender = EventSender::new(tx, Duration::from_secs(1));
         let matcher = IgnoreMatcher::empty();
         let root = Path::new("/root");
 
@@ -566,7 +641,7 @@ mod tests {
             vec![PathBuf::from("/root/old.txt")],
         );
 
-        process_event(event, &tx, &matcher, root).unwrap();
+        process_event(event, &sender, &matcher, root).unwrap();
 
         let received = rx.try_recv().unwrap();
         match received {
@@ -578,6 +653,7 @@ mod tests {
     #[test]
     fn test_process_event_rename_to_sends_file_created() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let sender = EventSender::new(tx, Duration::from_secs(1));
         let matcher = IgnoreMatcher::empty();
         let root = Path::new("/root");
 
@@ -586,7 +662,7 @@ mod tests {
             vec![PathBuf::from("/root/new.txt")],
         );
 
-        process_event(event, &tx, &matcher, root).unwrap();
+        process_event(event, &sender, &matcher, root).unwrap();
 
         let received = rx.try_recv().unwrap();
         match received {
@@ -598,6 +674,7 @@ mod tests {
     #[test]
     fn test_process_event_rename_both_sends_delete_and_create() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let sender = EventSender::new(tx, Duration::from_secs(1));
         let matcher = IgnoreMatcher::empty();
         let root = Path::new("/root");
 
@@ -609,7 +686,7 @@ mod tests {
             ],
         );
 
-        process_event(event, &tx, &matcher, root).unwrap();
+        process_event(event, &sender, &matcher, root).unwrap();
 
         // Should emit FileDeleted for the first path and FileCreated for the second
         let mut deleted = false;
@@ -634,6 +711,7 @@ mod tests {
     #[test]
     fn test_process_event_rename_both_single_path_does_nothing() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let sender = EventSender::new(tx, Duration::from_secs(1));
         let matcher = IgnoreMatcher::empty();
         let root = Path::new("/root");
 
@@ -644,7 +722,7 @@ mod tests {
             vec![PathBuf::from("/root/only.txt")],
         );
 
-        process_event(event, &tx, &matcher, root).unwrap();
+        process_event(event, &sender, &matcher, root).unwrap();
 
         assert!(rx.try_recv().is_err());
     }
@@ -655,6 +733,7 @@ mod tests {
     #[test]
     fn test_process_event_remove_sends_file_deleted() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let sender = EventSender::new(tx, Duration::from_secs(1));
         let matcher = IgnoreMatcher::empty();
         let root = Path::new("/root");
 
@@ -663,7 +742,7 @@ mod tests {
             vec![PathBuf::from("/root/gone.txt")],
         );
 
-        process_event(event, &tx, &matcher, root).unwrap();
+        process_event(event, &sender, &matcher, root).unwrap();
 
         let received = rx.try_recv().unwrap();
         match received {
@@ -678,6 +757,7 @@ mod tests {
     #[test]
     fn test_process_event_rename_from_ignored_path_skipped() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let sender = EventSender::new(tx, Duration::from_secs(1));
         let matcher = IgnoreMatcher::from_content("*.old");
         let root = Path::new("/root");
 
@@ -686,7 +766,7 @@ mod tests {
             vec![PathBuf::from("/root/file.old")],
         );
 
-        process_event(event, &tx, &matcher, root).unwrap();
+        process_event(event, &sender, &matcher, root).unwrap();
 
         assert!(rx.try_recv().is_err());
     }
@@ -694,6 +774,7 @@ mod tests {
     #[test]
     fn test_process_event_remove_ignored_path_skipped() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let sender = EventSender::new(tx, Duration::from_secs(1));
         let matcher = IgnoreMatcher::from_content("*.swp");
         let root = Path::new("/root");
 
@@ -702,7 +783,7 @@ mod tests {
             vec![PathBuf::from("/root/file.swp")],
         );
 
-        process_event(event, &tx, &matcher, root).unwrap();
+        process_event(event, &sender, &matcher, root).unwrap();
 
         assert!(rx.try_recv().is_err());
     }
@@ -728,6 +809,98 @@ mod tests {
         assert!(
             watcher._debouncer.is_some(),
             "FileWatcher must hold the notify debouncer so it is cleaned up on Drop"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Dropped-event warning on a full channel (story #2894)
+    // -----------------------------------------------------------------------
+    /// A writer that records formatted tracing output into a shared buffer so
+    /// tests can assert on the emitted warning text.
+    #[derive(Clone)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> MakeWriter<'a> for SharedBuf {
+        type Writer = SharedBufSink;
+
+        fn make_writer(&self) -> Self::Writer {
+            SharedBufSink(self.0.clone())
+        }
+    }
+
+    struct SharedBufSink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBufSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("shared buffer lock poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_send_after_full_channel_logs_warning() {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(SharedBuf(buffer.clone()))
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        with_default(subscriber, || {
+            let (tx, _rx) = tokio::sync::mpsc::channel(100);
+            let sender = EventSender::new(tx, Duration::ZERO);
+            let path = PathBuf::from("/root/dropped.txt");
+
+            // Fill the 100-capacity channel so the next send is dropped.
+            for _ in 0..100 {
+                sender.send(WatcherEvent::FileCreated(path.clone()));
+            }
+            sender.send(WatcherEvent::FileCreated(path.clone()));
+        });
+
+        let output = String::from_utf8(buffer.lock().expect("buffer lock poisoned").clone())
+            .expect("tracing output is utf-8");
+        assert!(
+            output.contains("dropped file-watcher event"),
+            "expected a drop warning to be logged, got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_drop_warning_is_rate_limited() {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(SharedBuf(buffer.clone()))
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        with_default(subscriber, || {
+            let (tx, _rx) = tokio::sync::mpsc::channel(100);
+            let sender = EventSender::new(tx, Duration::from_secs(60));
+            let path = PathBuf::from("/root/burst.txt");
+
+            for _ in 0..100 {
+                sender.send(WatcherEvent::FileCreated(path.clone()));
+            }
+            // A burst of dropped events must produce exactly one warning
+            // within the rate-limit window.
+            for _ in 0..10 {
+                sender.send(WatcherEvent::FileCreated(path.clone()));
+            }
+        });
+
+        let output = String::from_utf8(buffer.lock().expect("buffer lock poisoned").clone())
+            .expect("tracing output is utf-8");
+        let warn_count = output.matches("dropped file-watcher event").count();
+        assert_eq!(
+            warn_count, 1,
+            "expected a single rate-limited warning, got {warn_count} in: {output}"
         );
     }
 }
