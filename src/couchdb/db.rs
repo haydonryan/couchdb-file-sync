@@ -411,6 +411,11 @@ impl CouchDb {
             return Ok(None);
         }
 
+        #[cfg(test)]
+        if let Some(state) = &self.test_state {
+            return Ok(state.metadata.get(path).cloned());
+        }
+
         match self.retry_transient(|| self.db.get(path)).await {
             Ok(doc) => Ok(Some(doc)),
             Err(e) => {

@@ -753,7 +753,11 @@ impl SyncEngine {
             self.couchdb.delete_chunks(&old_chunk_ids).await?;
         }
 
-        let hash = compute_file_hash(&file_path)?;
+        // Hash the in-memory content buffer we just uploaded instead of
+        // re-reading the file from disk. Since `content` is exactly the bytes
+        // pushed to CouchDB, hashing it keeps the saved FileState in agreement
+        // with the transferred bytes even under a mid-sync modification.
+        let hash = compute_bytes_hash(&content);
         let state = FileState {
             path: local_path.to_string(),
             hash,
@@ -806,7 +810,10 @@ impl SyncEngine {
         tokio::fs::write(&file_path, &content).await?;
         debug!("[DOWNLOAD] Wrote {} bytes to disk", content.len());
 
-        let hash = compute_file_hash(&file_path)?;
+        // Hash the in-memory content buffer we just fetched and wrote instead
+        // of re-reading the file back from disk. This avoids a redundant disk
+        // read and keeps the saved hash equal to the bytes actually transferred.
+        let hash = compute_bytes_hash(&content);
         let metadata = std::fs::metadata(&file_path)?;
         let state = FileState {
             path: local_path.to_string(),
@@ -1003,7 +1010,7 @@ mod tests {
     use super::*;
     use crate::couchdb::db::CannedCouch;
     use crate::couchdb::CouchDb;
-    use crate::local::{compute_file_hash, LocalDb};
+    use crate::local::{compute_bytes_hash, compute_file_hash, LocalDb};
     use crate::models::{Change, CouchRev, FileDoc, IgnoreMatcher, TimestampMillis};
     use chrono::{Duration, Utc};
     use std::path::PathBuf;
@@ -1417,5 +1424,110 @@ mod tests {
             0,
             "dry run must not write to CouchDB"
         );
+    }
+
+    // ── Hash in-memory buffer vs. re-read from disk (#2904) ────────────────
+
+    #[tokio::test]
+    async fn bytes_hash_matches_file_hash_for_equivalent_content() {
+        let root = test_root("/tmp/cfs-bytes-vs-file-hash");
+        let file_path = root.as_path().join("content.bin");
+
+        // Representative content: empty, small text, binary, and content large
+        // enough to span multiple 8 KiB reads inside compute_file_hash.
+        let cases: Vec<&[u8]> = vec![
+            b"",
+            b"hello world",
+            &[0u8, 1, 2, 3, 255, 128, 64][..],
+            &[0x07u8; 20_000][..],
+        ];
+        for content in cases {
+            std::fs::write(&file_path, content).unwrap();
+            let bytes = std::fs::read(&file_path).unwrap();
+            assert_eq!(
+                compute_bytes_hash(&bytes),
+                compute_file_hash(&file_path).unwrap(),
+                "hash of a file and of its read bytes must match for {} bytes",
+                content.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_saved_hash_matches_transferred_content_buffer() {
+        let root = test_root("/tmp/cfs-upload-hash-buffer");
+        let content: Vec<u8> = b"upload content bytes".to_vec();
+        std::fs::write(root.as_path().join("up.txt"), &content).unwrap();
+
+        let local = test_local_db();
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", CannedCouch::default()),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let (bytes_sent, _rev) = engine
+            .upload_local_file("up.txt", "prefix/up.txt")
+            .await
+            .expect("upload should succeed");
+
+        assert_eq!(bytes_sent, content.len(), "all content bytes uploaded");
+
+        let state = engine
+            .get_file_state("up.txt")
+            .unwrap()
+            .expect("upload should save a FileState");
+        assert_eq!(
+            state.hash,
+            compute_bytes_hash(&content),
+            "saved upload hash must equal the hash of the transferred content buffer"
+        );
+        assert_eq!(state.size, content.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn download_saved_hash_matches_transferred_content_buffer() {
+        let root = test_root("/tmp/cfs-download-hash-buffer");
+        let content: Vec<u8> = b"downloaded content bytes".to_vec();
+        let remote_path = "prefix/dl.txt";
+
+        let mut remote_doc =
+            FileDoc::new(remote_path.to_string(), String::new(), content.len() as u64);
+        remote_doc.rev = Some("1-abc".to_string());
+        remote_doc.path = remote_path.to_string();
+
+        let canned = CannedCouch {
+            changes: Vec::new(),
+            last_seq: "1".to_string(),
+            metadata: std::collections::HashMap::from([(remote_path.to_string(), remote_doc)]),
+            contents: std::collections::HashMap::from([(remote_path.to_string(), content.clone())]),
+        };
+        let local = test_local_db();
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let bytes_written = engine
+            .download_remote_file(remote_path, "dl.txt", true)
+            .await
+            .expect("download should succeed")
+            .expect("download should write content");
+
+        assert_eq!(bytes_written, content.len(), "all content bytes written");
+
+        let state = engine
+            .get_file_state("dl.txt")
+            .unwrap()
+            .expect("download should save a FileState");
+        assert_eq!(
+            state.hash,
+            compute_bytes_hash(&content),
+            "saved download hash must equal the hash of the transferred content buffer"
+        );
+        assert_eq!(state.size, content.len() as u64);
     }
 }
