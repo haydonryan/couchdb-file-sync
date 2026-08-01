@@ -18,6 +18,30 @@ pub struct CouchDb {
     auth: Option<(String, String)>,
     /// Remote path prefix to sync (e.g., "notes/" or "obsidian/")
     remote_path: RemotePath,
+    /// Test-only canned responses used to exercise the sync pipeline without a
+    /// live CouchDB server. Only present in test builds.
+    #[cfg(test)]
+    test_state: Option<CannedCouch>,
+    /// Test-only counter of CouchDB write attempts (save/delete/chunk ops).
+    /// Only present in test builds.
+    #[cfg(test)]
+    test_write_calls: std::sync::atomic::AtomicUsize,
+}
+
+/// Test-only canned responses for the CouchDB client.
+/// When `test_state` is set, read methods return this data instead of hitting
+/// the network and write methods record a call instead of mutating anything.
+#[cfg(test)]
+#[derive(Default, Clone)]
+pub struct CannedCouch {
+    /// Remote changes returned by `get_changes`.
+    pub changes: Vec<crate::models::Change>,
+    /// Last sequence value returned by `get_changes`.
+    pub last_seq: String,
+    /// Metadata returned by `fetch_metadata`, keyed by remote path.
+    pub metadata: std::collections::HashMap<String, crate::models::FileDoc>,
+    /// File content returned by `get_file_content`, keyed by remote path.
+    pub contents: std::collections::HashMap<String, Vec<u8>>,
 }
 
 /// Entry from a CouchDB changes feed
@@ -85,6 +109,10 @@ impl CouchDb {
             db_name: DatabaseName::new(db_name.to_string()),
             auth,
             remote_path: RemotePath::new(remote_path.to_string()),
+            #[cfg(test)]
+            test_state: None,
+            #[cfg(test)]
+            test_write_calls: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -113,7 +141,32 @@ impl CouchDb {
             db_name: DatabaseName::new("unittest"),
             auth: None,
             remote_path: RemotePath::new(remote_path.to_string()),
+            #[cfg(test)]
+            test_state: None,
+            #[cfg(test)]
+            test_write_calls: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Create a `CouchDb` instance for testing backed by canned data.
+    ///
+    /// Read methods (`get_changes`, `fetch_metadata`, `get_file_content`)
+    /// return the canned values, and write methods (`save_file`,
+    /// `delete_file`, `upload_file_content`, `delete_chunks`) increment the
+    /// write-call counter and do nothing, so tests can assert that a dry-run
+    /// never issues any remote writes.
+    #[cfg(test)]
+    pub fn for_test_with_canned(remote_path: &str, canned: CannedCouch) -> Self {
+        let mut client = Self::for_test(remote_path);
+        client.test_state = Some(canned);
+        client
+    }
+
+    /// Number of write attempts issued against this test client.
+    #[cfg(test)]
+    pub fn test_write_calls(&self) -> usize {
+        self.test_write_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Fetch changes from CouchDB using the _changes feed (longpoll)
@@ -242,6 +295,13 @@ impl CouchDb {
 
     /// Save a document
     pub async fn save_file(&self, doc: &mut FileDoc) -> Result<()> {
+        #[cfg(test)]
+        if self.test_state.is_some() {
+            self.test_write_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Ok(());
+        }
+
         debug!("Saving file to CouchDB: {}", doc.id);
         let _details = self.db.save(doc).await?;
         Ok(())
@@ -249,6 +309,13 @@ impl CouchDb {
 
     /// Delete a document
     pub async fn delete_file(&self, path: &str) -> Result<()> {
+        #[cfg(test)]
+        if self.test_state.is_some() {
+            self.test_write_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Ok(());
+        }
+
         if let Some(mut doc) = self.get_file(path).await? {
             doc.deleted = true;
             self.save_file(&mut doc).await?;
@@ -272,6 +339,11 @@ impl CouchDb {
     /// Returns remote files within the configured remote path
     pub async fn get_changes(&self, since: Option<&str>) -> Result<(Vec<Change>, String)> {
         debug!("get_changes called with since = {:?}", since);
+
+        #[cfg(test)]
+        if let Some(state) = &self.test_state {
+            return Ok((state.changes.clone(), state.last_seq.clone()));
+        }
 
         let all_files = self.get_all_files().await?;
         debug!(
@@ -326,6 +398,11 @@ impl CouchDb {
 
     /// Fetch remote file metadata (without downloading chunks)
     pub async fn fetch_metadata(&self, path: &str) -> Result<Option<FileDoc>> {
+        #[cfg(test)]
+        if let Some(state) = &self.test_state {
+            return Ok(state.metadata.get(path).cloned());
+        }
+
         // Check if path is within allowed remote path
         if !self.is_path_allowed(path) {
             return Ok(None);
@@ -417,6 +494,11 @@ impl CouchDb {
 
     /// Get file content by fetching and combining all chunks
     pub async fn get_file_content(&self, path: &str) -> Result<Vec<u8>> {
+        #[cfg(test)]
+        if let Some(state) = &self.test_state {
+            return Ok(state.contents.get(path).cloned().unwrap_or_default());
+        }
+
         // First get the file document to find chunk IDs
         let doc = match self.get_file(path).await? {
             Some(d) => d,
@@ -482,6 +564,13 @@ impl CouchDb {
 
     /// Upload file content as chunks and return the chunk IDs
     pub async fn upload_file_content(&self, content: &[u8]) -> Result<Vec<String>> {
+        #[cfg(test)]
+        if self.test_state.is_some() {
+            self.test_write_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Ok(Vec::new());
+        }
+
         let content_str = String::from_utf8_lossy(content);
 
         // For simplicity, store entire content as a single chunk
@@ -501,6 +590,13 @@ impl CouchDb {
 
     /// Delete old chunks that are no longer referenced
     pub async fn delete_chunks(&self, chunk_ids: &[String]) -> Result<()> {
+        #[cfg(test)]
+        if self.test_state.is_some() {
+            self.test_write_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Ok(());
+        }
+
         for chunk_id in chunk_ids {
             if let Some(chunk) = self.get_chunk(chunk_id).await? {
                 if let Some(rev) = chunk.rev {
@@ -541,6 +637,8 @@ mod tests {
             db_name: DatabaseName::new("test_db"),
             auth: None,
             remote_path: RemotePath::new(remote_path.to_string()),
+            test_state: None,
+            test_write_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 

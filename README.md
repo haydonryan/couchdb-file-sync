@@ -169,6 +169,11 @@ couchdb-file-sync sync ~/documents --dry-run
 couchdb-file-sync sync ~/documents
 ```
 
+`--dry-run` walks the full sync pipeline (triage, upload/download/delete
+detection, and conflict identification) without writing anything to CouchDB,
+the local filesystem, or the state database, then prints a summary of what
+would be uploaded, downloaded, deleted, and conflicted.
+
 ### `couchdb-file-sync daemon [PATH]`
 
 Run continuous sync daemon.

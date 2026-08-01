@@ -62,13 +62,37 @@ impl SyncEngine {
         }
     }
 
-    /// Perform a full sync cycle
+    /// Perform a full sync cycle.
     pub async fn sync(&mut self) -> Result<SyncReport> {
-        info!("========== SYNC CYCLE STARTING ==========");
+        self.run_cycle(false).await
+    }
+
+    /// Perform a dry-run sync cycle.
+    ///
+    /// Walks the full sync pipeline (local scan, remote fetch, triage, and
+    /// conflict detection) but skips every write: nothing is written to
+    /// CouchDB, the local filesystem, or the state database. The returned
+    /// `SyncReport` reflects what *would* have been uploaded, downloaded,
+    /// deleted, and conflicted.
+    pub async fn sync_dry_run(&mut self) -> Result<SyncReport> {
+        self.run_cycle(true).await
+    }
+
+    /// Shared sync-cycle implementation.
+    ///
+    /// When `dry_run` is true every write operation (CouchDB writes, local
+    /// filesystem writes, and state-DB saves) is skipped while the read-only
+    /// triage, conflict detection, and report generation still run.
+    async fn run_cycle(&mut self, dry_run: bool) -> Result<SyncReport> {
+        if dry_run {
+            info!("========== DRY-RUN SYNC CYCLE STARTING ==========");
+        } else {
+            info!("========== SYNC CYCLE STARTING ==========");
+        }
         let mut report = SyncReport::default();
 
         // 1. Scan local changes
-        let local_changes = self.scan_local_changes().await?;
+        let local_changes = self.scan_local_changes(dry_run).await?;
         info!("Local changes detected: {}", local_changes.len());
         for change in &local_changes {
             debug!("  [LOCAL] {} ({:?})", change.path(), change.change_type());
@@ -88,7 +112,7 @@ impl SyncEngine {
 
         // 3. Detect conflicts
         let (local_to_upload, remote_to_apply, conflicts) = self
-            .detect_conflicts(&local_changes, &remote_changes)
+            .detect_conflicts(&local_changes, &remote_changes, dry_run)
             .await?;
 
         report.conflicts = conflicts.len();
@@ -98,13 +122,15 @@ impl SyncEngine {
         info!("  - Files to download: {}", remote_to_apply.len());
         info!("  - Conflicts: {}", conflicts.len());
 
-        // 4. Store conflicts
-        for conflict in conflicts {
+        // 4. Store conflicts (skipped in dry-run)
+        for conflict in &conflicts {
             info!("CONFLICT: {}", conflict.path);
-            self.local_db.store_conflict(&conflict)?;
+            if !dry_run {
+                self.local_db.store_conflict(conflict)?;
+            }
         }
 
-        // 5. Apply clean local changes to remote
+        // 5. Apply clean local changes to remote (skipped in dry-run)
         info!(
             "========== UPLOADING {} FILES ==========",
             local_to_upload.len()
@@ -115,25 +141,37 @@ impl SyncEngine {
                 change.path(),
                 self.couchdb.get_remote_path(change.path())
             );
-            match self.apply_to_couchdb(&change).await {
-                Ok(_) => {
-                    if matches!(change.change_type(), ChangeType::Deleted) {
-                        report.deleted_remote += 1;
-                        self.local_db.delete_file_state(change.path())?;
-                    } else {
-                        report.uploaded.0 += 1;
+
+            if matches!(change.change_type(), ChangeType::Deleted) {
+                report.deleted_remote += 1;
+                if !dry_run {
+                    match self.apply_to_couchdb(&change).await {
+                        Ok(_) => self.local_db.delete_file_state(change.path())?,
+                        Err(e) => {
+                            error!("Failed to upload {}: {}", change.path(), e);
+                            report
+                                .errors
+                                .push(format!("Upload {}: {}", change.path(), e));
+                        }
                     }
                 }
-                Err(e) => {
-                    error!("Failed to upload {}: {}", change.path(), e);
-                    report
-                        .errors
-                        .push(format!("Upload {}: {}", change.path(), e));
+            } else {
+                report.uploaded.0 += 1;
+                if !dry_run {
+                    match self.apply_to_couchdb(&change).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            error!("Failed to upload {}: {}", change.path(), e);
+                            report
+                                .errors
+                                .push(format!("Upload {}: {}", change.path(), e));
+                        }
+                    }
                 }
             }
         }
 
-        // 6. Apply clean remote changes to local
+        // 6. Apply clean remote changes to local (skipped in dry-run)
         info!(
             "========== DOWNLOADING {} FILES ==========",
             remote_to_apply.len()
@@ -144,30 +182,52 @@ impl SyncEngine {
                 change.path(),
                 self.couchdb.get_local_path(change.path())
             );
-            match self.apply_to_filesystem(&change).await {
-                Ok(_) => {
-                    if matches!(change.change_type(), ChangeType::Deleted) {
-                        report.deleted_local += 1;
-                    } else {
-                        report.downloaded.0 += 1;
+
+            if matches!(change.change_type(), ChangeType::Deleted) {
+                report.deleted_local += 1;
+                if !dry_run {
+                    match self.apply_to_filesystem(&change).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            error!("Failed to download {}: {}", change.path(), e);
+                            report
+                                .errors
+                                .push(format!("Download {}: {}", change.path(), e));
+                        }
                     }
                 }
-                Err(e) => {
-                    error!("Failed to download {}: {}", change.path(), e);
-                    report
-                        .errors
-                        .push(format!("Download {}: {}", change.path(), e));
+            } else {
+                report.downloaded.0 += 1;
+                if !dry_run {
+                    match self.apply_to_filesystem(&change).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            error!("Failed to download {}: {}", change.path(), e);
+                            report
+                                .errors
+                                .push(format!("Download {}: {}", change.path(), e));
+                        }
+                    }
                 }
             }
         }
 
-        // 7. Update checkpoint
-        self.local_db.save_checkpoint(&last_seq)?;
+        // 7. Update checkpoint (skipped in dry-run)
+        if !dry_run {
+            self.local_db.save_checkpoint(&last_seq)?;
+        }
 
-        info!(
-            "========== SYNC COMPLETE: {} uploaded, {} downloaded, {} conflicts ==========",
-            report.uploaded, report.downloaded, report.conflicts
-        );
+        if dry_run {
+            info!(
+                "========== DRY-RUN COMPLETE: {} would upload, {} would download, {} conflicts ==========",
+                report.uploaded, report.downloaded, report.conflicts
+            );
+        } else {
+            info!(
+                "========== SYNC COMPLETE: {} uploaded, {} downloaded, {} conflicts ==========",
+                report.uploaded, report.downloaded, report.conflicts
+            );
+        }
 
         Ok(report)
     }
@@ -244,8 +304,12 @@ impl SyncEngine {
         Ok(report)
     }
 
-    /// Scan for local changes
-    async fn scan_local_changes(&self) -> Result<Vec<Change>> {
+    /// Scan for local changes.
+    ///
+    /// In dry-run mode the scan still detects changes, but the state-DB
+    /// cleanups (removing polluted/ignored entries and re-saving unchanged
+    /// states) are skipped so that nothing is written to the state DB.
+    async fn scan_local_changes(&self, dry_run: bool) -> Result<Vec<Change>> {
         let current_states = self.scanner.full_scan()?;
         let stored_states = self.local_db.get_all_file_states()?;
         let remote_prefix = self.couchdb.remote_prefix();
@@ -257,7 +321,9 @@ impl SyncEngine {
                     "Removing invalid state entry for {}: local state includes remote prefix {}",
                     state.path, remote_prefix
                 );
-                self.local_db.delete_file_state(&state.path)?;
+                if !dry_run {
+                    self.local_db.delete_file_state(&state.path)?;
+                }
             } else if self
                 .ignore_matcher
                 .should_ignore(std::path::Path::new(&state.path))
@@ -266,7 +332,9 @@ impl SyncEngine {
                     "Removing ignored state entry from local database: {}",
                     state.path
                 );
-                self.local_db.delete_file_state(&state.path)?;
+                if !dry_run {
+                    self.local_db.delete_file_state(&state.path)?;
+                }
             } else {
                 valid_stored_states.push(state);
             }
@@ -291,28 +359,32 @@ impl SyncEngine {
             );
         }
 
-        // Build a map of stored states to preserve couch_rev
-        let stored_map: HashMap<_, _> = valid_stored_states.iter().map(|s| (&s.path, s)).collect();
-
         // Only update stored states for files that haven't changed
-        // (new and modified files will be updated after successful sync)
-        for state in &current_states {
-            // Check if this file is in the changes list
-            let is_changed = changes.iter().any(|c| c.path() == state.path);
-            if !is_changed {
-                // File unchanged - preserve the couch_rev from stored state
-                let couch_rev = stored_map
-                    .get(&state.path)
-                    .and_then(|s| s.couch_rev.clone());
-                let preserved_state = FileState {
-                    path: state.path.clone(),
-                    hash: state.hash.clone(),
-                    size: state.size,
-                    modified_at: state.modified_at,
-                    couch_rev,
-                    last_sync_at: state.last_sync_at,
-                };
-                self.local_db.save_file_state(&preserved_state)?;
+        // (new and modified files will be updated after successful sync).
+        // Skipped entirely in dry-run mode so the state DB is left untouched.
+        if !dry_run {
+            // Build a map of stored states to preserve couch_rev
+            let stored_map: HashMap<_, _> =
+                valid_stored_states.iter().map(|s| (&s.path, s)).collect();
+
+            for state in &current_states {
+                // Check if this file is in the changes list
+                let is_changed = changes.iter().any(|c| c.path() == state.path);
+                if !is_changed {
+                    // File unchanged - preserve the couch_rev from stored state
+                    let couch_rev = stored_map
+                        .get(&state.path)
+                        .and_then(|s| s.couch_rev.clone());
+                    let preserved_state = FileState {
+                        path: state.path.clone(),
+                        hash: state.hash.clone(),
+                        size: state.size,
+                        modified_at: state.modified_at,
+                        couch_rev,
+                        last_sync_at: state.last_sync_at,
+                    };
+                    self.local_db.save_file_state(&preserved_state)?;
+                }
             }
         }
 
@@ -328,10 +400,15 @@ impl SyncEngine {
     }
 
     /// Detect conflicts between local and remote changes
+    ///
+    /// In dry-run mode the identical-content "silent sync" branch skips the
+    /// state-DB save; conflict detection still runs and conflicts are returned
+    /// as if they would be recorded.
     async fn detect_conflicts(
         &self,
         local_changes: &[Change],
         remote_changes: &[Change],
+        dry_run: bool,
     ) -> Result<(Vec<Change>, Vec<Change>, Vec<Conflict>)> {
         // Build a complete map of stored states (one I/O batch)
         let mut stored_states: HashMap<String, FileState> = HashMap::new();
@@ -512,16 +589,18 @@ impl SyncEngine {
                     lc.path(),
                     &local_state.hash[..8.min(local_state.hash.len())]
                 );
-                // Update local state to reflect remote rev
-                let updated_state = FileState {
-                    path: lc.path().to_string(),
-                    hash: local_state.hash,
-                    size: local_state.size,
-                    modified_at: local_state.modified_at,
-                    couch_rev: remote_doc.rev.as_deref().and_then(CouchRev::new),
-                    last_sync_at: Utc::now(),
-                };
-                self.local_db.save_file_state(&updated_state)?;
+                // Update local state to reflect remote rev (skipped in dry-run)
+                if !dry_run {
+                    let updated_state = FileState {
+                        path: lc.path().to_string(),
+                        hash: local_state.hash,
+                        size: local_state.size,
+                        modified_at: local_state.modified_at,
+                        couch_rev: remote_doc.rev.as_deref().and_then(CouchRev::new),
+                        last_sync_at: Utc::now(),
+                    };
+                    self.local_db.save_file_state(&updated_state)?;
+                }
             } else {
                 info!(
                     "  [CONFLICT] {} - content differs (local: {}, remote: {})",
@@ -920,9 +999,11 @@ impl SyncEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::couchdb::db::CannedCouch;
     use crate::couchdb::CouchDb;
-    use crate::local::LocalDb;
-    use crate::models::IgnoreMatcher;
+    use crate::local::{compute_file_hash, LocalDb};
+    use crate::models::{Change, CouchRev, FileDoc, IgnoreMatcher, TimestampMillis};
+    use chrono::{Duration, Utc};
     use std::path::PathBuf;
 
     /// Create a minimal CouchDb instance for testing construction.
@@ -1040,5 +1121,299 @@ mod tests {
         // remote_to_local_path should strip the prefix
         let local = engine.remote_to_local_path("test-prefix/doc.txt");
         assert_eq!(local, "doc.txt");
+    }
+
+    // ── Dry-run sync cycle ─────────────────────────────────────────────
+
+    fn test_canned_couch(remote_path: &str, canned: CannedCouch) -> CouchDb {
+        CouchDb::for_test_with_canned(remote_path, canned)
+    }
+
+    fn seed_file_state(local: &LocalDb, path: &str, hash: &str, size: u64) {
+        let state = FileState::new(
+            path.to_string(),
+            hash.to_string(),
+            size,
+            Utc::now() - Duration::days(1),
+        );
+        local.save_file_state(&state).expect("seed file state");
+    }
+
+    #[tokio::test]
+    async fn dry_run_counts_local_uploads_and_remotes_deletes_without_writing() {
+        let root = test_root("/tmp/cfs-dryrun-uploads");
+        // New local file (would upload)
+        std::fs::write(root.as_path().join("new.txt"), "hello new\n").unwrap();
+        // A previously tracked file that no longer exists (would delete remote)
+        let local = test_local_db();
+        seed_file_state(&local, "gone.txt", "deadbeef", 4);
+
+        let canned = CannedCouch {
+            changes: Vec::new(),
+            last_seq: "500-seed".to_string(),
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let report = engine.sync_dry_run().await.expect("dry run uploads");
+
+        assert_eq!(report.uploaded.0, 1, "new.txt should be counted as upload");
+        assert_eq!(
+            report.deleted_remote, 1,
+            "gone.txt should be counted as remote delete"
+        );
+        assert_eq!(report.downloaded.0, 0);
+        assert_eq!(report.deleted_local, 0);
+        assert!(report.conflicts == 0);
+        assert!(report.errors.is_empty());
+
+        // Trieage ran: the planned upload is the new file.
+        // Dry run wrote nothing to the state DB:
+        assert!(
+            engine.get_file_state("new.txt").unwrap().is_none(),
+            "dry run must not save file states"
+        );
+        assert!(
+            engine.get_file_state("gone.txt").unwrap().is_some(),
+            "dry run must not delete existing file states"
+        );
+        assert!(engine.get_conflicts().unwrap().is_empty());
+        assert!(
+            engine.get_checkpoint().unwrap().is_none(),
+            "dry run must not save a checkpoint"
+        );
+        // Dry run issued no CouchDB writes:
+        assert_eq!(
+            engine.couchdb.test_write_calls(),
+            0,
+            "dry run must not write to CouchDB"
+        );
+        // Local file untouched
+        assert!(root.as_path().join("new.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn dry_run_counts_downloads_without_writing_files_or_state() {
+        let root = test_root("/tmp/cfs-dryrun-downloads");
+        // Tracked local file, unchanged on disk.
+        std::fs::write(root.as_path().join("foo.txt"), "foo-content").unwrap();
+        let local = test_local_db();
+        let foo_hash = compute_file_hash(&root.as_path().join("foo.txt")).unwrap();
+        local.save_checkpoint("100-before").unwrap();
+
+        let mut stored = FileState::new(
+            "foo.txt".to_string(),
+            foo_hash.clone(),
+            11,
+            Utc::now() - Duration::days(1),
+        );
+        stored.couch_rev = Some(CouchRev::new("1-abc").unwrap());
+        stored.last_sync_at = Utc::now() - Duration::days(1);
+        local.save_file_state(&stored).unwrap();
+
+        let remote_prefix = "prefix/";
+        let canned = CannedCouch {
+            changes: vec![
+                // Unchanged local file now has a new rev -> download
+                Change::remote_modified(
+                    format!("{}foo.txt", remote_prefix),
+                    "someremotehash".to_string(),
+                    11,
+                    Utc::now(),
+                    "2-def".to_string(),
+                ),
+                // Brand new remote file -> download
+                Change::remote_created(
+                    format!("{}bar.txt", remote_prefix),
+                    "barhash".to_string(),
+                    3,
+                    Utc::now(),
+                    "1-x".to_string(),
+                ),
+            ],
+            last_seq: "200-after".to_string(),
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch(remote_prefix, canned),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let report = engine.sync_dry_run().await.expect("dry run downloads");
+
+        assert_eq!(report.downloaded.0, 2, "foo.txt and bar.txt downloads");
+        assert_eq!(report.uploaded.0, 0);
+        assert_eq!(report.deleted_local, 0);
+        assert_eq!(report.deleted_remote, 0);
+        assert!(report.conflicts == 0);
+
+        // Nothing was written locally:
+        assert!(
+            !root.as_path().join("bar.txt").exists(),
+            "dry run must not create downloaded files"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.as_path().join("foo.txt")).unwrap(),
+            "foo-content",
+            "dry run must not overwrite local files"
+        );
+        // State DB untouched (checkpoint still the seeded one, rev unchanged):
+        assert_eq!(
+            engine.get_checkpoint().unwrap().unwrap().last_seq,
+            "100-before",
+            "dry run must not advance the checkpoint"
+        );
+        let foo_state = engine.get_file_state("foo.txt").unwrap().unwrap();
+        assert_eq!(
+            foo_state.couch_rev.map(|r| r.to_string()),
+            Some("1-abc".to_string())
+        );
+        assert!(engine.get_conflicts().unwrap().is_empty());
+        assert_eq!(
+            engine.couchdb.test_write_calls(),
+            0,
+            "dry run must not write to CouchDB"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_detects_conflicts_without_persisting_them() {
+        let root = test_root("/tmp/cfs-dryrun-conflict");
+        // Local file changed since last sync.
+        std::fs::write(root.as_path().join("both.txt"), "local-content").unwrap();
+        let local = test_local_db();
+        // Stored state is stale (old hash) so the local change is detected.
+        seed_file_state(&local, "both.txt", "stalehash", 13);
+        // Give the stored state an old enough last_sync_at.
+        let mut stored = local.get_file_state("both.txt").unwrap().unwrap();
+        stored.couch_rev = Some(CouchRev::new("1-abc").unwrap());
+        stored.last_sync_at = Utc::now() - Duration::days(1);
+        local.save_file_state(&stored).unwrap();
+
+        let remote_path = "prefix/both.txt";
+        let remote_modified_at = TimestampMillis::now();
+        let mut remote_doc = FileDoc::new(remote_path.to_string(), String::new(), 13);
+        remote_doc.rev = Some("2-def".to_string());
+        remote_doc.mtime = remote_modified_at;
+        remote_doc.path = remote_path.to_string();
+
+        let canned = CannedCouch {
+            changes: vec![Change::remote_modified(
+                remote_path.to_string(),
+                "remotehash".to_string(),
+                14,
+                Utc::now(),
+                "2-def".to_string(),
+            )],
+            last_seq: "900".to_string(),
+            metadata: std::collections::HashMap::from([(
+                remote_path.to_string(),
+                remote_doc.clone(),
+            )]),
+            contents: std::collections::HashMap::from([(
+                remote_path.to_string(),
+                b"remote-content".to_vec(),
+            )]),
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let report = engine.sync_dry_run().await.expect("dry run conflict");
+
+        assert_eq!(report.conflicts, 1, "content differs -> conflict");
+        assert_eq!(report.uploaded.0, 0);
+        assert_eq!(report.downloaded.0, 0);
+
+        // Conflict identified but NOT persisted to the state DB:
+        assert!(
+            engine.get_conflicts().unwrap().is_empty(),
+            "dry run must not store conflicts"
+        );
+        let stored = engine.get_file_state("both.txt").unwrap().unwrap();
+        assert_eq!(
+            stored.couch_rev.map(|r| r.to_string()),
+            Some("1-abc".to_string()),
+            "dry run must not update local state"
+        );
+        assert_eq!(
+            engine.couchdb.test_write_calls(),
+            0,
+            "dry run must not write to CouchDB"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_does_not_save_state_for_identical_content() {
+        let root = test_root("/tmp/cfs-dryrun-identical");
+        // Local file has the same content as remote; only local tracking is stale.
+        std::fs::write(root.as_path().join("same.txt"), "same-content").unwrap();
+        let local = test_local_db();
+        seed_file_state(&local, "same.txt", "stalehash", 12);
+        let mut stored = local.get_file_state("same.txt").unwrap().unwrap();
+        stored.couch_rev = Some(CouchRev::new("1-abc").unwrap());
+        stored.last_sync_at = Utc::now() - Duration::days(1);
+        local.save_file_state(&stored).unwrap();
+
+        let remote_path = "prefix/same.txt";
+        let mut remote_doc = FileDoc::new(remote_path.to_string(), String::new(), 12);
+        remote_doc.rev = Some("2-def".to_string());
+        remote_doc.mtime = TimestampMillis::now();
+        remote_doc.path = remote_path.to_string();
+
+        let canned = CannedCouch {
+            changes: vec![Change::remote_modified(
+                remote_path.to_string(),
+                "remotehash".to_string(),
+                12,
+                Utc::now(),
+                "2-def".to_string(),
+            )],
+            last_seq: "901".to_string(),
+            metadata: std::collections::HashMap::from([(
+                remote_path.to_string(),
+                remote_doc.clone(),
+            )]),
+            contents: std::collections::HashMap::from([(
+                remote_path.to_string(),
+                b"same-content".to_vec(),
+            )]),
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let report = engine.sync_dry_run().await.expect("dry run identical");
+
+        assert_eq!(report.conflicts, 0, "identical content is not a conflict");
+        assert_eq!(report.uploaded.0, 0);
+        assert_eq!(report.downloaded.0, 0);
+
+        // The silent-sync state update must also be skipped in dry-run:
+        let stored = engine.get_file_state("same.txt").unwrap().unwrap();
+        assert_eq!(
+            stored.couch_rev.map(|r| r.to_string()),
+            Some("1-abc".to_string()),
+            "identical-content dry run must not update the local state"
+        );
+        assert!(engine.get_conflicts().unwrap().is_empty());
+        assert_eq!(
+            engine.couchdb.test_write_calls(),
+            0,
+            "dry run must not write to CouchDB"
+        );
     }
 }
