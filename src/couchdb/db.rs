@@ -16,7 +16,6 @@ const RETRY_BASE_BACKOFF_MS: u64 = 250;
 
 /// CouchDB client wrapper
 pub struct CouchDb {
-    #[allow(dead_code)]
     client: Client,
     db: Database,
     http_client: HttpClient,
@@ -596,40 +595,6 @@ impl CouchDb {
             Ok(_) => Ok(true),
             Err(_) => Ok(false),
         }
-    }
-
-    /// Get attachment content from a document
-    /// Attachments are stored at /{db}/{docid}/{attname}
-    #[allow(dead_code)]
-    pub async fn get_attachment(&self, doc_id: &str, attachment_name: &str) -> Result<Vec<u8>> {
-        let url = format!("{}/{}/{}", self.base_db_url, doc_id, attachment_name);
-
-        let bytes = self
-            .retry_transient::<_, _, Vec<u8>, anyhow::Error>(|| {
-                let mut request = self.http_client.get(&url);
-
-                if let Some((username, password)) = &self.auth {
-                    request = request.basic_auth(username, Some(password));
-                }
-
-                async move {
-                    let response = request.send().await?;
-
-                    if !response.status().is_success() {
-                        anyhow::bail!(
-                            "Failed to fetch attachment {}/{}: {}",
-                            doc_id,
-                            attachment_name,
-                            response.status()
-                        );
-                    }
-
-                    Ok(response.bytes().await?.to_vec())
-                }
-            })
-            .await?;
-
-        Ok(bytes)
     }
 
     /// Get a chunk document by ID
