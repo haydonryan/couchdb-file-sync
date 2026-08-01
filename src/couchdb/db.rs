@@ -757,8 +757,29 @@ impl CouchDb {
                     if let Some((username, password)) = &self.auth {
                         request = request.basic_auth(username, Some(password));
                     }
-                    let _ = request.send().await;
-                    debug!("Deleted old chunk: {}", chunk_id);
+                    match request.send().await {
+                        Ok(response) if response.status().is_success() => {
+                            debug!("Deleted old chunk: {}", chunk_id);
+                        }
+                        Ok(response) => {
+                            let status = response.status();
+                            let body = response.text().await.unwrap_or_default();
+                            warn!(
+                                "Failed to delete old chunk {}: {} - {}",
+                                chunk_id, status, body
+                            );
+                            anyhow::bail!(
+                                "Failed to delete old chunk {}: {} - {}",
+                                chunk_id,
+                                status,
+                                body
+                            );
+                        }
+                        Err(e) => {
+                            warn!("Failed to delete old chunk {}: {}", chunk_id, e);
+                            anyhow::bail!("Failed to delete old chunk {}: {}", chunk_id, e);
+                        }
+                    }
                 }
             }
         }
@@ -1104,5 +1125,140 @@ mod tests {
         assert!(CouchDb::is_transient(&"502 bad gateway".to_string()));
         assert!(!CouchDb::is_transient(&"400 bad request".to_string()));
         assert!(!CouchDb::is_transient(&"JSON parse error".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 2895: surface delete_chunks HTTP failures
+    // -----------------------------------------------------------------------
+
+    /// Build a CouchDb instance pointed at a caller-supplied base URL, with no
+    /// canned state, so `delete_chunks` issues real HTTP requests to the fake
+    /// server in these tests.
+    fn couchdb_at(base_db_url: &str) -> CouchDb {
+        let client = Client::new_no_auth("http://localhost:15984").unwrap();
+        let db = Database::new("test_db".to_string(), client.clone());
+        CouchDb {
+            client,
+            db,
+            http_client: HttpClient::new(),
+            base_db_url: base_db_url.to_string(),
+            db_name: DatabaseName::new("test_db"),
+            auth: None,
+            remote_path: RemotePath::new(String::new()),
+            timeout_seconds: 30,
+            retry_attempts: 3,
+            test_state: None,
+            test_write_calls: std::sync::atomic::AtomicUsize::new(0),
+            test_backoff: Duration::from_millis(1),
+        }
+    }
+
+    /// Spawn a minimal in-process fake CouchDB server that serves one chunk
+    /// document on GET and answers DELETE with `delete_status`. Returns the
+    /// base database URL, the server handle, and a shutdown flag.
+    fn spawn_fake_couch(
+        delete_status: u16,
+    ) -> (
+        String,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake couch");
+        let addr = listener.local_addr().expect("fake couch addr");
+        let base_db_url = format!("http://{}/test_db", addr);
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_thread = shutdown.clone();
+        let handle = std::thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("set fake couch nonblocking");
+            loop {
+                if shutdown_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => handle_fake_couch_conn(stream, delete_status),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (base_db_url, handle, shutdown)
+    }
+
+    /// Serve one connection: read the request line and headers, then respond to
+    /// GET with a chunk document and to DELETE with the configured status.
+    fn handle_fake_couch_conn(mut stream: std::net::TcpStream, delete_status: u16) {
+        use std::io::{BufRead, BufReader, Write};
+
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).is_err() {
+            return;
+        }
+        // Drain the remainder of the request headers.
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                break;
+            }
+        }
+        let method = request_line
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let (status, body) = match method.as_str() {
+            "GET" => (
+                "HTTP/1.1 200 OK",
+                r#"{"_id":"chunk1","_rev":"1-abc","data":"hello","type":"leaf"}"#,
+            ),
+            "DELETE" if delete_status == 200 => ("HTTP/1.1 200 OK", r#"{"ok":true}"#),
+            "DELETE" => (
+                "HTTP/1.1 500 Internal Server Error",
+                r#"{"error":"simulated delete failure"}"#,
+            ),
+            _ => ("HTTP/1.1 404 Not Found", ""),
+        };
+        let response = format!(
+            "{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status,
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+
+    #[tokio::test]
+    async fn delete_chunks_surfaces_http_delete_failure() {
+        let (base_db_url, server, shutdown) = spawn_fake_couch(500);
+        let db = couchdb_at(&base_db_url);
+        let chunk_ids = vec!["chunk1".to_string()];
+        let result = db.delete_chunks(&chunk_ids).await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake couch server join");
+        assert!(
+            result.is_err(),
+            "failed chunk delete must be surfaced, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_chunks_successful_delete_returns_ok() {
+        let (base_db_url, server, shutdown) = spawn_fake_couch(200);
+        let db = couchdb_at(&base_db_url);
+        let chunk_ids = vec!["chunk1".to_string()];
+        let result = db.delete_chunks(&chunk_ids).await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake couch server join");
+        assert!(
+            result.is_ok(),
+            "successful chunk delete must return Ok, got: {:?}",
+            result
+        );
     }
 }
