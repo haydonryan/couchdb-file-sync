@@ -1638,4 +1638,55 @@ mod tests {
             "failed content fetch must not save any FileState"
         );
     }
+
+    #[tokio::test]
+    async fn download_remote_file_writes_empty_file_for_empty_content_doc() {
+        // Guard for #2898: a document with no children is legitimate empty
+        // content, not a fetch failure. It must keep writing an empty local
+        // file and saving synced state (behavior preserved from before the
+        // error-propagation fix).
+        let root = test_root("/tmp/cfs-download-empty-content");
+
+        let remote_path = "prefix/empty.txt";
+        let mut remote_doc = FileDoc::new(remote_path.to_string(), String::new(), 0);
+        remote_doc.rev = Some("1-empty".to_string());
+        remote_doc.path = remote_path.to_string();
+
+        let canned = CannedCouch {
+            changes: Vec::new(),
+            last_seq: "1".to_string(),
+            metadata: std::collections::HashMap::from([(remote_path.to_string(), remote_doc)]),
+            // No content entry: get_file_content returns Ok(empty), matching
+            // the real path for a childless document.
+            contents: std::collections::HashMap::new(),
+            content_errors: std::collections::HashSet::new(),
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let bytes = engine
+            .download_remote_file(remote_path, "empty.txt", true)
+            .await
+            .expect("empty-content download should succeed")
+            .expect("empty-content download should write a file");
+
+        assert_eq!(bytes, 0, "empty-content download should write 0 bytes");
+        assert_eq!(
+            std::fs::read(root.as_path().join("empty.txt")).unwrap(),
+            b"",
+            "empty-content document must still produce an empty local file"
+        );
+        let stored = engine
+            .get_file_state("empty.txt")
+            .unwrap()
+            .expect("empty-content download should save FileState");
+        assert_eq!(
+            stored.size, 0,
+            "empty-content FileState should record size 0"
+        );
+    }
 }
