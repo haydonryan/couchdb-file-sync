@@ -677,9 +677,16 @@ impl SyncEngine {
         // Strip leading / to prevent absolute path issues
         let relative_path = path.trim_start_matches('/');
         let file_path = self.root_dir.as_path().join(relative_path);
-        let hash = compute_file_hash(&file_path).map_err(|e| {
-            anyhow::anyhow!("Failed to compute hash for {}: {}", file_path.display(), e)
-        })?;
+
+        // Hashing is a blocking open+read+SHA-256 of the full file, so run it on
+        // tokio's blocking thread pool instead of stalling the async executor.
+        let hash_path = file_path.clone();
+        let hash = tokio::task::spawn_blocking(move || compute_file_hash(&hash_path))
+            .await
+            .map_err(|e| anyhow::anyhow!("Hash task panicked for {}: {}", file_path.display(), e))?
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to compute hash for {}: {}", file_path.display(), e)
+            })?;
         let metadata = tokio::fs::metadata(&file_path).await.map_err(|e| {
             anyhow::anyhow!("Failed to read metadata for {}: {}", file_path.display(), e)
         })?;
@@ -1133,6 +1140,36 @@ mod tests {
         // remote_to_local_path should strip the prefix
         let local = engine.remote_to_local_path("test-prefix/doc.txt");
         assert_eq!(local, "doc.txt");
+    }
+
+    #[tokio::test]
+    async fn get_local_state_returns_byte_identical_hash_after_blocking_compute() {
+        let root = test_root("/tmp/cfs-gls-hash");
+        std::fs::write(root.as_path().join("data.bin"), b"regression content").unwrap();
+
+        let engine = SyncEngine::new(test_couchdb(), test_local_db(), root.clone());
+
+        let state = engine
+            .get_local_state("data.bin")
+            .await
+            .expect("get_local_state should compute local state");
+
+        // The hash must be byte-identical to a direct blocking hash of the same
+        // file: moving the hash computation off the async executor via
+        // spawn_blocking must not change the returned FileState.
+        let expected_hash =
+            compute_file_hash(&root.as_path().join("data.bin")).expect("direct compute_file_hash");
+        assert_eq!(
+            state.hash, expected_hash,
+            "local state hash must be byte-identical to a direct file hash"
+        );
+        assert_eq!(
+            state.hash,
+            compute_bytes_hash(b"regression content"),
+            "hash must match the file bytes"
+        );
+        assert_eq!(state.size, b"regression content".len() as u64);
+        assert_eq!(state.path, "data.bin");
     }
 
     // ── Dry-run sync cycle ─────────────────────────────────────────────
