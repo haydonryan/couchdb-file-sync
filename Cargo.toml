@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.53", features = ["full"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal"] }
 tokio-util = "0.7"
 
 # CouchDB client
