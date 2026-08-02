@@ -83,11 +83,28 @@ impl Scanner {
     /// Scan a single file
     pub fn scan_file(&self, path: &Path) -> Result<FileState> {
         let metadata = std::fs::metadata(path)?;
-        let relative_path = path.strip_prefix(self.root_dir.as_path())?.to_path_buf();
+
+        // SyncDirPath::new() canonicalizes the scan root at construction. On
+        // macOS, temp/sync roots under /var/folders are symlinks to their real
+        // location under /private/var/folders, so a caller may hand scan_file a
+        // lexical path whose textual prefix does not match the canonical root,
+        // and a naive strip_prefix would fail with StripPrefixError ("prefix
+        // not found"). Resolve the scanned path before the comparison so the
+        // residual-path derivation is robust to symlinked roots. If the path is
+        // itself a symlink pointing outside the root (or cannot be resolved),
+        // fall back to the lexical path so existing behavior is preserved.
+        let resolved_path = match path.canonicalize() {
+            Ok(canonical) if canonical.starts_with(self.root_dir.as_path()) => canonical,
+            _ => path.to_path_buf(),
+        };
+        let relative_path = resolved_path
+            .strip_prefix(self.root_dir.as_path())?
+            .to_path_buf();
         let path_str = relative_path.to_string_lossy().to_string();
 
-        // Compute hash
-        let hash = compute_file_hash(path)?;
+        // Compute hash / mtime from the same resolved path as the relative-path
+        // derivation so hashing and residual derivation stay consistent.
+        let hash = compute_file_hash(&resolved_path)?;
 
         // Get modification time
         let modified_at = metadata.modified()?.into();
@@ -295,6 +312,41 @@ mod tests {
 
         assert_eq!(state.path, "sub/dir/data.txt");
         assert_eq!(state.size, 14);
+    }
+
+    // Regression for #2941: on macOS, tempdir paths under /var/folders are
+    // symlinked to their real location under /private/var/folders.
+    // SyncDirPath::new() canonicalizes the root (so the scanner root becomes
+    // /private/var/folders/...) while TempDir hands scan_file the lexical
+    // /var/folders/... path, making a naive path.strip_prefix(root) panic with
+    // StripPrefixError ("prefix not found"). Linux /tmp is not a symlink, which
+    // is why these tests only failed on macos-latest. This test mirrors the
+    // mismatch with an explicit Unix symlink: the scanner root is the canonical
+    // target path and the scanned file path goes through the symlink.
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_file_with_symlinked_temp_root() {
+        use std::os::unix::fs::symlink;
+
+        let base = TempDir::new().unwrap();
+        let link_parent = TempDir::new().unwrap();
+        let link = link_parent.path().join("linked_root");
+        symlink(base.path(), &link).unwrap();
+
+        let file_path = link.join("hello.txt");
+        std::fs::write(&file_path, b"Hello, world!").unwrap();
+
+        let scanner = Scanner::new(
+            SyncDirPath::new(base.path().to_path_buf()).unwrap(),
+            IgnoreMatcher::empty(),
+        );
+
+        let state = scanner.scan_file(&file_path).unwrap();
+
+        // The residual path still derives from the file under the (symlinked)
+        // root, and existing FileState.path contents are unchanged.
+        assert_eq!(state.path, "hello.txt");
+        assert_eq!(state.size, 13);
     }
 
     #[test]
