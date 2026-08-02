@@ -9,13 +9,22 @@ use tracing::info;
 /// Local SQLite database for state tracking
 pub struct LocalDb {
     conn: Connection,
+    /// Number of `save_file_state` writes issued (test-only; counts every
+    /// INSERT OR REPLACE, including content-identical rewrites). Lets engine
+    /// tests assert that no-op syncs skip redundant state rewrites.
+    #[cfg(test)]
+    save_file_state_calls: std::cell::Cell<u64>,
 }
 
 impl LocalDb {
     /// Open or create the local database
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let conn = Connection::open(path)?;
-        let db = Self { conn };
+        let db = Self {
+            conn,
+            #[cfg(test)]
+            save_file_state_calls: std::cell::Cell::new(0),
+        };
         db.init_schema()?;
         info!("Local database initialized");
         Ok(db)
@@ -24,7 +33,11 @@ impl LocalDb {
     /// Create an in-memory database (for testing)
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let db = Self { conn };
+        let db = Self {
+            conn,
+            #[cfg(test)]
+            save_file_state_calls: std::cell::Cell::new(0),
+        };
         db.init_schema()?;
         Ok(db)
     }
@@ -113,6 +126,10 @@ impl LocalDb {
 
     /// Save or update file state
     pub fn save_file_state(&self, state: &FileState) -> Result<()> {
+        #[cfg(test)]
+        self.save_file_state_calls
+            .set(self.save_file_state_calls.get() + 1);
+
         // Check if this is a new file
         let is_new = self.get_file_state(&state.path)?.is_none();
 
@@ -138,6 +155,13 @@ impl LocalDb {
         }
 
         Ok(())
+    }
+
+    /// Number of `save_file_state` writes issued since this database was
+    /// created (test-only).
+    #[cfg(test)]
+    pub fn save_file_state_calls(&self) -> u64 {
+        self.save_file_state_calls.get()
     }
 
     /// Delete file state

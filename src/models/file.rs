@@ -204,7 +204,7 @@ impl TypedCouchDocument for FileDoc {
 }
 
 /// Local file state for tracking
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileState {
     pub path: String,
     pub hash: String,
