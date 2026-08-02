@@ -2029,7 +2029,11 @@ mod tests {
         // skipped because scan_local_changes overwrote the stored last_sync_at
         // with the scan time, making any remote change between two syncs look
         // stale (remote mtime < advanced last_sync_at) and never get applied.
-        let root = test_root("/tmp/cfs-remote-delete-between-syncs");
+        // Use a unique per-run temp dir so concurrent test processes never
+        // race on a shared state DB; TempDir removes the dir (state DB
+        // included) when the test ends.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
         std::fs::write(root.as_path().join("a.txt"), "hello\n").unwrap();
         let state_db = root.as_path().join("state.db");
 
