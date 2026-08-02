@@ -54,6 +54,38 @@ jobs:
       - name: No-default features
         run: cargo test --workspace --no-default-features
 
+  # Live-CouchDB integration tests (tests/dry_run.rs, tests/remote_move.rs).
+  # These are #[ignore]d by default because they need a running CouchDB, so
+  # they run in their own Ubuntu-only job that provisions one as a service
+  # container. Service containers are not supported on GitHub-hosted macOS
+  # runners, so this cannot live inside the matrix `test` job.
+  integration-test:
+    name: Integration tests (CouchDB)
+    runs-on: ubuntu-latest
+    services:
+      couchdb:
+        image: couchdb
+        env:
+          COUCHDB_USER: admin
+          COUCHDB_PASSWORD: password
+        ports:
+          - 5984:5984
+        options: >-
+          --health-cmd "curl -fsS http://localhost:5984/_up || exit 1"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 30
+          --health-start-period 10s
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run ignored CouchDB integration tests
+        # The two integration tests default to http://localhost:5984 with
+        # admin/password, matching the service container (and docker-compose.yml).
+        run: cargo test --workspace --test dry_run --test remote_move -- --include-ignored
+
   coverage:
     name: Coverage (Tarpaulin)
     runs-on: ubuntu-latest
