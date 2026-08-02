@@ -86,6 +86,14 @@ impl AsyncLocalDb {
         self.run(move |db| db.save_file_state(&state)).await
     }
 
+    /// Number of `save_file_state` writes issued so far (test-only).
+    #[cfg(test)]
+    async fn save_file_state_calls(&self) -> u64 {
+        self.run(|db| Ok(db.save_file_state_calls()))
+            .await
+            .expect("LocalDb save_file_state_calls must not fail")
+    }
+
     async fn delete_file_state(&self, path: &str) -> Result<()> {
         let path = path.to_string();
         self.run(move |db| db.delete_file_state(&path)).await
@@ -482,7 +490,16 @@ impl SyncEngine {
                         couch_rev,
                         last_sync_at,
                     };
-                    self.local_db.save_file_state(&preserved_state).await?;
+                    // Skip the redundant SQLite write entirely when the
+                    // preserved state (path, hash, size, modified_at,
+                    // couch_rev, last_sync_at) is byte-identical to the stored
+                    // row, so a no-op sync issues zero file-state writes
+                    // instead of rewriting every unchanged file via
+                    // INSERT OR REPLACE each cycle.
+                    let identical_to_stored = stored.is_some_and(|s| (**s) == preserved_state);
+                    if !identical_to_stored {
+                        self.local_db.save_file_state(&preserved_state).await?;
+                    }
                 }
             }
         }
@@ -1578,6 +1595,78 @@ mod tests {
             0,
             "dry run must not write to CouchDB"
         );
+    }
+
+    // ── No-op sync skips identical state rewrites (#2946) ─────────────────
+
+    #[tokio::test]
+    async fn unchanged_tree_second_sync_skips_identical_file_state_rewrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
+        let file_path = root.as_path().join("keep.txt");
+        std::fs::write(&file_path, "unchanged content").unwrap();
+
+        // Seed a fully-tracked, unchanged file: hash/size/mtime match the
+        // on-disk scan, with a couch_rev and an old last_sync_at to preserve.
+        let local = test_local_db();
+        let hash = compute_file_hash(&file_path).unwrap();
+        let meta = std::fs::metadata(&file_path).unwrap();
+        let mut stored = FileState::new(
+            "keep.txt".to_string(),
+            hash.clone(),
+            meta.len(),
+            meta.modified().unwrap().into(),
+        );
+        stored.couch_rev = Some(CouchRev::new("1-abc").unwrap());
+        stored.last_sync_at = Utc::now() - Duration::days(1);
+        local.save_file_state(&stored).unwrap();
+        local.save_checkpoint("100-before").unwrap();
+
+        let canned = CannedCouch {
+            changes: Vec::new(),
+            last_seq: "200-after".to_string(),
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        // First full sync: tracked-and-unchanged, so the preservation loop
+        // writes the file state once.
+        let report = engine.sync().await.expect("first sync");
+        assert_eq!(report.uploaded.0, 0);
+        assert_eq!(report.downloaded.0, 0);
+        assert_eq!(report.conflicts, 0);
+        let writes_after_first = engine.local_db.save_file_state_calls().await;
+        assert!(
+            writes_after_first >= 1,
+            "first sync must preserve the unchanged file state"
+        );
+
+        // Second full sync over the exact same unchanged tree must not
+        // rewrite the identical file_states row.
+        let report2 = engine.sync().await.expect("second sync");
+        assert_eq!(report2.uploaded.0, 0);
+        assert_eq!(report2.downloaded.0, 0);
+        assert_eq!(report2.conflicts, 0);
+        let writes_after_second = engine.local_db.save_file_state_calls().await;
+        assert_eq!(
+            writes_after_second, writes_after_first,
+            "a second sync of an unchanged tree must not rewrite identical file_states rows"
+        );
+
+        // Observables unchanged: couch_rev, last_sync_at, and hash are all
+        // preserved across the repeated syncs.
+        let final_state = engine.get_file_state("keep.txt").await.unwrap().unwrap();
+        assert_eq!(
+            final_state.couch_rev.map(|r| r.to_string()),
+            Some("1-abc".to_string())
+        );
+        assert_eq!(final_state.last_sync_at, stored.last_sync_at);
+        assert_eq!(final_state.hash, hash);
     }
 
     // ── Hash in-memory buffer vs. re-read from disk (#2904) ────────────────
