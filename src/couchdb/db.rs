@@ -1169,7 +1169,15 @@ mod tests {
                     break;
                 }
                 match listener.accept() {
-                    Ok((stream, _)) => handle_fake_couch_conn(stream, delete_status),
+                    Ok((stream, _)) => {
+                        // Serve each connection on its own thread so the accept
+                        // loop is never blocked by a long-lived keep-alive
+                        // connection. Otherwise a second connection that the
+                        // client opens because the first is occupied sits
+                        // unaccepted, and the race on macOS can surface as
+                        // ECONNRESET.
+                        std::thread::spawn(move || handle_fake_couch_conn(stream, delete_status));
+                    }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(std::time::Duration::from_millis(2));
                     }
@@ -1225,7 +1233,7 @@ mod tests {
                 _ => ("HTTP/1.1 404 Not Found", ""),
             };
             let response = format!(
-                "{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "{}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
                 status,
                 body.len(),
                 body
