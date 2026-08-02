@@ -1180,48 +1180,61 @@ mod tests {
         (base_db_url, handle, shutdown)
     }
 
-    /// Serve one connection: read the request line and headers, then respond to
-    /// GET with a chunk document and to DELETE with the configured status.
+    /// Serve one connection: read the request line and headers for each
+    /// request, responding to GET with a chunk document and to DELETE with the
+    /// configured status, until the client closes the connection. Serving
+    /// multiple requests per accepted connection keeps the fake tolerant of
+    /// reqwest connection reuse.
     fn handle_fake_couch_conn(mut stream: std::net::TcpStream, delete_status: u16) {
         use std::io::{BufRead, BufReader, Write};
 
         let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-        let mut request_line = String::new();
-        if reader.read_line(&mut request_line).is_err() {
-            return;
-        }
-        // Drain the remainder of the request headers.
+        // Keep serving requests on this connection until the client closes it
+        // (EOF) or the connection errors. reqwest may reuse a pooled
+        // connection, delivering GET and DELETE on the same TCP stream, so
+        // serving a single request and dropping the socket would reset the
+        // connection mid-test.
         loop {
-            let mut line = String::new();
-            if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
-                break;
+            let mut request_line = String::new();
+            match reader.read_line(&mut request_line) {
+                Ok(0) | Err(_) => return, // client closed the connection
+                Ok(_) => {}
             }
+            // Drain the remainder of the request headers.
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                    break;
+                }
+            }
+            let method = request_line
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let (status, body) = match method.as_str() {
+                "GET" => (
+                    "HTTP/1.1 200 OK",
+                    r#"{"_id":"chunk1","_rev":"1-abc","data":"hello","type":"leaf"}"#,
+                ),
+                "DELETE" if delete_status == 200 => ("HTTP/1.1 200 OK", r#"{"ok":true}"#),
+                "DELETE" => (
+                    "HTTP/1.1 500 Internal Server Error",
+                    r#"{"error":"simulated delete failure"}"#,
+                ),
+                _ => ("HTTP/1.1 404 Not Found", ""),
+            };
+            let response = format!(
+                "{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status,
+                body.len(),
+                body
+            );
+            if stream.write_all(response.as_bytes()).is_err() {
+                return;
+            }
+            let _ = stream.flush();
         }
-        let method = request_line
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_string();
-        let (status, body) = match method.as_str() {
-            "GET" => (
-                "HTTP/1.1 200 OK",
-                r#"{"_id":"chunk1","_rev":"1-abc","data":"hello","type":"leaf"}"#,
-            ),
-            "DELETE" if delete_status == 200 => ("HTTP/1.1 200 OK", r#"{"ok":true}"#),
-            "DELETE" => (
-                "HTTP/1.1 500 Internal Server Error",
-                r#"{"error":"simulated delete failure"}"#,
-            ),
-            _ => ("HTTP/1.1 404 Not Found", ""),
-        };
-        let response = format!(
-            "{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            status,
-            body.len(),
-            body
-        );
-        let _ = stream.write_all(response.as_bytes());
-        let _ = stream.flush();
     }
 
     #[tokio::test]
@@ -1252,5 +1265,89 @@ mod tests {
             "successful chunk delete must return Ok, got: {:?}",
             result
         );
+    }
+
+    /// Regression test for the macOS-CI flake: a reqwest client may reuse a
+    /// pooled TCP connection and deliver GET then DELETE on the same stream.
+    /// The fake server must keep serving requests on that connection instead of
+    /// resetting the socket after the first response.
+    #[tokio::test]
+    async fn fake_couch_serves_get_then_delete_on_one_connection() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpStream;
+
+        let (base_db_url, server, shutdown) = spawn_fake_couch(200);
+        let addr = base_db_url
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .expect("fake couch host:port");
+
+        let stream = TcpStream::connect(addr).expect("connect to fake couch");
+        let read_stream = stream.try_clone().expect("clone fake couch stream");
+        let mut writer = stream;
+        let mut reader = BufReader::new(read_stream);
+
+        let requests = [
+            (
+                "GET /test_db/chunk1 HTTP/1.1\r\nHost: fake\r\n\r\n",
+                "HTTP/1.1 200 OK",
+                "\"data\":\"hello\"",
+            ),
+            (
+                "DELETE /test_db/chunk1?rev=1-abc HTTP/1.1\r\nHost: fake\r\n\r\n",
+                "HTTP/1.1 200 OK",
+                r#"{"ok":true}"#,
+            ),
+        ];
+
+        for (request, expected_status, expected_body) in requests {
+            writer
+                .write_all(request.as_bytes())
+                .expect("write request to fake couch");
+
+            let mut status_line = String::new();
+            reader
+                .read_line(&mut status_line)
+                .expect("read status line from fake couch");
+            assert!(
+                status_line.starts_with(expected_status),
+                "unexpected status line on shared connection: {}",
+                status_line
+            );
+
+            let mut content_length = 0usize;
+            loop {
+                let mut header = String::new();
+                let n = reader
+                    .read_line(&mut header)
+                    .expect("read header line from fake couch");
+                assert!(n > 0, "unexpected EOF while reading headers");
+                let trimmed = header.trim();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some(rest) = trimmed.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = rest.trim().parse().expect("parse content-length");
+                }
+            }
+
+            let mut body = vec![0u8; content_length];
+            reader.read_exact(&mut body).expect("read response body");
+            let body_text = String::from_utf8_lossy(&body);
+            assert!(
+                body_text.contains(expected_body),
+                "response body did not contain {:?}: {}",
+                expected_body,
+                body_text
+            );
+        }
+
+        // Close the client side of the shared connection so the fake server's
+        // keep-serving loop returns to the accept loop before we join.
+        drop(reader);
+        drop(writer);
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake couch server join");
     }
 }
