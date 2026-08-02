@@ -464,17 +464,23 @@ impl SyncEngine {
                 // Check if this file is in the changes list
                 let is_changed = changes.iter().any(|c| c.path() == state.path);
                 if !is_changed {
-                    // File unchanged - preserve the couch_rev from stored state
-                    let couch_rev = stored_map
-                        .get(&state.path)
-                        .and_then(|s| s.couch_rev.clone());
+                    // File unchanged - preserve the couch_rev and last_sync_at
+                    // from the stored state. The freshly-scanned state's
+                    // `last_sync_at` is set to the scan time by the scanner and
+                    // must not clobber the real last-sync timestamp: doing so
+                    // makes any remote change that arrived since the previous
+                    // sync look stale (remote mtime < last_sync_at) and it would
+                    // never be applied locally.
+                    let stored = stored_map.get(&state.path);
+                    let couch_rev = stored.and_then(|s| s.couch_rev.clone());
+                    let last_sync_at = stored.map(|s| s.last_sync_at).unwrap_or(state.last_sync_at);
                     let preserved_state = FileState {
                         path: state.path.clone(),
                         hash: state.hash.clone(),
                         size: state.size,
                         modified_at: state.modified_at,
                         couch_rev,
-                        last_sync_at: state.last_sync_at,
+                        last_sync_at,
                     };
                     self.local_db.save_file_state(&preserved_state).await?;
                 }
@@ -2013,5 +2019,60 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn remote_delete_between_syncs_is_applied_locally() {
+        // Regression for the ignored live-CouchDB integration test
+        // remote_move_deletes_old_local_path: a remote delete that arrives
+        // after the previous sync must remove the local file. This used to be
+        // skipped because scan_local_changes overwrote the stored last_sync_at
+        // with the scan time, making any remote change between two syncs look
+        // stale (remote mtime < advanced last_sync_at) and never get applied.
+        let root = test_root("/tmp/cfs-remote-delete-between-syncs");
+        std::fs::write(root.as_path().join("a.txt"), "hello\n").unwrap();
+        let state_db = root.as_path().join("state.db");
+
+        // Sync 1 uploads a.txt to an empty remote and records last_sync_at.
+        let mut engine1 = SyncEngine::new(
+            test_canned_couch("prefix/", CannedCouch::default()),
+            LocalDb::open(&state_db).unwrap(),
+            root.clone(),
+        );
+        engine1.sync().await.unwrap();
+        let last_sync = engine1
+            .get_file_state("a.txt")
+            .await
+            .unwrap()
+            .expect("a.txt state after first sync")
+            .last_sync_at;
+        assert!(root.as_path().join("a.txt").exists());
+
+        // The remote delete lands just after the first sync (newer than our
+        // last sync) but before this second sync runs.
+        let remote_delete = Change::remote_deleted(
+            "prefix/a.txt".to_string(),
+            Some(last_sync + Duration::microseconds(1)),
+        );
+        let canned = CannedCouch {
+            changes: vec![remote_delete],
+            last_seq: "2".to_string(),
+            ..CannedCouch::default()
+        };
+        let mut engine2 = SyncEngine::new(
+            test_canned_couch("prefix/", canned),
+            LocalDb::open(&state_db).unwrap(),
+            root.clone(),
+        );
+        let report = engine2.sync().await.unwrap();
+
+        assert_eq!(
+            report.deleted_local, 1,
+            "a remote delete newer than the last sync must remove the local file"
+        );
+        assert!(
+            !root.as_path().join("a.txt").exists(),
+            "local a.txt must be removed after the remote delete"
+        );
     }
 }
