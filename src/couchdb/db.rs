@@ -1147,11 +1147,13 @@ mod tests {
 
     /// Spawn a minimal in-process fake CouchDB server that serves one chunk
     /// document on GET and answers DELETE with `delete_status`. Returns the
-    /// base database URL, the server handle, and a shutdown flag.
+    /// base database URL, a counter of accepted TCP connections, the server
+    /// handle, and a shutdown flag.
     fn spawn_fake_couch(
         delete_status: u16,
     ) -> (
         String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
         std::thread::JoinHandle<()>,
         std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {
@@ -1159,7 +1161,9 @@ mod tests {
         let addr = listener.local_addr().expect("fake couch addr");
         let base_db_url = format!("http://{}/test_db", addr);
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let conn_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let shutdown_thread = shutdown.clone();
+        let conn_count_thread = conn_count.clone();
         let handle = std::thread::spawn(move || {
             listener
                 .set_nonblocking(true)
@@ -1170,6 +1174,7 @@ mod tests {
                 }
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        conn_count_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         // Serve each connection on its own thread so the accept
                         // loop is never blocked by a long-lived keep-alive
                         // connection. Otherwise a second connection that the
@@ -1185,7 +1190,7 @@ mod tests {
                 }
             }
         });
-        (base_db_url, handle, shutdown)
+        (base_db_url, conn_count, handle, shutdown)
     }
 
     /// Serve one connection: read the request line and headers for each
@@ -1247,7 +1252,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_chunks_surfaces_http_delete_failure() {
-        let (base_db_url, server, shutdown) = spawn_fake_couch(500);
+        let (base_db_url, _conn_count, server, shutdown) = spawn_fake_couch(500);
         let db = couchdb_at(&base_db_url);
         let chunk_ids = vec!["chunk1".to_string()];
         let result = db.delete_chunks(&chunk_ids).await;
@@ -1262,7 +1267,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_chunks_successful_delete_returns_ok() {
-        let (base_db_url, server, shutdown) = spawn_fake_couch(200);
+        let (base_db_url, _conn_count, server, shutdown) = spawn_fake_couch(200);
         let db = couchdb_at(&base_db_url);
         let chunk_ids = vec!["chunk1".to_string()];
         let result = db.delete_chunks(&chunk_ids).await;
@@ -1275,87 +1280,42 @@ mod tests {
         );
     }
 
-    /// Regression test for the macOS-CI flake: a reqwest client may reuse a
-    /// pooled TCP connection and deliver GET then DELETE on the same stream.
+    /// Regression test for the macOS-CI flake: a reqwest client reuses a
+    /// pooled TCP connection and delivers GET then DELETE on the same stream.
     /// The fake server must keep serving requests on that connection instead of
-    /// resetting the socket after the first response.
+    /// resetting the socket after the first response. Driven through the real
+    /// `delete_chunks` HTTP path and asserting that a single TCP connection
+    /// served both requests makes the test deterministic; hand-rolled raw
+    /// socket framing raced the server thread and flaked on macOS.
     #[tokio::test]
     async fn fake_couch_serves_get_then_delete_on_one_connection() {
-        use std::io::{BufRead, BufReader, Read, Write};
-        use std::net::TcpStream;
+        let (base_db_url, conn_count, server, shutdown) = spawn_fake_couch(200);
+        let db = couchdb_at(&base_db_url);
 
-        let (base_db_url, server, shutdown) = spawn_fake_couch(200);
-        let addr = base_db_url
-            .trim_start_matches("http://")
-            .split('/')
-            .next()
-            .expect("fake couch host:port");
+        // GET the chunk metadata, then DELETE it, and read the responses to
+        // completion so reqwest's pool can reuse the connection for the second
+        // request.
+        let result = db.delete_chunks(&["chunk1".to_string()]).await;
+        assert!(
+            result.is_ok(),
+            "GET then DELETE on one fake server must succeed, got: {:?}",
+            result
+        );
 
-        let stream = TcpStream::connect(addr).expect("connect to fake couch");
-        let read_stream = stream.try_clone().expect("clone fake couch stream");
-        let mut writer = stream;
-        let mut reader = BufReader::new(read_stream);
-
-        let requests = [
-            (
-                "GET /test_db/chunk1 HTTP/1.1\r\nHost: fake\r\n\r\n",
-                "HTTP/1.1 200 OK",
-                "\"data\":\"hello\"",
-            ),
-            (
-                "DELETE /test_db/chunk1?rev=1-abc HTTP/1.1\r\nHost: fake\r\n\r\n",
-                "HTTP/1.1 200 OK",
-                r#"{"ok":true}"#,
-            ),
-        ];
-
-        for (request, expected_status, expected_body) in requests {
-            writer
-                .write_all(request.as_bytes())
-                .expect("write request to fake couch");
-
-            let mut status_line = String::new();
-            reader
-                .read_line(&mut status_line)
-                .expect("read status line from fake couch");
-            assert!(
-                status_line.starts_with(expected_status),
-                "unexpected status line on shared connection: {}",
-                status_line
-            );
-
-            let mut content_length = 0usize;
-            loop {
-                let mut header = String::new();
-                let n = reader
-                    .read_line(&mut header)
-                    .expect("read header line from fake couch");
-                assert!(n > 0, "unexpected EOF while reading headers");
-                let trimmed = header.trim();
-                if trimmed.is_empty() {
-                    break;
-                }
-                if let Some(rest) = trimmed.to_ascii_lowercase().strip_prefix("content-length:") {
-                    content_length = rest.trim().parse().expect("parse content-length");
-                }
-            }
-
-            let mut body = vec![0u8; content_length];
-            reader.read_exact(&mut body).expect("read response body");
-            let body_text = String::from_utf8_lossy(&body);
-            assert!(
-                body_text.contains(expected_body),
-                "response body did not contain {:?}: {}",
-                expected_body,
-                body_text
-            );
-        }
-
-        // Close the client side of the shared connection so the fake server's
-        // keep-serving loop returns to the accept loop before we join.
-        drop(reader);
-        drop(writer);
+        // Drain the pooled connection so the connection thread can observe the
+        // client closing it before we tear the server down.
+        drop(db);
         shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
         server.join().expect("fake couch server join");
+
+        // Both requests must have been served on a single accepted connection,
+        // proving the fake server honours reqwest's connection reuse instead of
+        // resetting the socket mid-test.
+        assert_eq!(
+            conn_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "fake CouchDB served the GET and DELETE on {} connections instead of one",
+            conn_count.load(std::sync::atomic::Ordering::SeqCst)
+        );
     }
 }
