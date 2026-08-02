@@ -7,7 +7,7 @@ use crate::models::{
 use crate::sync::triage;
 use anyhow::Result;
 use chrono::Utc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
 
@@ -468,9 +468,13 @@ impl SyncEngine {
             let stored_map: HashMap<_, _> =
                 valid_stored_states.iter().map(|s| (&s.path, s)).collect();
 
+            // Prebuild a set of changed paths so per-file membership checks
+            // are O(1) instead of an O(M) scan over the changes list.
+            let changed_paths: HashSet<&str> = changes.iter().map(|c| c.path()).collect();
+
             for state in &current_states {
                 // Check if this file is in the changes list
-                let is_changed = changes.iter().any(|c| c.path() == state.path);
+                let is_changed = changed_paths.contains(state.path.as_str());
                 if !is_changed {
                     // File unchanged - preserve the couch_rev and last_sync_at
                     // from the stored state. The freshly-scanned state's
