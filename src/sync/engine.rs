@@ -1251,7 +1251,8 @@ mod tests {
 
     #[tokio::test]
     async fn get_local_state_returns_byte_identical_hash_after_blocking_compute() {
-        let root = test_root("/tmp/cfs-gls-hash");
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
         std::fs::write(root.as_path().join("data.bin"), b"regression content").unwrap();
 
         let engine = SyncEngine::new(test_couchdb(), test_local_db(), root.clone());
@@ -1297,7 +1298,8 @@ mod tests {
 
     #[tokio::test]
     async fn dry_run_counts_local_uploads_and_remotes_deletes_without_writing() {
-        let root = test_root("/tmp/cfs-dryrun-uploads");
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
         // New local file (would upload)
         std::fs::write(root.as_path().join("new.txt"), "hello new\n").unwrap();
         // A previously tracked file that no longer exists (would delete remote)
@@ -1355,7 +1357,8 @@ mod tests {
 
     #[tokio::test]
     async fn dry_run_counts_downloads_without_writing_files_or_state() {
-        let root = test_root("/tmp/cfs-dryrun-downloads");
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
         // Tracked local file, unchanged on disk.
         std::fs::write(root.as_path().join("foo.txt"), "foo-content").unwrap();
         let local = test_local_db();
@@ -1441,7 +1444,8 @@ mod tests {
 
     #[tokio::test]
     async fn dry_run_detects_conflicts_without_persisting_them() {
-        let root = test_root("/tmp/cfs-dryrun-conflict");
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
         // Local file changed since last sync.
         std::fs::write(root.as_path().join("both.txt"), "local-content").unwrap();
         let local = test_local_db();
@@ -1512,7 +1516,8 @@ mod tests {
 
     #[tokio::test]
     async fn dry_run_does_not_save_state_for_identical_content() {
-        let root = test_root("/tmp/cfs-dryrun-identical");
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
         // Local file has the same content as remote; only local tracking is stale.
         std::fs::write(root.as_path().join("same.txt"), "same-content").unwrap();
         let local = test_local_db();
@@ -1579,7 +1584,8 @@ mod tests {
 
     #[tokio::test]
     async fn bytes_hash_matches_file_hash_for_equivalent_content() {
-        let root = test_root("/tmp/cfs-bytes-vs-file-hash");
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
         let file_path = root.as_path().join("content.bin");
 
         // Representative content: empty, small text, binary, and content large
@@ -1604,7 +1610,8 @@ mod tests {
 
     #[tokio::test]
     async fn upload_saved_hash_matches_transferred_content_buffer() {
-        let root = test_root("/tmp/cfs-upload-hash-buffer");
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
         let content: Vec<u8> = b"upload content bytes".to_vec();
         std::fs::write(root.as_path().join("up.txt"), &content).unwrap();
 
@@ -1638,7 +1645,8 @@ mod tests {
 
     #[tokio::test]
     async fn download_saved_hash_matches_transferred_content_buffer() {
-        let root = test_root("/tmp/cfs-download-hash-buffer");
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
         let content: Vec<u8> = b"downloaded content bytes".to_vec();
         let remote_path = "prefix/dl.txt";
 
@@ -1688,7 +1696,8 @@ mod tests {
         // Regression for #2898: a failed content fetch must propagate as an
         // error instead of being swallowed into an empty-file write plus
         // synced state (which would silently truncate a valid local file).
-        let root = test_root("/tmp/cfs-download-fetch-error");
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
 
         // Scenario A: existing valid local file with tracked state. The failed
         // content fetch must surface as an error and leave file + state intact.
@@ -1796,7 +1805,8 @@ mod tests {
         // content, not a fetch failure. It must keep writing an empty local
         // file and saving synced state (behavior preserved from before the
         // error-propagation fix).
-        let root = test_root("/tmp/cfs-download-empty-content");
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
 
         let remote_path = "prefix/empty.txt";
         let mut remote_doc = FileDoc::new(remote_path.to_string(), String::new(), 0);
@@ -1965,7 +1975,8 @@ mod tests {
         // save_checkpoint, get_checkpoint, get_conflicts) end-to-end through a
         // SyncEngine: reads and writes go through spawn_blocking and must
         // return/update identical data.
-        let root = test_root("/tmp/cfs-engine-accessors");
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
         let local = test_local_db();
         local.save_checkpoint("42-seq").unwrap();
         let conflict = Conflict::new(
