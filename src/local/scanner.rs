@@ -84,22 +84,38 @@ impl Scanner {
     pub fn scan_file(&self, path: &Path) -> Result<FileState> {
         let metadata = std::fs::metadata(path)?;
 
-        // SyncDirPath::new() canonicalizes the scan root at construction. On
-        // macOS, temp/sync roots under /var/folders are symlinks to their real
-        // location under /private/var/folders, so a caller may hand scan_file a
-        // lexical path whose textual prefix does not match the canonical root,
-        // and a naive strip_prefix would fail with StripPrefixError ("prefix
-        // not found"). Resolve the scanned path before the comparison so the
-        // residual-path derivation is robust to symlinked roots. If the path is
-        // itself a symlink pointing outside the root (or cannot be resolved),
-        // fall back to the lexical path so existing behavior is preserved.
-        let resolved_path = match path.canonicalize() {
-            Ok(canonical) if canonical.starts_with(self.root_dir.as_path()) => canonical,
-            _ => path.to_path_buf(),
+        // Try the lexical root strip_prefix first. In production, scan_blocking
+        // walks the already-canonical SyncDirPath root, so this textual prefix
+        // comparison succeeds and we avoid the redundant path.canonicalize()
+        // realpath syscall on every scanned file. Only when the lexical
+        // strip_prefix fails (e.g. a caller hands scan_file a non-canonical
+        // path through a symlinked root, as in #2941) do we canonicalize and
+        // re-derive the residual path with the canonical-with-lexical fallback
+        // below.
+        let (resolved_path, relative_path) = match path.strip_prefix(self.root_dir.as_path()) {
+            Ok(rel) => (path.to_path_buf(), rel.to_path_buf()),
+            Err(_) => {
+                // SyncDirPath::new() canonicalizes the scan root at
+                // construction. On macOS, temp/sync roots under /var/folders
+                // are symlinks to their real location under /private/var/
+                // folders, so a caller may hand scan_file a lexical path whose
+                // textual prefix does not match the canonical root, and a
+                // naive strip_prefix would fail with StripPrefixError ("prefix
+                // not found"). Resolve the scanned path before the comparison
+                // so the residual-path derivation is robust to symlinked
+                // roots. If the path is itself a symlink pointing outside the
+                // root (or cannot be resolved), fall back to the lexical path
+                // so existing behavior is preserved.
+                let resolved = match path.canonicalize() {
+                    Ok(canonical) if canonical.starts_with(self.root_dir.as_path()) => canonical,
+                    _ => path.to_path_buf(),
+                };
+                let relative = resolved
+                    .strip_prefix(self.root_dir.as_path())?
+                    .to_path_buf();
+                (resolved, relative)
+            }
         };
-        let relative_path = resolved_path
-            .strip_prefix(self.root_dir.as_path())?
-            .to_path_buf();
         let path_str = relative_path.to_string_lossy().to_string();
 
         // Compute hash / mtime from the same resolved path as the relative-path
