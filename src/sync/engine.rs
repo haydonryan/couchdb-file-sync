@@ -532,13 +532,6 @@ impl SyncEngine {
     ) -> Result<(Vec<Change>, Vec<Change>, Vec<Conflict>)> {
         // Build a complete map of stored states (one I/O batch)
         let mut stored_states: HashMap<String, FileState> = HashMap::new();
-        // Collect all paths we need state for
-        let mut paths_to_lookup: Vec<&str> = Vec::new();
-        for lc in local_changes {
-            if !paths_to_lookup.contains(&lc.path()) {
-                paths_to_lookup.push(lc.path());
-            }
-        }
         // Actually load all stored states individually (keeps existing pattern)
         for lc in local_changes {
             if !stored_states.contains_key(lc.path()) {
