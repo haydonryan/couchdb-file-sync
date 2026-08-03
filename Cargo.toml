@@ -69,6 +69,7 @@ rand = "0.10.2"
 [dev-dependencies]
 tempfile = "3.27"
 tokio-test = "0.4"
+filetime = "0.2"
 
 [package.metadata.release]
 allow-branch = ["main", "master"]

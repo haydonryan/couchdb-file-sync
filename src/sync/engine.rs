@@ -748,7 +748,6 @@ impl SyncEngine {
     /// cleanups (removing polluted/ignored entries and re-saving unchanged
     /// states) are skipped so that nothing is written to the state DB.
     async fn scan_local_changes(&self, dry_run: bool) -> Result<Vec<Change>> {
-        let current_states = self.scanner.full_scan().await?;
         let stored_states = self.local_db.get_all_file_states().await?;
         let remote_prefix = self.couchdb.remote_prefix();
         let mut valid_stored_states = Vec::with_capacity(stored_states.len());
@@ -778,15 +777,21 @@ impl SyncEngine {
             }
         }
 
-        debug!("Scanned {} files on disk", current_states.len());
-        debug!(
-            "Found {} files in local database",
-            valid_stored_states.len()
-        );
-
-        let changes = self
+        // Scan the tree against the valid stored states so unchanged files
+        // (mtime AND size equal, not racily clean) reuse their stored hash
+        // instead of re-reading and re-hashing every file on every sync.
+        // Polluted/ignored states are excluded above, so their hashes are never
+        // reused.
+        let stored_states = Arc::new(valid_stored_states);
+        let current_states = self
             .scanner
-            .detect_changes(&current_states, &valid_stored_states);
+            .full_scan_with_stored(stored_states.clone())
+            .await?;
+
+        debug!("Scanned {} files on disk", current_states.len());
+        debug!("Found {} files in local database", stored_states.len());
+
+        let changes = self.scanner.detect_changes(&current_states, &stored_states);
 
         debug!("Detected {} changes from local scan", changes.len());
         for change in &changes {
@@ -802,8 +807,7 @@ impl SyncEngine {
         // Skipped entirely in dry-run mode so the state DB is left untouched.
         if !dry_run {
             // Build a map of stored states to preserve couch_rev
-            let stored_map: HashMap<_, _> =
-                valid_stored_states.iter().map(|s| (&s.path, s)).collect();
+            let stored_map: HashMap<_, _> = stored_states.iter().map(|s| (&s.path, s)).collect();
 
             // Prebuild a set of changed paths so per-file membership checks
             // are O(1) instead of an O(M) scan over the changes list.
@@ -1823,6 +1827,81 @@ mod tests {
 
         // Observables unchanged: couch_rev, last_sync_at, and hash are all
         // preserved across the repeated syncs.
+        let final_state = engine.get_file_state("keep.txt").await.unwrap().unwrap();
+        assert_eq!(
+            final_state.couch_rev.map(|r| r.to_string()),
+            Some("1-abc".to_string())
+        );
+        assert_eq!(final_state.last_sync_at, stored.last_sync_at);
+        assert_eq!(final_state.hash, hash);
+    }
+
+    // ── Unchanged-tree scan reuses stored hashes (#3005) ──────────────────
+
+    #[tokio::test]
+    async fn unchanged_tree_sync_reuses_stored_hashes_without_rehashing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
+        let file_path = root.as_path().join("keep.txt");
+        std::fs::write(&file_path, "stable content").unwrap();
+
+        // Make the file not racily clean so the mtime+size shortcut applies.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        filetime::set_file_mtime(&file_path, filetime::FileTime::from_system_time(old)).unwrap();
+
+        // Seed a fully-tracked, unchanged file whose stored mtime/size/hash all
+        // match the on-disk scan.
+        let local = test_local_db();
+        let hash = compute_file_hash(&file_path).unwrap();
+        let meta = std::fs::metadata(&file_path).unwrap();
+        let mut stored = FileState::new(
+            "keep.txt".to_string(),
+            hash.clone(),
+            meta.len(),
+            meta.modified().unwrap().into(),
+        );
+        stored.couch_rev = Some(CouchRev::new("1-abc").unwrap());
+        stored.last_sync_at = Utc::now() - Duration::days(1);
+        local.save_file_state(&stored).unwrap();
+        local.save_checkpoint("100-before").unwrap();
+
+        let canned = CannedCouch {
+            changes: Vec::new(),
+            last_seq: "200-after".to_string(),
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let report = engine.sync().await.expect("sync unchanged tree");
+        assert_eq!(report.uploaded.0, 0);
+        assert_eq!(report.downloaded.0, 0);
+        assert_eq!(report.conflicts, 0);
+
+        // Because the stored mtime AND size match and the file is not racily
+        // clean, the full scan reuses the stored hash: zero file re-reads.
+        assert_eq!(
+            engine.scanner.hash_computations(),
+            0,
+            "unchanged tree sync must not re-read/re-hash any file"
+        );
+
+        // A second sync over the exact same tree still does not re-hash.
+        let report2 = engine.sync().await.expect("second sync unchanged tree");
+        assert_eq!(report2.uploaded.0, 0);
+        assert_eq!(report2.downloaded.0, 0);
+        assert_eq!(report2.conflicts, 0);
+        assert_eq!(
+            engine.scanner.hash_computations(),
+            0,
+            "repeated sync of an unchanged tree must never re-hash"
+        );
+
+        // Observables unchanged: couch_rev, last_sync_at, and hash preserved.
         let final_state = engine.get_file_state("keep.txt").await.unwrap().unwrap();
         assert_eq!(
             final_state.couch_rev.map(|r| r.to_string()),
