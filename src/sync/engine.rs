@@ -11,9 +11,16 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
 
+/// Maximum number of per-file upload/download operations applied in parallel
+/// during the sync phase. Bounds in-flight HTTP + hash + DB work so a large
+/// change batch is processed concurrently without unbounded resource use.
+const APPLY_CONCURRENCY_LIMIT: usize = 8;
+
 /// The main sync engine
 pub struct SyncEngine {
-    couchdb: CouchDb,
+    /// Shared CouchDB client; all operations are `&self` so the same client is
+    /// used concurrently by the bounded batch apply loops.
+    couchdb: Arc<CouchDb>,
     local_db: AsyncLocalDb,
     scanner: Scanner,
     root_dir: SyncDirPath,
@@ -140,13 +147,389 @@ impl AsyncLocalDb {
     }
 }
 
+/// Owned handle to the per-file apply state used by the bounded-concurrency
+/// sync loops.
+///
+/// Cloning this handle is cheap (an `Arc` for the CouchDB client, the shared
+/// `AsyncLocalDb` handle, and a `PathBuf`), so each task in a sync batch can
+/// process its own file without borrowing `SyncEngine`.
+#[derive(Clone)]
+struct ApplyWorker {
+    couchdb: Arc<CouchDb>,
+    local_db: AsyncLocalDb,
+    root_dir: SyncDirPath,
+}
+
+impl ApplyWorker {
+    async fn upload_local_file(
+        &self,
+        local_path: &str,
+        remote_path: &str,
+    ) -> Result<(usize, Option<String>)> {
+        let relative_path = local_path.trim_start_matches('/');
+        let file_path = self.root_dir.as_path().join(relative_path);
+        let metadata = tokio::fs::metadata(&file_path).await?;
+        let mtime = metadata
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        debug!("[UPLOAD] File path: {:?}", file_path);
+        debug!("[UPLOAD] Size: {} bytes", metadata.len());
+        debug!("[UPLOAD] mtime: {} ms", mtime);
+
+        let content = tokio::fs::read(&file_path).await?;
+        debug!("[UPLOAD] Read {} bytes from disk", content.len());
+
+        let new_chunk_ids = self.couchdb.upload_file_content(&content).await?;
+        debug!(
+            "[UPLOAD] Uploaded content, got {} chunks",
+            new_chunk_ids.len()
+        );
+
+        let (existing_rev, existing_ctime, old_chunk_ids) =
+            match self.couchdb.get_file(remote_path).await? {
+                Some(existing) => {
+                    debug!("[UPLOAD] Existing doc found, rev: {:?}", existing.rev);
+                    debug!("[UPLOAD] Existing ctime: {} ms", existing.ctime.as_u64());
+                    debug!("[UPLOAD] Existing chunks: {}", existing.children.len());
+                    (existing.rev, existing.ctime.as_u64(), existing.children)
+                }
+                None => {
+                    debug!("[UPLOAD] No existing doc, creating new");
+                    (None, mtime, Vec::new())
+                }
+            };
+
+        let mut doc = crate::models::FileDoc {
+            id: remote_path.to_string(),
+            rev: existing_rev,
+            children: new_chunk_ids,
+            path: remote_path.to_string(),
+            ctime: crate::models::TimestampMillis::new(existing_ctime),
+            mtime: crate::models::TimestampMillis::new(mtime),
+            size: metadata.len(),
+            doc_type: crate::models::DocType::Plain,
+            deleted: false,
+        };
+
+        self.couchdb.save_file(&mut doc).await?;
+        debug!("[UPLOAD] Saved doc, new rev: {:?}", doc.rev);
+
+        if !old_chunk_ids.is_empty() {
+            debug!("[UPLOAD] Deleting {} old chunks", old_chunk_ids.len());
+            self.couchdb.delete_chunks(&old_chunk_ids).await?;
+        }
+
+        // Hash the in-memory content buffer we just uploaded instead of
+        // re-reading the file from disk. Since `content` is exactly the bytes
+        // pushed to CouchDB, hashing it keeps the saved FileState in agreement
+        // with the transferred bytes even under a mid-sync modification.
+        let hash = compute_bytes_hash(&content);
+        let state = FileState {
+            path: local_path.to_string(),
+            hash,
+            size: metadata.len(),
+            modified_at: metadata.modified()?.into(),
+            couch_rev: doc.rev.as_deref().and_then(CouchRev::new),
+            last_sync_at: Utc::now(),
+        };
+        self.local_db.save_file_state(&state).await?;
+        debug!("[UPLOAD] Updated local state with rev: {:?}", doc.rev);
+
+        Ok((content.len(), doc.rev))
+    }
+
+    async fn download_remote_file(
+        &self,
+        remote_path: &str,
+        local_path: &str,
+        require_doc: bool,
+    ) -> Result<Option<usize>> {
+        let doc = match self.couchdb.fetch_metadata(remote_path).await? {
+            Some(d) => d,
+            None => {
+                if require_doc {
+                    anyhow::bail!("Document not found in CouchDB: {}", remote_path);
+                }
+                warn!("Document not found in CouchDB: {}", remote_path);
+                return Ok(None);
+            }
+        };
+
+        let relative_path = local_path.trim_start_matches('/');
+        let file_path = self.root_dir.as_path().join(relative_path);
+        if let Some(parent) = file_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        debug!("[DOWNLOAD] Downloading {} chunks...", doc.children.len());
+        let content = match self.couchdb.get_file_content(remote_path).await {
+            Ok(data) => {
+                debug!("[DOWNLOAD] Downloaded {} bytes from chunks", data.len());
+                data
+            }
+            Err(e) => {
+                // A content-fetch failure is a real sync failure, not "no
+                // content": propagate it instead of swallowing it. Otherwise a
+                // transient network/auth/server error would silently truncate
+                // a valid local file to zero bytes and record it as synced.
+                anyhow::bail!("failed to fetch content for {}: {}", remote_path, e);
+            }
+        };
+
+        tokio::fs::write(&file_path, &content).await?;
+        debug!("[DOWNLOAD] Wrote {} bytes to disk", content.len());
+
+        // Hash the in-memory content buffer we just fetched and wrote instead
+        // of re-reading the file back from disk. This avoids a redundant disk
+        // read and keeps the saved hash equal to the bytes actually transferred.
+        let hash = compute_bytes_hash(&content);
+        let metadata = tokio::fs::metadata(&file_path).await?;
+        let state = FileState {
+            path: local_path.to_string(),
+            hash,
+            size: metadata.len(),
+            modified_at: metadata.modified()?.into(),
+            couch_rev: doc.rev.as_deref().and_then(CouchRev::new),
+            last_sync_at: Utc::now(),
+        };
+        self.local_db.save_file_state(&state).await?;
+
+        Ok(Some(content.len()))
+    }
+
+    /// Apply a change to CouchDB
+    async fn apply_to_couchdb(&self, change: &Change) -> Result<()> {
+        let remote_path = self.couchdb.get_remote_path(change.path());
+        debug!("[UPLOAD] Starting: {} -> {}", change.path(), remote_path);
+        debug!("[UPLOAD] Change type: {:?}", change.change_type());
+
+        match change.change_type() {
+            ChangeType::Created | ChangeType::Modified => {
+                let (bytes_uploaded, new_rev) =
+                    self.upload_local_file(change.path(), &remote_path).await?;
+                info!(
+                    "[UPLOAD] SUCCESS: {} -> {} ({} bytes, rev: {:?})",
+                    change.path(),
+                    remote_path,
+                    bytes_uploaded,
+                    new_rev
+                );
+            }
+            ChangeType::Deleted => {
+                debug!("[DELETE] Remote: {}", remote_path);
+                self.couchdb.delete_file(&remote_path).await?;
+                self.local_db.delete_file_state(change.path()).await?;
+                info!("[DELETE] SUCCESS: {} -> {}", change.path(), remote_path);
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a change to the local filesystem
+    async fn apply_to_filesystem(&self, change: &Change) -> Result<()> {
+        let remote_path = change.path();
+        let local_path = self.couchdb.get_local_path(remote_path);
+        let relative_path = local_path.trim_start_matches('/');
+        let file_path = self.root_dir.as_path().join(relative_path);
+
+        debug!("[DOWNLOAD] Remote is newer, downloading chunked file");
+        debug!("[DOWNLOAD] {} -> {}", remote_path, local_path);
+
+        match change.change_type() {
+            ChangeType::Created | ChangeType::Modified => {
+                if let Some(bytes) = self
+                    .download_remote_file(remote_path, &local_path, false)
+                    .await?
+                {
+                    info!(
+                        "[DOWNLOAD] Chunked file downloaded: {} ({} bytes)",
+                        local_path, bytes
+                    );
+                }
+            }
+            ChangeType::Deleted => {
+                debug!(
+                    "[LOCAL DELETE] Remote: {}, Local: {:?}",
+                    remote_path, file_path
+                );
+                if file_path.exists() {
+                    tokio::fs::remove_file(&file_path).await?;
+                }
+                self.local_db.delete_file_state(&local_path).await?;
+                info!("[LOCAL DELETE] SUCCESS: {} -> {}", remote_path, local_path);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Per-file result of one upload in a bounded batch, accumulated into the
+/// shared `SyncReport` exactly as the sequential loop did.
+struct UploadOutcome {
+    uploaded: usize,
+    deleted_remote: usize,
+    error: Option<String>,
+}
+
+/// Per-file result of one download in a bounded batch.
+struct DownloadOutcome {
+    downloaded: usize,
+    deleted_local: usize,
+    error: Option<String>,
+}
+
+/// Apply one queued upload, returning its report deltas and any per-file
+/// error. A fatal state-DB cleanup failure is propagated as `Err` so the sync
+/// aborts, matching the sequential loop's `?` on the same path.
+async fn apply_one_upload(
+    worker: ApplyWorker,
+    change: Change,
+    dry_run: bool,
+) -> Result<UploadOutcome> {
+    debug!(
+        "  Preparing to upload: {} -> {}",
+        change.path(),
+        worker.couchdb.get_remote_path(change.path())
+    );
+
+    let is_deleted = matches!(change.change_type(), ChangeType::Deleted);
+    let mut outcome = UploadOutcome {
+        uploaded: usize::from(!is_deleted),
+        deleted_remote: usize::from(is_deleted),
+        error: None,
+    };
+
+    if !dry_run {
+        if is_deleted {
+            match worker.apply_to_couchdb(&change).await {
+                Ok(_) => {
+                    // Preserve the original post-delete local state refresh.
+                    worker.local_db.delete_file_state(change.path()).await?;
+                }
+                Err(e) => {
+                    error!("Failed to upload {}: {}", change.path(), e);
+                    outcome.error = Some(format!("Upload {}: {}", change.path(), e));
+                }
+            }
+        } else if let Err(e) = worker.apply_to_couchdb(&change).await {
+            error!("Failed to upload {}: {}", change.path(), e);
+            outcome.error = Some(format!("Upload {}: {}", change.path(), e));
+        }
+    }
+
+    Ok(outcome)
+}
+
+/// Apply a batch of uploads with bounded concurrency, collecting every
+/// per-file error into `report` (none dropped).
+async fn apply_upload_batch(
+    worker: ApplyWorker,
+    changes: Vec<Change>,
+    dry_run: bool,
+    report: &mut SyncReport,
+) -> Result<()> {
+    let mut in_flight = tokio::task::JoinSet::new();
+    let mut pending = changes.into_iter();
+
+    // Seed the first `APPLY_CONCURRENCY_LIMIT` tasks so the number of
+    // in-flight file operations never exceeds the bound.
+    for _ in 0..APPLY_CONCURRENCY_LIMIT {
+        if let Some(change) = pending.next() {
+            let worker = worker.clone();
+            in_flight.spawn(async move { apply_one_upload(worker, change, dry_run).await });
+        }
+    }
+
+    while let Some(joined) = in_flight.join_next().await {
+        let outcome = joined.map_err(|e| anyhow::anyhow!("upload task panicked: {e}"))??;
+        report.uploaded.0 += outcome.uploaded;
+        report.deleted_remote += outcome.deleted_remote;
+        if let Some(error) = outcome.error {
+            report.errors.push(error);
+        }
+        // Fill the freed slot with the next pending upload.
+        if let Some(change) = pending.next() {
+            let worker = worker.clone();
+            in_flight.spawn(async move { apply_one_upload(worker, change, dry_run).await });
+        }
+    }
+
+    Ok(())
+}
+
+/// Apply one queued download, returning its report deltas and any per-file error.
+async fn apply_one_download(
+    worker: ApplyWorker,
+    change: Change,
+    dry_run: bool,
+) -> Result<DownloadOutcome> {
+    debug!(
+        "  Preparing to download: {} -> {}",
+        change.path(),
+        worker.couchdb.get_local_path(change.path())
+    );
+
+    let is_deleted = matches!(change.change_type(), ChangeType::Deleted);
+    let mut outcome = DownloadOutcome {
+        downloaded: usize::from(!is_deleted),
+        deleted_local: usize::from(is_deleted),
+        error: None,
+    };
+
+    if !dry_run {
+        if let Err(e) = worker.apply_to_filesystem(&change).await {
+            error!("Failed to download {}: {}", change.path(), e);
+            outcome.error = Some(format!("Download {}: {}", change.path(), e));
+        }
+    }
+
+    Ok(outcome)
+}
+
+/// Apply a batch of downloads with bounded concurrency, collecting every
+/// per-file error into `report` (none dropped).
+async fn apply_download_batch(
+    worker: ApplyWorker,
+    changes: Vec<Change>,
+    dry_run: bool,
+    report: &mut SyncReport,
+) -> Result<()> {
+    let mut in_flight = tokio::task::JoinSet::new();
+    let mut pending = changes.into_iter();
+
+    for _ in 0..APPLY_CONCURRENCY_LIMIT {
+        if let Some(change) = pending.next() {
+            let worker = worker.clone();
+            in_flight.spawn(async move { apply_one_download(worker, change, dry_run).await });
+        }
+    }
+
+    while let Some(joined) = in_flight.join_next().await {
+        let outcome = joined.map_err(|e| anyhow::anyhow!("download task panicked: {e}"))??;
+        report.downloaded.0 += outcome.downloaded;
+        report.deleted_local += outcome.deleted_local;
+        if let Some(error) = outcome.error {
+            report.errors.push(error);
+        }
+        if let Some(change) = pending.next() {
+            let worker = worker.clone();
+            in_flight.spawn(async move { apply_one_download(worker, change, dry_run).await });
+        }
+    }
+
+    Ok(())
+}
+
 impl SyncEngine {
     /// Create a new sync engine
     pub fn new(couchdb: CouchDb, local_db: LocalDb, root_dir: SyncDirPath) -> Self {
         let ignore_matcher = IgnoreMatcher::empty();
         let scanner = Scanner::new(root_dir.clone(), ignore_matcher.clone());
         Self {
-            couchdb,
+            couchdb: Arc::new(couchdb),
             local_db: AsyncLocalDb::new(local_db),
             scanner,
             root_dir,
@@ -163,11 +546,21 @@ impl SyncEngine {
     ) -> Self {
         let scanner = Scanner::new(root_dir.clone(), ignore_matcher.clone());
         Self {
-            couchdb,
+            couchdb: Arc::new(couchdb),
             local_db: AsyncLocalDb::new(local_db),
             scanner,
             root_dir,
             ignore_matcher,
+        }
+    }
+
+    /// Cheap handle to the per-file apply state used by the bounded-concurrency
+    /// sync loops (clones an `Arc`, a shared DB handle, and a `PathBuf`).
+    fn apply_worker(&self) -> ApplyWorker {
+        ApplyWorker {
+            couchdb: self.couchdb.clone(),
+            local_db: self.local_db.clone(),
+            root_dir: self.root_dir.clone(),
         }
     }
 
@@ -192,7 +585,7 @@ impl SyncEngine {
     /// When `dry_run` is true every write operation (CouchDB writes, local
     /// filesystem writes, and state-DB saves) is skipped while the read-only
     /// triage, conflict detection, and report generation still run.
-    async fn run_cycle(&mut self, dry_run: bool) -> Result<SyncReport> {
+    async fn run_cycle(&self, dry_run: bool) -> Result<SyncReport> {
         if dry_run {
             info!("========== DRY-RUN SYNC CYCLE STARTING ==========");
         } else {
@@ -239,87 +632,23 @@ impl SyncEngine {
             }
         }
 
-        // 5. Apply clean local changes to remote (skipped in dry-run)
+        // 5. Apply clean local changes to remote (skipped in dry-run).
+        //    Runs with bounded concurrency so a large batch of uploads does not
+        //    serialize every per-file network round trip.
         info!(
             "========== UPLOADING {} FILES ==========",
             local_to_upload.len()
         );
-        for change in local_to_upload {
-            debug!(
-                "  Preparing to upload: {} -> {}",
-                change.path(),
-                self.couchdb.get_remote_path(change.path())
-            );
+        apply_upload_batch(self.apply_worker(), local_to_upload, dry_run, &mut report).await?;
 
-            if matches!(change.change_type(), ChangeType::Deleted) {
-                report.deleted_remote += 1;
-                if !dry_run {
-                    match self.apply_to_couchdb(&change).await {
-                        Ok(_) => self.local_db.delete_file_state(change.path()).await?,
-                        Err(e) => {
-                            error!("Failed to upload {}: {}", change.path(), e);
-                            report
-                                .errors
-                                .push(format!("Upload {}: {}", change.path(), e));
-                        }
-                    }
-                }
-            } else {
-                report.uploaded.0 += 1;
-                if !dry_run {
-                    match self.apply_to_couchdb(&change).await {
-                        Ok(_) => {}
-                        Err(e) => {
-                            error!("Failed to upload {}: {}", change.path(), e);
-                            report
-                                .errors
-                                .push(format!("Upload {}: {}", change.path(), e));
-                        }
-                    }
-                }
-            }
-        }
-
-        // 6. Apply clean remote changes to local (skipped in dry-run)
+        // 6. Apply clean remote changes to local (skipped in dry-run).
+        //    Runs with bounded concurrency so a large batch of downloads does
+        //    not serialize every per-file network round trip.
         info!(
             "========== DOWNLOADING {} FILES ==========",
             remote_to_apply.len()
         );
-        for change in remote_to_apply {
-            debug!(
-                "  Preparing to download: {} -> {}",
-                change.path(),
-                self.couchdb.get_local_path(change.path())
-            );
-
-            if matches!(change.change_type(), ChangeType::Deleted) {
-                report.deleted_local += 1;
-                if !dry_run {
-                    match self.apply_to_filesystem(&change).await {
-                        Ok(_) => {}
-                        Err(e) => {
-                            error!("Failed to download {}: {}", change.path(), e);
-                            report
-                                .errors
-                                .push(format!("Download {}: {}", change.path(), e));
-                        }
-                    }
-                }
-            } else {
-                report.downloaded.0 += 1;
-                if !dry_run {
-                    match self.apply_to_filesystem(&change).await {
-                        Ok(_) => {}
-                        Err(e) => {
-                            error!("Failed to download {}: {}", change.path(), e);
-                            report
-                                .errors
-                                .push(format!("Download {}: {}", change.path(), e));
-                        }
-                    }
-                }
-            }
-        }
+        apply_download_batch(self.apply_worker(), remote_to_apply, dry_run, &mut report).await?;
 
         // 7. Update checkpoint (skipped in dry-run)
         if !dry_run {
@@ -818,208 +1147,37 @@ impl SyncEngine {
         ))
     }
 
+    /// Upload one local file to CouchDB (delegates to the shared apply worker).
     async fn upload_local_file(
-        &mut self,
+        &self,
         local_path: &str,
         remote_path: &str,
     ) -> Result<(usize, Option<String>)> {
-        let relative_path = local_path.trim_start_matches('/');
-        let file_path = self.root_dir.as_path().join(relative_path);
-        let metadata = tokio::fs::metadata(&file_path).await?;
-        let mtime = metadata
-            .modified()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        debug!("[UPLOAD] File path: {:?}", file_path);
-        debug!("[UPLOAD] Size: {} bytes", metadata.len());
-        debug!("[UPLOAD] mtime: {} ms", mtime);
-
-        let content = tokio::fs::read(&file_path).await?;
-        debug!("[UPLOAD] Read {} bytes from disk", content.len());
-
-        let new_chunk_ids = self.couchdb.upload_file_content(&content).await?;
-        debug!(
-            "[UPLOAD] Uploaded content, got {} chunks",
-            new_chunk_ids.len()
-        );
-
-        let (existing_rev, existing_ctime, old_chunk_ids) =
-            match self.couchdb.get_file(remote_path).await? {
-                Some(existing) => {
-                    debug!("[UPLOAD] Existing doc found, rev: {:?}", existing.rev);
-                    debug!("[UPLOAD] Existing ctime: {} ms", existing.ctime.as_u64());
-                    debug!("[UPLOAD] Existing chunks: {}", existing.children.len());
-                    (existing.rev, existing.ctime.as_u64(), existing.children)
-                }
-                None => {
-                    debug!("[UPLOAD] No existing doc, creating new");
-                    (None, mtime, Vec::new())
-                }
-            };
-
-        let mut doc = crate::models::FileDoc {
-            id: remote_path.to_string(),
-            rev: existing_rev,
-            children: new_chunk_ids,
-            path: remote_path.to_string(),
-            ctime: crate::models::TimestampMillis::new(existing_ctime),
-            mtime: crate::models::TimestampMillis::new(mtime),
-            size: metadata.len(),
-            doc_type: crate::models::DocType::Plain,
-            deleted: false,
-        };
-
-        self.couchdb.save_file(&mut doc).await?;
-        debug!("[UPLOAD] Saved doc, new rev: {:?}", doc.rev);
-
-        if !old_chunk_ids.is_empty() {
-            debug!("[UPLOAD] Deleting {} old chunks", old_chunk_ids.len());
-            self.couchdb.delete_chunks(&old_chunk_ids).await?;
-        }
-
-        // Hash the in-memory content buffer we just uploaded instead of
-        // re-reading the file from disk. Since `content` is exactly the bytes
-        // pushed to CouchDB, hashing it keeps the saved FileState in agreement
-        // with the transferred bytes even under a mid-sync modification.
-        let hash = compute_bytes_hash(&content);
-        let state = FileState {
-            path: local_path.to_string(),
-            hash,
-            size: metadata.len(),
-            modified_at: metadata.modified()?.into(),
-            couch_rev: doc.rev.as_deref().and_then(CouchRev::new),
-            last_sync_at: Utc::now(),
-        };
-        self.local_db.save_file_state(&state).await?;
-        debug!("[UPLOAD] Updated local state with rev: {:?}", doc.rev);
-
-        Ok((content.len(), doc.rev))
+        self.apply_worker()
+            .upload_local_file(local_path, remote_path)
+            .await
     }
 
+    /// Download one remote file to the local filesystem (delegates to the shared apply worker).
     async fn download_remote_file(
-        &mut self,
+        &self,
         remote_path: &str,
         local_path: &str,
         require_doc: bool,
     ) -> Result<Option<usize>> {
-        let doc = match self.couchdb.fetch_metadata(remote_path).await? {
-            Some(d) => d,
-            None => {
-                if require_doc {
-                    anyhow::bail!("Document not found in CouchDB: {}", remote_path);
-                }
-                warn!("Document not found in CouchDB: {}", remote_path);
-                return Ok(None);
-            }
-        };
-
-        let relative_path = local_path.trim_start_matches('/');
-        let file_path = self.root_dir.as_path().join(relative_path);
-        if let Some(parent) = file_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        debug!("[DOWNLOAD] Downloading {} chunks...", doc.children.len());
-        let content = match self.couchdb.get_file_content(remote_path).await {
-            Ok(data) => {
-                debug!("[DOWNLOAD] Downloaded {} bytes from chunks", data.len());
-                data
-            }
-            Err(e) => {
-                // A content-fetch failure is a real sync failure, not "no
-                // content": propagate it instead of swallowing it. Otherwise a
-                // transient network/auth/server error would silently truncate
-                // a valid local file to zero bytes and record it as synced.
-                anyhow::bail!("failed to fetch content for {}: {}", remote_path, e);
-            }
-        };
-
-        tokio::fs::write(&file_path, &content).await?;
-        debug!("[DOWNLOAD] Wrote {} bytes to disk", content.len());
-
-        // Hash the in-memory content buffer we just fetched and wrote instead
-        // of re-reading the file back from disk. This avoids a redundant disk
-        // read and keeps the saved hash equal to the bytes actually transferred.
-        let hash = compute_bytes_hash(&content);
-        let metadata = tokio::fs::metadata(&file_path).await?;
-        let state = FileState {
-            path: local_path.to_string(),
-            hash,
-            size: metadata.len(),
-            modified_at: metadata.modified()?.into(),
-            couch_rev: doc.rev.as_deref().and_then(CouchRev::new),
-            last_sync_at: Utc::now(),
-        };
-        self.local_db.save_file_state(&state).await?;
-
-        Ok(Some(content.len()))
+        self.apply_worker()
+            .download_remote_file(remote_path, local_path, require_doc)
+            .await
     }
 
-    /// Apply a change to CouchDB
-    async fn apply_to_couchdb(&mut self, change: &Change) -> Result<()> {
-        let remote_path = self.couchdb.get_remote_path(change.path());
-        debug!("[UPLOAD] Starting: {} -> {}", change.path(), remote_path);
-        debug!("[UPLOAD] Change type: {:?}", change.change_type());
-
-        match change.change_type() {
-            ChangeType::Created | ChangeType::Modified => {
-                let (bytes_uploaded, new_rev) =
-                    self.upload_local_file(change.path(), &remote_path).await?;
-                info!(
-                    "[UPLOAD] SUCCESS: {} -> {} ({} bytes, rev: {:?})",
-                    change.path(),
-                    remote_path,
-                    bytes_uploaded,
-                    new_rev
-                );
-            }
-            ChangeType::Deleted => {
-                debug!("[DELETE] Remote: {}", remote_path);
-                self.couchdb.delete_file(&remote_path).await?;
-                self.local_db.delete_file_state(change.path()).await?;
-                info!("[DELETE] SUCCESS: {} -> {}", change.path(), remote_path);
-            }
-        }
-        Ok(())
+    /// Apply a change to CouchDB (delegates to the shared apply worker).
+    async fn apply_to_couchdb(&self, change: &Change) -> Result<()> {
+        self.apply_worker().apply_to_couchdb(change).await
     }
 
-    /// Apply a change to the local filesystem
-    async fn apply_to_filesystem(&mut self, change: &Change) -> Result<()> {
-        let remote_path = change.path();
-        let local_path = self.couchdb.get_local_path(remote_path);
-        let relative_path = local_path.trim_start_matches('/');
-        let file_path = self.root_dir.as_path().join(relative_path);
-
-        debug!("[DOWNLOAD] Remote is newer, downloading chunked file");
-        debug!("[DOWNLOAD] {} -> {}", remote_path, local_path);
-
-        match change.change_type() {
-            ChangeType::Created | ChangeType::Modified => {
-                if let Some(bytes) = self
-                    .download_remote_file(remote_path, &local_path, false)
-                    .await?
-                {
-                    info!(
-                        "[DOWNLOAD] Chunked file downloaded: {} ({} bytes)",
-                        local_path, bytes
-                    );
-                }
-            }
-            ChangeType::Deleted => {
-                debug!(
-                    "[LOCAL DELETE] Remote: {}, Local: {:?}",
-                    remote_path, file_path
-                );
-                if file_path.exists() {
-                    tokio::fs::remove_file(&file_path).await?;
-                }
-                self.local_db.delete_file_state(&local_path).await?;
-                info!("[LOCAL DELETE] SUCCESS: {} -> {}", remote_path, local_path);
-            }
-        }
-        Ok(())
+    /// Apply a change to the local filesystem (delegates to the shared apply worker).
+    async fn apply_to_filesystem(&self, change: &Change) -> Result<()> {
+        self.apply_worker().apply_to_filesystem(change).await
     }
 
     /// Get list of conflicts
@@ -1137,7 +1295,7 @@ impl SyncEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::couchdb::db::CannedCouch;
+    use crate::couchdb::db::{CannedCouch, ConcurrencyProbe};
     use crate::couchdb::CouchDb;
     use crate::local::{compute_bytes_hash, compute_file_hash, LocalDb};
     use crate::models::{Change, CouchRev, FileDoc, IgnoreMatcher, TimestampMillis};
@@ -1502,6 +1660,7 @@ mod tests {
                 b"remote-content".to_vec(),
             )]),
             content_errors: std::collections::HashSet::new(),
+            ..CannedCouch::default()
         };
         let mut engine = SyncEngine::with_ignore(
             test_canned_couch("prefix/", canned),
@@ -1571,6 +1730,7 @@ mod tests {
                 b"same-content".to_vec(),
             )]),
             content_errors: std::collections::HashSet::new(),
+            ..CannedCouch::default()
         };
         let mut engine = SyncEngine::with_ignore(
             test_canned_couch("prefix/", canned),
@@ -1708,7 +1868,7 @@ mod tests {
         std::fs::write(root.as_path().join("up.txt"), &content).unwrap();
 
         let local = test_local_db();
-        let mut engine = SyncEngine::with_ignore(
+        let engine = SyncEngine::with_ignore(
             test_canned_couch("prefix/", CannedCouch::default()),
             local,
             root.clone(),
@@ -1753,9 +1913,10 @@ mod tests {
             metadata: std::collections::HashMap::from([(remote_path.to_string(), remote_doc)]),
             contents: std::collections::HashMap::from([(remote_path.to_string(), content.clone())]),
             content_errors: std::collections::HashSet::new(),
+            ..CannedCouch::default()
         };
         let local = test_local_db();
-        let mut engine = SyncEngine::with_ignore(
+        let engine = SyncEngine::with_ignore(
             test_canned_couch("prefix/", canned),
             local,
             root.clone(),
@@ -1818,8 +1979,9 @@ mod tests {
             metadata: std::collections::HashMap::from([(remote_path.to_string(), remote_doc)]),
             contents: std::collections::HashMap::new(),
             content_errors: std::collections::HashSet::from([remote_path.to_string()]),
+            ..CannedCouch::default()
         };
-        let mut engine_a = SyncEngine::with_ignore(
+        let engine_a = SyncEngine::with_ignore(
             test_canned_couch("prefix/", canned_a),
             local_a,
             root.clone(),
@@ -1865,8 +2027,9 @@ mod tests {
             metadata: std::collections::HashMap::from([(remote_path2.to_string(), remote_doc2)]),
             contents: std::collections::HashMap::new(),
             content_errors: std::collections::HashSet::from([remote_path2.to_string()]),
+            ..CannedCouch::default()
         };
-        let mut engine_b = SyncEngine::with_ignore(
+        let engine_b = SyncEngine::with_ignore(
             test_canned_couch("prefix/", canned_b),
             test_local_db(),
             root.clone(),
@@ -1913,8 +2076,9 @@ mod tests {
             // the real path for a childless document.
             contents: std::collections::HashMap::new(),
             content_errors: std::collections::HashSet::new(),
+            ..CannedCouch::default()
         };
-        let mut engine = SyncEngine::with_ignore(
+        let engine = SyncEngine::with_ignore(
             test_canned_couch("prefix/", canned),
             test_local_db(),
             root.clone(),
@@ -2180,6 +2344,150 @@ mod tests {
         assert!(
             !root.as_path().join("a.txt").exists(),
             "local a.txt must be removed after the remote delete"
+        );
+    }
+
+    // ── Bounded-concurrency batch apply (#3006) ──────────────────────────
+
+    #[tokio::test]
+    async fn upload_batch_applies_with_bounded_concurrency_and_collects_every_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
+
+        // Larger than APPLY_CONCURRENCY_LIMIT so the loop is forced to run in
+        // waves; a couple of uploads fail at the canned `save_file` step so we
+        // can verify every per-file error is still collected (none dropped).
+        const N: usize = 16;
+        let mut changes = Vec::with_capacity(N);
+        let mut save_errors = std::collections::HashSet::new();
+        for i in 0..N {
+            let path = format!("up{i}.txt");
+            std::fs::write(root.as_path().join(&path), format!("content-{i}")).unwrap();
+            changes.push(Change::local_created(path.clone(), format!("hash-{i}"), 8));
+            if i == 3 || i == 11 {
+                save_errors.insert(format!("prefix/{path}"));
+            }
+        }
+
+        let probe = std::sync::Arc::new(ConcurrencyProbe::default());
+        let canned = CannedCouch {
+            save_errors,
+            probe: Some(probe.clone()),
+            batch_delay: Some(std::time::Duration::from_millis(20)),
+            ..CannedCouch::default()
+        };
+        let engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let mut report = SyncReport::default();
+        apply_upload_batch(engine.apply_worker(), changes, false, &mut report)
+            .await
+            .expect("batch upload must not abort the sync");
+
+        // Every file is accounted for and every failure is collected.
+        assert_eq!(report.uploaded.0, N, "all uploads accounted for");
+        assert_eq!(report.deleted_remote, 0);
+        assert_eq!(
+            report.errors.len(),
+            2,
+            "both simulated upload failures collected"
+        );
+        for i in [3, 11] {
+            let expected = format!("Upload up{i}.txt: simulated save failure for prefix/up{i}.txt");
+            let errors = &report.errors;
+            assert!(
+                errors.iter().any(|e| e == &expected),
+                "upload batch dropped the error for up{i}.txt; got {errors:?}"
+            );
+        }
+
+        // Real concurrency happened (more than one file in flight) but never
+        // above the configured bound.
+        let max = probe.max_concurrent();
+        assert!(
+            (2..=APPLY_CONCURRENCY_LIMIT).contains(&max),
+            "upload batch max concurrency {max}, expected 2..={APPLY_CONCURRENCY_LIMIT}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_batch_applies_with_bounded_concurrency_and_collects_every_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
+
+        const N: usize = 16;
+        let mut changes = Vec::with_capacity(N);
+        let mut metadata = std::collections::HashMap::new();
+        let mut contents = std::collections::HashMap::new();
+        let mut content_errors = std::collections::HashSet::new();
+        for i in 0..N {
+            let remote = format!("prefix/dl{i}.txt");
+            changes.push(Change::remote_created(
+                remote.clone(),
+                format!("rhash-{i}"),
+                16,
+                Utc::now(),
+                format!("1-{i}"),
+            ));
+            let mut doc = FileDoc::new(remote.clone(), String::new(), 16);
+            doc.rev = Some(format!("1-{i}"));
+            doc.path = remote.clone();
+            metadata.insert(remote.clone(), doc);
+            contents.insert(remote.clone(), format!("remote-content-{i}").into_bytes());
+            if i == 3 || i == 11 {
+                content_errors.insert(remote);
+            }
+        }
+
+        let probe = std::sync::Arc::new(ConcurrencyProbe::default());
+        let canned = CannedCouch {
+            metadata,
+            contents,
+            content_errors,
+            probe: Some(probe.clone()),
+            batch_delay: Some(std::time::Duration::from_millis(20)),
+            ..CannedCouch::default()
+        };
+        let engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let mut report = SyncReport::default();
+        apply_download_batch(engine.apply_worker(), changes, false, &mut report)
+            .await
+            .expect("batch download must not abort the sync");
+
+        assert_eq!(report.downloaded.0, N, "all downloads accounted for");
+        assert_eq!(report.deleted_local, 0);
+        assert_eq!(
+            report.errors.len(),
+            2,
+            "both simulated download failures collected"
+        );
+        for i in [3, 11] {
+            let remote = format!("prefix/dl{i}.txt");
+            let expected = format!(
+                "Download {remote}: failed to fetch content for {remote}: \
+                 simulated content fetch failure for {remote}"
+            );
+            let errors = &report.errors;
+            assert!(
+                errors.iter().any(|e| e == &expected),
+                "download batch dropped the error for {remote}; got {errors:?}"
+            );
+        }
+
+        let max = probe.max_concurrent();
+        assert!(
+            (2..=APPLY_CONCURRENCY_LIMIT).contains(&max),
+            "download batch max concurrency {max}, expected 2..={APPLY_CONCURRENCY_LIMIT}"
         );
     }
 }

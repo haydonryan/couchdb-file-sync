@@ -60,6 +60,47 @@ pub struct CannedCouch {
     /// Paths for which `get_file_content` should return a fetch error instead
     /// of content, simulating a failed network/auth/server content download.
     pub content_errors: std::collections::HashSet<String>,
+    /// Remote paths (doc ids) for which `save_file` should return an error,
+    /// simulating a failed network/auth/server content upload.
+    pub save_errors: std::collections::HashSet<String>,
+    /// When set, each `save_file`/`get_file_content` call records itself in the
+    /// probe and sleeps for `batch_delay`, letting tests observe how many
+    /// per-file operations are in flight at once.
+    pub probe: Option<std::sync::Arc<ConcurrencyProbe>>,
+    /// Optional artificial per-operation delay to force overlap in
+    /// bounded-concurrency tests. Only consulted when `probe` is set.
+    pub batch_delay: Option<std::time::Duration>,
+}
+
+/// Test-only tracker of the maximum number of concurrent in-flight canned
+/// CouchDB operations, used to assert that the sync apply loops respect the
+/// bounded-concurrency limit.
+#[cfg(test)]
+#[derive(Default)]
+pub struct ConcurrencyProbe {
+    current: std::sync::atomic::AtomicUsize,
+    max: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl ConcurrencyProbe {
+    fn enter(&self) {
+        let now = self
+            .current
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.max.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn leave(&self) {
+        self.current
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Highest number of concurrent operations observed.
+    pub fn max_concurrent(&self) -> usize {
+        self.max.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// Entry from a CouchDB changes feed
@@ -436,9 +477,19 @@ impl CouchDb {
     /// Save a document
     pub async fn save_file(&self, doc: &mut FileDoc) -> Result<()> {
         #[cfg(test)]
-        if self.test_state.is_some() {
+        if let Some(state) = &self.test_state {
+            if state.save_errors.contains(&doc.id) {
+                anyhow::bail!("simulated save failure for {}", doc.id);
+            }
             self.test_write_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(probe) = &state.probe {
+                probe.enter();
+                if let Some(delay) = state.batch_delay {
+                    tokio::time::sleep(delay).await;
+                }
+                probe.leave();
+            }
             return Ok(());
         }
 
@@ -632,6 +683,13 @@ impl CouchDb {
         if let Some(state) = &self.test_state {
             if state.content_errors.contains(path) {
                 anyhow::bail!("simulated content fetch failure for {path}");
+            }
+            if let Some(probe) = &state.probe {
+                probe.enter();
+                if let Some(delay) = state.batch_delay {
+                    tokio::time::sleep(delay).await;
+                }
+                probe.leave();
             }
             return Ok(state.contents.get(path).cloned().unwrap_or_default());
         }
