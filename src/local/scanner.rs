@@ -1,17 +1,48 @@
 use crate::models::{Change, FileState, IgnoreMatcher, SyncDirPath};
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 use tracing::{debug, info, trace, warn};
 use walkdir::WalkDir;
+
+/// Conservative timestamp granularity (seconds) used for the git-style
+/// "racily clean" check. A file whose mtime is within this window of the scan
+/// time may have been written inside the same filesystem timestamp tick, so a
+/// write can leave mtime (and size) unchanged while the content differs. Such
+/// files are re-hashed instead of reusing the stored hash. Chosen to cover
+/// coarse-granularity filesystems (e.g. FAT-style 2s ticks) while having no
+/// practical cost on unchanged trees, whose mtimes are far in the past.
+const TIMESTAMP_GRANULARITY_SECS: i64 = 2;
+
+/// True when `modified_at` falls inside the timestamp-granularity window of
+/// "now" (or is in the future, e.g. from clock skew), meaning the mtime alone
+/// cannot prove the content is unchanged. Mirrors git's racily-clean handling:
+/// a file touched inside the current timestamp tick must be re-checked even
+/// when its stored mtime and size match.
+fn is_racily_clean(modified_at: DateTime<Utc>) -> bool {
+    // A negative delta (mtime in the future) is also within the window because
+    // `now - modified_at <= granularity` holds for negative values.
+    Utc::now().signed_duration_since(modified_at)
+        <= chrono::Duration::seconds(TIMESTAMP_GRANULARITY_SECS)
+}
 
 /// Scans the filesystem for changes
 #[derive(Clone)]
 pub struct Scanner {
     root_dir: SyncDirPath,
     ignore_matcher: IgnoreMatcher,
+    /// Number of full file re-reads / SHA-256 computations issued by
+    /// [`Self::scan_file_with_stored`] (test-only). Shared across clones via
+    /// `Arc` so the count is visible on the scanner that drives a
+    /// [`Self::full_scan_with_stored`] call even though the blocking scan runs
+    /// on a cloned scanner. Lets tests assert unchanged scans reuse stored
+    /// hashes instead of re-hashing every file.
+    #[cfg(test)]
+    hash_computations: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Scanner {
@@ -20,6 +51,8 @@ impl Scanner {
         Self {
             root_dir,
             ignore_matcher,
+            #[cfg(test)]
+            hash_computations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -29,14 +62,34 @@ impl Scanner {
     /// [`tokio::task::spawn_blocking`] so the async executor is never stalled by
     /// the scan.
     pub async fn full_scan(&self) -> Result<Vec<FileState>> {
+        self.full_scan_with_stored(Arc::new(Vec::new())).await
+    }
+
+    /// Perform a full scan, reusing the stored hash for files whose stored
+    /// state has the same mtime AND size as the on-disk file and that are not
+    /// racily clean (see [`is_racily_clean`]). Unchanged trees therefore skip
+    /// the full disk read + SHA-256 for every file. New files, files with a
+    /// differing mtime or size, and racily-clean files are hashed as usual, so
+    /// created/modified/deleted detection semantics are unchanged.
+    ///
+    /// `stored_states` is shared with the blocking task through an [`Arc`] so
+    /// the (potentially large) state table is never copied.
+    pub async fn full_scan_with_stored(
+        &self,
+        stored_states: Arc<Vec<FileState>>,
+    ) -> Result<Vec<FileState>> {
         let scanner = self.clone();
-        tokio::task::spawn_blocking(move || scanner.scan_blocking()).await?
+        tokio::task::spawn_blocking(move || scanner.scan_blocking(&stored_states)).await?
     }
 
     /// Walk the directory tree and hash every file using blocking filesystem
     /// calls. Called on a blocking thread pool by [`Self::full_scan`].
-    fn scan_blocking(&self) -> Result<Vec<FileState>> {
+    fn scan_blocking(&self, stored_states: &[FileState]) -> Result<Vec<FileState>> {
         let mut states = Vec::new();
+        // Index stored states by relative path for O(1) reuse lookups. Keys are
+        // borrowed, so no path/hash strings are copied.
+        let stored_map: HashMap<&str, &FileState> =
+            stored_states.iter().map(|s| (s.path.as_str(), s)).collect();
 
         for entry in WalkDir::new(&self.root_dir).follow_links(false) {
             let entry = match entry {
@@ -65,8 +118,12 @@ impl Scanner {
                 continue;
             }
 
-            // Get file metadata and hash
-            match self.scan_file(path) {
+            // Get file metadata and hash, reusing the stored hash when the
+            // mtime+size match is safe.
+            let stored = stored_map
+                .get(relative_path.to_string_lossy().as_ref())
+                .copied();
+            match self.scan_file_with_stored(path, stored) {
                 Ok(state) => {
                     debug!("Scanned file: {} (hash: {})", state.path, &state.hash[..8]);
                     states.push(state);
@@ -80,8 +137,26 @@ impl Scanner {
         Ok(states)
     }
 
-    /// Scan a single file
+    /// Scan a single file, always computing the SHA-256 hash.
+    ///
+    /// Used by the watcher quick-scan path ([`Self::scan_single`]) where no
+    /// stored-state shortcut applies; behavior is identical to
+    /// [`Self::scan_file_with_stored`] with no stored state.
     pub fn scan_file(&self, path: &Path) -> Result<FileState> {
+        self.scan_file_with_stored(path, None)
+    }
+
+    /// Scan a single file, reusing the stored hash when the stored state's
+    /// mtime AND size match the on-disk file and the file is not racily clean.
+    ///
+    /// `stored` is the previously recorded state for this file, if any. When it
+    /// is `None` (or the mtime/size shortcut does not apply) the SHA-256 hash is
+    /// computed from the file content, preserving existing detection behavior.
+    pub fn scan_file_with_stored(
+        &self,
+        path: &Path,
+        stored: Option<&FileState>,
+    ) -> Result<FileState> {
         let metadata = std::fs::metadata(path)?;
 
         // Try the lexical root strip_prefix first. In production, scan_blocking
@@ -118,21 +193,56 @@ impl Scanner {
         };
         let path_str = relative_path.to_string_lossy().to_string();
 
-        // Compute hash / mtime from the same resolved path as the relative-path
-        // derivation so hashing and residual derivation stay consistent.
-        let hash = compute_file_hash(&resolved_path)?;
-
-        // Get modification time
+        // Get modification time and size from the same metadata the hash
+        // shortcut decision uses.
         let modified_at = metadata.modified()?.into();
+        let size = metadata.len();
+
+        // Conservative mtime+size shortcut (git-style): reuse the stored hash
+        // when the stored state has the same mtime AND size as the on-disk file
+        // and the file is not racily clean. Otherwise (new file, size or mtime
+        // drift, or a recently-touched racily-clean file) compute the SHA-256
+        // hash as before, so change detection stays correct.
+        let reuse_hash = match stored {
+            Some(s)
+                if s.size == size
+                    && s.modified_at == modified_at
+                    && !is_racily_clean(modified_at) =>
+            {
+                Some(s.hash.clone())
+            }
+            _ => None,
+        };
+
+        let hash = match reuse_hash {
+            Some(hash) => hash,
+            None => {
+                #[cfg(test)]
+                self.hash_computations
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Compute the hash from the same resolved path as the
+                // relative-path derivation so hashing and residual derivation
+                // stay consistent.
+                compute_file_hash(&resolved_path)?
+            }
+        };
 
         Ok(FileState {
             path: path_str,
             hash,
-            size: metadata.len(),
+            size,
             modified_at,
             couch_rev: None,
             last_sync_at: Utc::now(),
         })
+    }
+
+    /// Number of file hashes computed by this scanner since it was created
+    /// (test-only).
+    #[cfg(test)]
+    pub fn hash_computations(&self) -> u64 {
+        self.hash_computations
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Detect changes by comparing current state with stored state
@@ -248,7 +358,15 @@ mod tests {
     use crate::models::IgnoreMatcher;
     use std::io::Write;
     use std::path::Path;
+    use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
+
+    /// Set a file's mtime deterministically so tests can place files inside or
+    /// outside the racily-clean timestamp-granularity window.
+    fn set_mtime(path: &Path, time: SystemTime) {
+        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(time))
+            .expect("set file mtime");
+    }
 
     #[test]
     fn test_compute_file_hash() {
@@ -280,6 +398,234 @@ mod tests {
         let hash2 = compute_file_hash(&file_path).unwrap();
 
         assert_ne!(hash1, hash2, "Hash should change when content changes");
+    }
+
+    // ---- stored-hash mtime+size shortcut tests (#3005) ----
+
+    /// An unchanged file (same mtime AND size, not racily clean) must reuse the
+    /// stored hash and produce no local change. The stored hash is a marker
+    /// value that would only appear if the file was NOT re-read.
+    #[test]
+    fn test_scan_file_reuses_stored_hash_when_mtime_and_size_match() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("keep.txt");
+        std::fs::write(&file_path, b"stable content").unwrap();
+
+        // Place the mtime far enough in the past that the file is not racily
+        // clean, so the mtime+size shortcut is eligible.
+        let old_mtime = SystemTime::now() - Duration::from_secs(3600);
+        set_mtime(&file_path, old_mtime);
+
+        let scanner = Scanner::new(
+            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            IgnoreMatcher::empty(),
+        );
+
+        // Build the stored state from the file's actual reported metadata so
+        // the mtime equality comparison is exact on any filesystem precision.
+        let meta = std::fs::metadata(&file_path).unwrap();
+        let stored = FileState::new(
+            "keep.txt".to_string(),
+            "a".repeat(64), // marker hash: only present if reused
+            meta.len(),
+            meta.modified().unwrap().into(),
+        );
+
+        let state = scanner
+            .scan_file_with_stored(&file_path, Some(&stored))
+            .unwrap();
+
+        // The marker hash proves the stored hash was reused, not recomputed.
+        assert_eq!(state.hash, stored.hash, "stored hash must be reused");
+        assert_eq!(state.size, stored.size);
+        assert_eq!(state.modified_at, stored.modified_at);
+
+        // Change detection against the stored state reports no change.
+        let changes = scanner.detect_changes(&[state], &[stored]);
+        assert!(changes.is_empty(), "unchanged file must produce no changes");
+    }
+
+    /// A content change that also changes the mtime (same size) must be
+    /// detected: the mtime differs, so the hash is recomputed.
+    #[test]
+    fn test_scan_file_recomputes_hash_when_mtime_differs() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("edit.txt");
+        std::fs::write(&file_path, b"AAAA").unwrap();
+        let old_mtime = SystemTime::now() - Duration::from_secs(3600);
+        set_mtime(&file_path, old_mtime);
+
+        let scanner = Scanner::new(
+            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            IgnoreMatcher::empty(),
+        );
+
+        let meta = std::fs::metadata(&file_path).unwrap();
+        let stored = FileState::new(
+            "edit.txt".to_string(),
+            "a".repeat(64),
+            meta.len(),
+            meta.modified().unwrap().into(),
+        );
+
+        // Change content but keep the size; bump the mtime.
+        std::fs::write(&file_path, b"BBBB").unwrap();
+        set_mtime(&file_path, old_mtime + Duration::from_secs(10));
+
+        let state = scanner
+            .scan_file_with_stored(&file_path, Some(&stored))
+            .unwrap();
+
+        assert_eq!(state.size, stored.size);
+        assert_ne!(state.modified_at, stored.modified_at);
+        assert_ne!(state.hash, stored.hash, "hash must be recomputed");
+        assert_eq!(state.hash, compute_file_hash(&file_path).unwrap());
+
+        let changes = scanner.detect_changes(&[state], &[stored]);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path(), "edit.txt");
+        assert_eq!(changes[0].change_type(), ChangeType::Modified);
+    }
+
+    /// A content change that also changes the size (same mtime) must be
+    /// detected: the size differs, so the hash is recomputed.
+    #[test]
+    fn test_scan_file_recomputes_hash_when_size_differs() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("edit.txt");
+        std::fs::write(&file_path, b"AAAA").unwrap();
+        let old_mtime = SystemTime::now() - Duration::from_secs(3600);
+        set_mtime(&file_path, old_mtime);
+
+        let scanner = Scanner::new(
+            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            IgnoreMatcher::empty(),
+        );
+
+        let meta = std::fs::metadata(&file_path).unwrap();
+        let stored = FileState::new(
+            "edit.txt".to_string(),
+            "a".repeat(64),
+            meta.len(),
+            meta.modified().unwrap().into(),
+        );
+
+        // Change content and size; restore the exact same mtime.
+        std::fs::write(&file_path, b"AAAAA").unwrap();
+        set_mtime(&file_path, old_mtime);
+
+        let state = scanner
+            .scan_file_with_stored(&file_path, Some(&stored))
+            .unwrap();
+
+        assert_eq!(state.modified_at, stored.modified_at);
+        assert_ne!(state.size, stored.size);
+        assert_ne!(state.hash, stored.hash, "hash must be recomputed");
+        assert_eq!(state.hash, compute_file_hash(&file_path).unwrap());
+
+        let changes = scanner.detect_changes(&[state], &[stored]);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].change_type(), ChangeType::Modified);
+    }
+
+    /// Regression test for the racily-clean edge: a content change that keeps
+    /// both the mtime and size identical (possible inside the filesystem
+    /// timestamp-granularity window) must still be detected. Because the file
+    /// is racily clean, the stored hash is NOT reused and the new content is
+    /// hashed.
+    #[test]
+    fn test_scan_file_rehashes_racily_clean_file_with_same_mtime_and_size() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("racy.txt");
+
+        // Seed the file and give it an mtime inside the racily-clean window
+        // (within TIMESTAMP_GRANULARITY_SECS of "now").
+        std::fs::write(&file_path, b"AAAA").unwrap();
+        let racy_mtime = SystemTime::now() - Duration::from_millis(50);
+        set_mtime(&file_path, racy_mtime);
+
+        let scanner = Scanner::new(
+            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            IgnoreMatcher::empty(),
+        );
+
+        let meta = std::fs::metadata(&file_path).unwrap();
+        let stored = FileState::new(
+            "racy.txt".to_string(),
+            "a".repeat(64),
+            meta.len(),
+            meta.modified().unwrap().into(),
+        );
+
+        // Overwrite with different content but the SAME size, then restore the
+        // exact same mtime so both mtime and size match the stored state.
+        std::fs::write(&file_path, b"BBBB").unwrap();
+        set_mtime(&file_path, racy_mtime);
+
+        let state = scanner
+            .scan_file_with_stored(&file_path, Some(&stored))
+            .unwrap();
+
+        // mtime and size match the stored state...
+        assert_eq!(state.modified_at, stored.modified_at);
+        assert_eq!(state.size, stored.size);
+        // ...but the file is racily clean, so the hash must be recomputed and
+        // the content change detected.
+        assert_ne!(
+            state.hash, stored.hash,
+            "racily-clean file with matching mtime+size must still be re-hashed"
+        );
+        assert_eq!(state.hash, compute_file_hash(&file_path).unwrap());
+
+        let changes = scanner.detect_changes(&[state], &[stored]);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path(), "racy.txt");
+        assert_eq!(changes[0].change_type(), ChangeType::Modified);
+    }
+
+    /// full_scan_with_stored over an unchanged tree must reuse every stored
+    /// hash (zero file re-reads) while producing the same states as full_scan.
+    #[tokio::test]
+    async fn test_full_scan_with_stored_reuses_all_hashes_on_unchanged_tree() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap();
+        let old_mtime = SystemTime::now() - Duration::from_secs(3600);
+        for (i, name) in ["a.txt", "b.txt", "c.txt"].iter().enumerate() {
+            let file_path = root.as_path().join(name);
+            std::fs::write(&file_path, format!("content {i}")).unwrap();
+            set_mtime(&file_path, old_mtime);
+        }
+
+        let scanner = Scanner::new(root.clone(), IgnoreMatcher::empty());
+
+        // Establish the stored states (this first scan hashes everything).
+        let stored_states = Arc::new(scanner.full_scan().await.unwrap());
+        let hashes_after_first = scanner.hash_computations();
+        assert_eq!(hashes_after_first, 3, "first scan must hash all 3 files");
+
+        // A second scan against the stored states must reuse all hashes.
+        let current = scanner
+            .full_scan_with_stored(stored_states.clone())
+            .await
+            .unwrap();
+        let hashes_after_second = scanner.hash_computations();
+        assert_eq!(
+            hashes_after_second, hashes_after_first,
+            "unchanged scan must not re-hash any file"
+        );
+        assert_eq!(current.len(), 3);
+        for state in &current {
+            let stored = stored_states
+                .iter()
+                .find(|s| s.path == state.path)
+                .expect("stored state exists");
+            assert_eq!(state.hash, stored.hash);
+            assert_eq!(state.size, stored.size);
+            assert_eq!(state.modified_at, stored.modified_at);
+        }
+        // And change detection sees no changes.
+        let changes = scanner.detect_changes(&current, &stored_states);
+        assert!(changes.is_empty());
     }
 
     // ---- scan_file tests ----

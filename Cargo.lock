@@ -459,6 +459,7 @@ dependencies = [
  "config",
  "couch_rs",
  "dialoguer",
+ "filetime",
  "globset",
  "hex",
  "notify-debouncer-full",
@@ -649,6 +650,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1fc6a637b6dc58414714eddd9170ff187ecb0933d4c7024d1abbd23a3cc26e9"
 dependencies = [
  "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
 ]
 
 [[package]]
