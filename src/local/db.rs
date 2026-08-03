@@ -3,6 +3,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::path::Path;
 use tracing::info;
 
@@ -122,6 +123,51 @@ impl LocalDb {
             .optional()?;
 
         Ok(state)
+    }
+
+    /// Get file states for a set of paths in a single batch query.
+    ///
+    /// Returns a map keyed by path containing only paths that have a stored
+    /// state; paths without a stored state are simply absent from the result,
+    /// matching the per-path [`Self::get_file_state`] behavior. The whole
+    /// batch is loaded with one `WHERE path IN (...)` prepared statement
+    /// (chunked only when the path set would exceed SQLite's bind-parameter
+    /// limit) instead of one prepared-statement query per path.
+    pub fn get_file_states(&self, paths: &[&str]) -> Result<HashMap<String, FileState>> {
+        let mut states = HashMap::new();
+        if paths.is_empty() {
+            return Ok(states);
+        }
+
+        // SQLite limits the number of bind parameters in a single statement.
+        // Chunk large path sets so we never exceed the limit while still
+        // issuing far fewer queries than one-per-path.
+        const MAX_PARAMS_PER_QUERY: usize = 900;
+        for chunk in paths.chunks(MAX_PARAMS_PER_QUERY) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT path, hash, size, modified_at, couch_rev, last_sync_at \
+                 FROM file_states WHERE path IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                let size: i64 = row.get(2)?;
+                Ok(FileState {
+                    path: row.get(0)?,
+                    hash: row.get(1)?,
+                    size: i64_to_u64(size)?,
+                    modified_at: row.get(3)?,
+                    couch_rev: row.get(4)?,
+                    last_sync_at: row.get(5)?,
+                })
+            })?;
+            for state in rows {
+                let state = state?;
+                states.insert(state.path.clone(), state);
+            }
+        }
+
+        Ok(states)
     }
 
     /// Save or update file state
@@ -573,6 +619,28 @@ mod tests {
             .get_file_state("/nonexistent")
             .expect("get_file_state failed");
         assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn test_get_file_states_batch_matches_per_path() {
+        let db = test_db();
+        // A mixed set of paths: some present, some missing, plus duplicates
+        // to exercise dedup at the caller.
+        for (i, p) in ["/a.txt", "/b.txt", "/c.txt"].iter().enumerate() {
+            let mut state = make_file_state(p);
+            state.hash = format!("hash-{i}");
+            db.save_file_state(&state).expect("save_file_state failed");
+        }
+        let paths = ["/a.txt", "/b.txt", "/missing.txt", "/c.txt", "/a.txt"];
+        let batch = db.get_file_states(&paths).expect("get_file_states failed");
+
+        // Batch result must contain exactly the stored paths from the set.
+        assert_eq!(batch.len(), 3);
+        for p in ["/a.txt", "/b.txt", "/c.txt"] {
+            let per_path = db.get_file_state(p).expect("get_file_state failed");
+            assert_eq!(batch.get(p), per_path.as_ref(), "batch mismatch for {p}");
+        }
+        assert!(!batch.contains_key("/missing.txt"));
     }
 
     #[test]

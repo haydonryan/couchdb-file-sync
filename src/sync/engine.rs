@@ -81,6 +81,14 @@ impl AsyncLocalDb {
         self.run(move |db| db.get_file_state(&path)).await
     }
 
+    async fn get_file_states(&self, paths: &[&str]) -> Result<HashMap<String, FileState>> {
+        let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+        self.run(move |db| {
+            db.get_file_states(&paths.iter().map(String::as_str).collect::<Vec<_>>())
+        })
+        .await
+    }
+
     async fn save_file_state(&self, state: &FileState) -> Result<()> {
         let state = state.clone();
         self.run(move |db| db.save_file_state(&state)).await
@@ -530,27 +538,25 @@ impl SyncEngine {
         remote_changes: &[Change],
         dry_run: bool,
     ) -> Result<(Vec<Change>, Vec<Change>, Vec<Conflict>)> {
-        // Build a complete map of stored states (one I/O batch)
-        let mut stored_states: HashMap<String, FileState> = HashMap::new();
-        // Actually load all stored states individually (keeps existing pattern)
+        // Build a complete map of stored states in one I/O batch: load the
+        // states for the deduped union of local and remote change paths with a
+        // single batch query instead of one per-path `get_file_state` call.
+        let mut paths_to_lookup: HashSet<String> = HashSet::new();
         for lc in local_changes {
-            if !stored_states.contains_key(lc.path()) {
-                if let Some(state) = self.local_db.get_file_state(lc.path()).await? {
-                    stored_states.insert(lc.path().to_string(), state);
-                }
-            }
+            paths_to_lookup.insert(lc.path().to_string());
         }
         for rc in remote_changes {
-            let local_path = self.couchdb.get_local_path(rc.path());
-            // Use entry API: clone the key for the lookup to avoid borrow-after-move
-            if let std::collections::hash_map::Entry::Vacant(e) =
-                stored_states.entry(local_path.clone())
-            {
-                if let Some(state) = self.local_db.get_file_state(&local_path).await? {
-                    e.insert(state);
-                }
-            }
+            paths_to_lookup.insert(self.couchdb.get_local_path(rc.path()));
         }
+        let stored_states = self
+            .local_db
+            .get_file_states(
+                &paths_to_lookup
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
 
         let remote_prefix = self.couchdb.remote_prefix();
 
