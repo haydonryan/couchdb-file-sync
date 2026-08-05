@@ -70,6 +70,9 @@ rand = "0.10.2"
 tempfile = "3.27"
 tokio-test = "0.4"
 filetime = "0.2"
+hyper = { version = "1.11", features = ["server", "http1"] }
+http-body-util = "0.1.4"
+hyper-util = { version = "0.1.20", features = ["tokio"] }
 
 [package.metadata.release]
 allow-branch = ["main", "master"]

@@ -1203,10 +1203,13 @@ mod tests {
         }
     }
 
-    /// Spawn a minimal in-process fake CouchDB server that serves one chunk
-    /// document on GET and answers DELETE with `delete_status`. Returns the
-    /// base database URL, a counter of accepted TCP connections, the server
-    /// handle, and a shutdown flag.
+    /// Spawn an in-process fake CouchDB server backed by a real hyper HTTP
+    /// server that serves one chunk document on GET and answers DELETE with
+    /// `delete_status`. Using hyper means HTTP/1.1 framing, keep-alive and
+    /// connection reuse are handled correctly by construction, so the tests are
+    /// deterministic and do not race on macOS the way a hand-rolled raw-TCP
+    /// server did. Returns the base database URL, a counter of accepted TCP
+    /// connections, the server thread handle, and a shutdown flag.
     fn spawn_fake_couch(
         delete_status: u16,
     ) -> (
@@ -1215,6 +1218,9 @@ mod tests {
         std::thread::JoinHandle<()>,
         std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {
+        // Bind a std listener first so we obtain the ephemeral port without
+        // needing an async context, then hand the socket to a dedicated tokio
+        // runtime that runs the hyper accept loop.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake couch");
         let addr = listener.local_addr().expect("fake couch addr");
         let base_db_url = format!("http://{}/test_db", addr);
@@ -1223,89 +1229,77 @@ mod tests {
         let shutdown_thread = shutdown.clone();
         let conn_count_thread = conn_count.clone();
         let handle = std::thread::spawn(move || {
-            listener
-                .set_nonblocking(true)
-                .expect("set fake couch nonblocking");
-            loop {
-                if shutdown_thread.load(std::sync::atomic::Ordering::SeqCst) {
-                    break;
-                }
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        conn_count_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        // Serve each connection on its own thread so the accept
-                        // loop is never blocked by a long-lived keep-alive
-                        // connection. Otherwise a second connection that the
-                        // client opens because the first is occupied sits
-                        // unaccepted, and the race on macOS can surface as
-                        // ECONNRESET.
-                        std::thread::spawn(move || handle_fake_couch_conn(stream, delete_status));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("fake couch runtime");
+            runtime.block_on(async move {
+                listener
+                    .set_nonblocking(true)
+                    .expect("set fake couch nonblocking");
+                let listener =
+                    tokio::net::TcpListener::from_std(listener).expect("fake couch tokio listener");
+                loop {
+                    if shutdown_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    // Poll for connections with a short timeout so the loop can
+                    // observe the shutdown flag and exit promptly.
+                    match tokio::time::timeout(Duration::from_millis(10), listener.accept()).await {
+                        Ok(Ok((stream, _))) => {
+                            conn_count_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let status = delete_status;
+                            let service = hyper::service::service_fn(move |req| {
+                                handle_fake_couch_req(req, status)
+                            });
+                            tokio::spawn(async move {
+                                let io = hyper_util::rt::TokioIo::new(stream);
+                                let _ = hyper::server::conn::http1::Builder::new()
+                                    .serve_connection(io, service)
+                                    .await;
+                            });
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_elapsed) => {} // no connection yet; re-check shutdown
                     }
-                    Err(_) => break,
                 }
-            }
+            });
         });
         (base_db_url, conn_count, handle, shutdown)
     }
 
-    /// Serve one connection: read the request line and headers for each
-    /// request, responding to GET with a chunk document and to DELETE with the
-    /// configured status, until the client closes the connection. Serving
-    /// multiple requests per accepted connection keeps the fake tolerant of
-    /// reqwest connection reuse.
-    fn handle_fake_couch_conn(mut stream: std::net::TcpStream, delete_status: u16) {
-        use std::io::{BufRead, BufReader, Write};
-
-        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-        // Keep serving requests on this connection until the client closes it
-        // (EOF) or the connection errors. reqwest may reuse a pooled
-        // connection, delivering GET and DELETE on the same TCP stream, so
-        // serving a single request and dropping the socket would reset the
-        // connection mid-test.
-        loop {
-            let mut request_line = String::new();
-            match reader.read_line(&mut request_line) {
-                Ok(0) | Err(_) => return, // client closed the connection
-                Ok(_) => {}
+    /// Serve one HTTP request: respond to GET with a chunk document and to
+    /// DELETE with the configured status. hyper handles keep-alive and
+    /// connection reuse, so the server tolerates reqwest reusing the pooled
+    /// connection across the GET and DELETE that `delete_chunks` issues.
+    async fn handle_fake_couch_req(
+        req: hyper::Request<hyper::body::Incoming>,
+        delete_status: u16,
+    ) -> Result<hyper::Response<http_body_util::Full<hyper::body::Bytes>>, hyper::Error> {
+        let (parts, _body) = req.into_parts();
+        let mut response =
+            hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::new()));
+        match parts.method {
+            hyper::Method::GET => {
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from_static(
+                    br#"{"_id":"chunk1","_rev":"1-abc","data":"hello","type":"leaf"}"#,
+                ));
             }
-            // Drain the remainder of the request headers.
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
-                    break;
-                }
+            hyper::Method::DELETE if delete_status == 200 => {
+                *response.body_mut() =
+                    http_body_util::Full::new(hyper::body::Bytes::from_static(br#"{"ok":true}"#));
             }
-            let method = request_line
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_string();
-            let (status, body) = match method.as_str() {
-                "GET" => (
-                    "HTTP/1.1 200 OK",
-                    r#"{"_id":"chunk1","_rev":"1-abc","data":"hello","type":"leaf"}"#,
-                ),
-                "DELETE" if delete_status == 200 => ("HTTP/1.1 200 OK", r#"{"ok":true}"#),
-                "DELETE" => (
-                    "HTTP/1.1 500 Internal Server Error",
-                    r#"{"error":"simulated delete failure"}"#,
-                ),
-                _ => ("HTTP/1.1 404 Not Found", ""),
-            };
-            let response = format!(
-                "{}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
-                status,
-                body.len(),
-                body
-            );
-            if stream.write_all(response.as_bytes()).is_err() {
-                return;
+            hyper::Method::DELETE => {
+                *response.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from_static(
+                    br#"{"error":"simulated delete failure"}"#,
+                ));
             }
-            let _ = stream.flush();
+            _ => {
+                *response.status_mut() = hyper::StatusCode::NOT_FOUND;
+            }
         }
+        Ok(response)
     }
 
     #[tokio::test]
@@ -1340,9 +1334,11 @@ mod tests {
 
     /// Regression test for the macOS-CI flake: the fake CouchDB server must not
     /// reset the socket between the GET and DELETE requests issued by the real
-    /// reqwest client during `delete_chunks`. Driven through the actual HTTP
-    /// path (no hand-rolled socket framing, which raced the server thread and
-    /// flaked on macOS), asserting that both requests complete successfully.
+    /// reqwest client during `delete_chunks`. The fake server is a real hyper
+    /// HTTP server, so framing and keep-alive are handled correctly, and
+    /// `delete_chunks` succeeds deterministically. Asserting both requests
+    /// complete successfully guards against any future regression back to a
+    /// connection-resetting fake.
     ///
     /// Reqwest may either reuse the pooled connection or, depending on timing,
     /// open a fresh one for the DELETE, so the connection count is a sanity
