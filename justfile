@@ -25,6 +25,24 @@ run *args:
 test:
     cargo test --workspace
 
+pre-commit:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    before_fmt_diff="$(mktemp)"
+    after_fmt_diff="$(mktemp)"
+    trap 'rm -f "$before_fmt_diff" "$after_fmt_diff"' EXIT
+    git diff --name-only -- . >"$before_fmt_diff"
+    cargo fmt --all
+    git diff --name-only -- . >"$after_fmt_diff"
+    if ! cmp -s "$before_fmt_diff" "$after_fmt_diff"; then
+      echo "cargo fmt updated files. Review and stage the formatting changes, then commit again." >&2
+      exit 1
+    fi
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo audit
+    cargo deny check all
+    cargo test
+    ./scripts/scan-staged-secrets.sh
 
 
 docker-deploy:
