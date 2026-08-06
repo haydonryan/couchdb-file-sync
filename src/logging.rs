@@ -114,10 +114,10 @@ impl Write for AppLogWriter {
 }
 
 fn open_log_file(path: &Path) -> io::Result<File> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
     }
 
     OpenOptions::new().create(true).append(true).open(path)
@@ -142,7 +142,7 @@ fn rotated_log_path(path: &Path, date: NaiveDate) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{rotated_log_path, AppLogWriter};
+    use super::{AppLogWriter, rotated_log_path};
     use crate::config::RotationConfig;
     use chrono::{Duration, Local, NaiveDate};
     use std::fs;

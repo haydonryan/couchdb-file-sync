@@ -1,7 +1,7 @@
 use crate::models::{Change, ChunkDoc, DatabaseName, FileDoc, RemotePath};
 use anyhow::Result;
-use couch_rs::database::Database;
 use couch_rs::Client;
+use couch_rs::database::Database;
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use serde_json::Value;
@@ -865,32 +865,30 @@ impl CouchDb {
         }
 
         for chunk_id in chunk_ids {
-            if let Some(chunk) = self.get_chunk(chunk_id).await? {
-                if let Some(rev) = chunk.rev {
-                    let url = format!("{}/{}?rev={}", self.base_db_url, chunk_id, rev);
-                    let mut request = self.http_client.delete(&url);
-                    if let Some((username, password)) = &self.auth {
-                        request = request.basic_auth(username, Some(password));
+            if let Some(chunk) = self.get_chunk(chunk_id).await?
+                && let Some(rev) = chunk.rev
+            {
+                let url = format!("{}/{}?rev={}", self.base_db_url, chunk_id, rev);
+                let mut request = self.http_client.delete(&url);
+                if let Some((username, password)) = &self.auth {
+                    request = request.basic_auth(username, Some(password));
+                }
+                match request.send().await {
+                    Ok(response) if response.status().is_success() => {
+                        debug!("Deleted old chunk: {}", chunk_id);
                     }
-                    match request.send().await {
-                        Ok(response) if response.status().is_success() => {
-                            debug!("Deleted old chunk: {}", chunk_id);
-                        }
-                        Ok(response) => {
-                            let status = response.status();
-                            let body = response.text().await.unwrap_or_default();
-                            warn!(
-                                "Failed to delete old chunk {}: {} - {}",
-                                chunk_id, status, body
-                            );
-                            anyhow::bail!(
-                                "Failed to delete old chunk {chunk_id}: {status} - {body}"
-                            );
-                        }
-                        Err(e) => {
-                            warn!("Failed to delete old chunk {}: {}", chunk_id, e);
-                            anyhow::bail!("Failed to delete old chunk {chunk_id}: {e}");
-                        }
+                    Ok(response) => {
+                        let status = response.status();
+                        let body = response.text().await.unwrap_or_default();
+                        warn!(
+                            "Failed to delete old chunk {}: {} - {}",
+                            chunk_id, status, body
+                        );
+                        anyhow::bail!("Failed to delete old chunk {chunk_id}: {status} - {body}");
+                    }
+                    Err(e) => {
+                        warn!("Failed to delete old chunk {}: {}", chunk_id, e);
+                        anyhow::bail!("Failed to delete old chunk {chunk_id}: {e}");
                     }
                 }
             }

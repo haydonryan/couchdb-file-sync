@@ -2,7 +2,7 @@ use crate::models::{Change, ChangeSource, ChangeType, Checkpoint, Conflict, Couc
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::info;
@@ -1088,10 +1088,11 @@ mod tests {
 
         // Verify everything is gone
         assert!(db.get_all_file_states().expect("file states").is_empty());
-        assert!(db
-            .get_pending_changes()
-            .expect("pending changes")
-            .is_empty());
+        assert!(
+            db.get_pending_changes()
+                .expect("pending changes")
+                .is_empty()
+        );
         assert!(db.get_conflicts().expect("conflicts").is_empty());
         assert!(db.get_checkpoint().expect("checkpoint").is_none());
     }

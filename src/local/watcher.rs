@@ -1,9 +1,8 @@
 use crate::models::{Change, IgnoreMatcher, SyncDirPath};
 use anyhow::Result;
 use notify_debouncer_full::{
-    new_debouncer,
+    DebounceEventResult, DebouncedEvent, Debouncer, RecommendedCache, new_debouncer,
     notify::{EventKind, RecommendedWatcher, RecursiveMode},
-    DebounceEventResult, DebouncedEvent, Debouncer, RecommendedCache,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -59,10 +58,10 @@ impl RateLimitedWarn {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
-        if let Some(prev) = *last {
-            if now.duration_since(prev) < self.interval {
-                return false;
-            }
+        if let Some(prev) = *last
+            && now.duration_since(prev) < self.interval
+        {
+            return false;
         }
         *last = Some(now);
         true
@@ -88,13 +87,13 @@ impl EventSender {
     /// Try to enqueue `event`; on failure log a rate-limited warning rather
     /// than silently dropping the event (which would be lost to sync).
     fn send(&self, event: WatcherEvent) {
-        if let Err(err) = self.tx.try_send(event) {
-            if self.drop_warn.should_emit() {
-                warn!(
-                    error = %err,
-                    "dropped file-watcher event: internal event channel is full; event will not be synced"
-                );
-            }
+        if let Err(err) = self.tx.try_send(event)
+            && self.drop_warn.should_emit()
+        {
+            warn!(
+                error = %err,
+                "dropped file-watcher event: internal event channel is full; event will not be synced"
+            );
         }
     }
 }

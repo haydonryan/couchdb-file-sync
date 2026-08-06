@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use tracing::info;
 
 use couchdb_file_sync::cli;
-use couchdb_file_sync::config::{default_log_file, default_user_config_file, AppConfig, SyncPath};
+use couchdb_file_sync::config::{AppConfig, SyncPath, default_log_file, default_user_config_file};
 use couchdb_file_sync::logging::AppLogWriter;
 
 #[derive(Parser, Debug)]
@@ -409,10 +409,10 @@ fn paths_match(left: &std::path::Path, right: &std::path::Path) -> bool {
 
 /// Initialize logging based on verbosity or `RUST_LOG` env var
 fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daemon_mode: bool) {
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
 
     // Prefer RUST_LOG if set, otherwise use verbosity flag
     let filter = if std::env::var("RUST_LOG").is_ok() {
@@ -470,10 +470,10 @@ fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daem
 
 #[cfg(test)]
 mod tests {
+    use super::{Cli, Commands, init_logging};
     use super::{
         default_user_config_file_if_exists, paths_match, resolve_paths, resolved_config_path,
     };
-    use super::{init_logging, Cli, Commands};
     use clap::Parser;
     use couchdb_file_sync::config::{AppConfig, SyncPath};
     use std::path::PathBuf;
@@ -494,18 +494,28 @@ mod tests {
         let old_home = std::env::var_os("HOME");
         let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
         // Avoid letting a previous test's XDG_CONFIG_HOME leak through
-        std::env::remove_var("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
         f();
         // Restore
         if let Some(ref h) = old_home {
-            std::env::set_var("HOME", h);
+            unsafe {
+                std::env::set_var("HOME", h);
+            }
         } else {
-            std::env::remove_var("HOME");
+            unsafe {
+                std::env::remove_var("HOME");
+            }
         }
         if let Some(ref x) = old_xdg {
-            std::env::set_var("XDG_CONFIG_HOME", x);
+            unsafe {
+                std::env::set_var("XDG_CONFIG_HOME", x);
+            }
         } else {
-            std::env::remove_var("XDG_CONFIG_HOME");
+            unsafe {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            }
         }
         // guard dropped here, releasing the lock
     }
@@ -624,8 +634,12 @@ mod tests {
             let tmp = TempDir::new().unwrap();
             let fake_home = tmp.path().join("home");
             std::fs::create_dir_all(&fake_home).unwrap();
-            std::env::set_var("HOME", &fake_home);
-            std::env::remove_var("XDG_CONFIG_HOME");
+            unsafe {
+                std::env::set_var("HOME", &fake_home);
+            }
+            unsafe {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            }
 
             let result = default_user_config_file_if_exists();
             assert!(
@@ -644,8 +658,12 @@ mod tests {
             let yaml_path = config_dir.join("couchdb-file-sync.yaml");
             std::fs::write(&yaml_path, "").unwrap();
 
-            std::env::set_var("HOME", tmp.path());
-            std::env::remove_var("XDG_CONFIG_HOME");
+            unsafe {
+                std::env::set_var("HOME", tmp.path());
+            }
+            unsafe {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            }
 
             let result = default_user_config_file_if_exists();
             assert!(
@@ -665,8 +683,12 @@ mod tests {
             let yml_path = config_dir.join("couchdb-file-sync.yml");
             std::fs::write(&yml_path, "").unwrap();
 
-            std::env::set_var("HOME", tmp.path());
-            std::env::remove_var("XDG_CONFIG_HOME");
+            unsafe {
+                std::env::set_var("HOME", tmp.path());
+            }
+            unsafe {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            }
 
             let result = default_user_config_file_if_exists();
             assert!(result.is_some(), "expected Some for existing yml, got None");
@@ -685,8 +707,12 @@ mod tests {
             std::fs::write(&yaml_path, "yaml").unwrap();
             std::fs::write(&yml_path, "yml").unwrap();
 
-            std::env::set_var("HOME", tmp.path());
-            std::env::remove_var("XDG_CONFIG_HOME");
+            unsafe {
+                std::env::set_var("HOME", tmp.path());
+            }
+            unsafe {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            }
 
             let result = default_user_config_file_if_exists();
             assert!(result.is_some());
@@ -713,8 +739,12 @@ mod tests {
             let tmp = TempDir::new().unwrap();
             let fake_home = tmp.path().join("home");
             std::fs::create_dir_all(&fake_home).unwrap();
-            std::env::set_var("HOME", &fake_home);
-            std::env::remove_var("XDG_CONFIG_HOME");
+            unsafe {
+                std::env::set_var("HOME", &fake_home);
+            }
+            unsafe {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            }
 
             let result = resolved_config_path(None);
             assert!(result.is_none());

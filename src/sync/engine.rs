@@ -1,5 +1,5 @@
 use crate::couchdb::CouchDb;
-use crate::local::{compute_bytes_hash, compute_file_hash, LocalDb, Scanner};
+use crate::local::{LocalDb, Scanner, compute_bytes_hash, compute_file_hash};
 use crate::models::{
     Change, ChangeType, Checkpoint, Conflict, CouchRev, DownloadCount, FileState, IgnoreMatcher,
     RemoteState, ResolutionStrategy, SyncDirPath, UploadCount,
@@ -480,11 +480,9 @@ async fn apply_one_download(
         error: None,
     };
 
-    if !dry_run {
-        if let Err(e) = worker.apply_to_filesystem(&change).await {
-            error!("Failed to download {}: {}", change.path(), e);
-            outcome.error = Some(format!("Download {}: {}", change.path(), e));
-        }
+    if !dry_run && let Err(e) = worker.apply_to_filesystem(&change).await {
+        error!("Failed to download {}: {}", change.path(), e);
+        outcome.error = Some(format!("Download {}: {}", change.path(), e));
     }
 
     Ok(outcome)
@@ -985,7 +983,10 @@ impl SyncEngine {
                         );
                     }
                 } else {
-                    info!("  [REMOTE CHANGE DETECTED] {} - no remote mtime available, assuming changed", lc.path());
+                    info!(
+                        "  [REMOTE CHANGE DETECTED] {} - no remote mtime available, assuming changed",
+                        lc.path()
+                    );
                     if let Some(state) = stored_states.get(lc.path()) {
                         info!(
                             "    Stored rev: {:?} | Remote rev: {:?}",
@@ -1353,9 +1354,9 @@ impl SyncEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::couchdb::db::{CannedCouch, ConcurrencyProbe};
     use crate::couchdb::CouchDb;
-    use crate::local::{compute_bytes_hash, compute_file_hash, LocalDb};
+    use crate::couchdb::db::{CannedCouch, ConcurrencyProbe};
+    use crate::local::{LocalDb, compute_bytes_hash, compute_file_hash};
     use crate::models::{Change, CouchRev, FileDoc, IgnoreMatcher, TimestampMillis};
     use chrono::{Duration, Utc};
     use std::path::PathBuf;
@@ -1387,9 +1388,11 @@ mod tests {
         assert!(engine.get_conflicts().await.unwrap().is_empty());
         // with_ignore uses IgnoreMatcher::empty() internally
         // The default empty matcher should not ignore anything
-        assert!(!engine
-            .ignore_matcher()
-            .should_ignore(std::path::Path::new("test.txt")));
+        assert!(
+            !engine
+                .ignore_matcher()
+                .should_ignore(std::path::Path::new("test.txt"))
+        );
     }
 
     #[test]
@@ -1401,15 +1404,21 @@ mod tests {
         let matcher = IgnoreMatcher::from_content("*.log\nnode_modules/");
         let engine = SyncEngine::with_ignore(couch, local, root, matcher);
 
-        assert!(engine
-            .ignore_matcher()
-            .should_ignore(std::path::Path::new("debug.log")));
-        assert!(engine
-            .ignore_matcher()
-            .should_ignore(std::path::Path::new("node_modules/pkg/index.js")));
-        assert!(!engine
-            .ignore_matcher()
-            .should_ignore(std::path::Path::new("src/main.rs")));
+        assert!(
+            engine
+                .ignore_matcher()
+                .should_ignore(std::path::Path::new("debug.log"))
+        );
+        assert!(
+            engine
+                .ignore_matcher()
+                .should_ignore(std::path::Path::new("node_modules/pkg/index.js"))
+        );
+        assert!(
+            !engine
+                .ignore_matcher()
+                .should_ignore(std::path::Path::new("src/main.rs"))
+        );
     }
 
     #[test]
@@ -1439,16 +1448,20 @@ mod tests {
         assert!(engine.get_conflicts().await.unwrap().is_empty());
 
         // Fresh engine should have no file states
-        assert!(engine
-            .get_file_state("nonexistent.txt")
-            .await
-            .unwrap()
-            .is_none());
-        assert!(engine
-            .get_file_state("other/path.md")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            engine
+                .get_file_state("nonexistent.txt")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            engine
+                .get_file_state("other/path.md")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2414,11 +2427,13 @@ mod tests {
             "43-seq",
             "checkpoint write via engine must be read back unchanged"
         );
-        assert!(engine
-            .get_file_state("nonexistent.txt")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            engine
+                .get_file_state("nonexistent.txt")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

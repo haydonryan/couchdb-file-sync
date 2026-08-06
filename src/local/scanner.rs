@@ -383,8 +383,8 @@ pub fn compute_bytes_hash(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::change::{ChangeSource, ChangeType};
     use crate::models::IgnoreMatcher;
+    use crate::models::change::{ChangeSource, ChangeType};
     use std::io::Write;
     use std::path::Path;
     use std::time::{Duration, SystemTime};

@@ -722,17 +722,29 @@ local: /home/user/docs
         let old_log = std::env::var_os("COUCHDB_FILE_SYNC__LOGGING__LEVEL");
 
         // Clear interfering env vars
-        std::env::remove_var("COUCHDB_FILE_SYNC__COUCHDB__URL");
-        std::env::remove_var("COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL");
-        std::env::remove_var("COUCHDB_FILE_SYNC__LOGGING__LEVEL");
+        unsafe {
+            std::env::remove_var("COUCHDB_FILE_SYNC__COUCHDB__URL");
+        }
+        unsafe {
+            std::env::remove_var("COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL");
+        }
+        unsafe {
+            std::env::remove_var("COUCHDB_FILE_SYNC__LOGGING__LEVEL");
+        }
 
         // --- Test 1: Env vars override defaults ---
-        std::env::set_var(
-            "COUCHDB_FILE_SYNC__COUCHDB__URL",
-            "https://couch.example.com:6984",
-        );
-        std::env::set_var("COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL", "120");
-        std::env::set_var("COUCHDB_FILE_SYNC__LOGGING__LEVEL", "debug");
+        unsafe {
+            std::env::set_var(
+                "COUCHDB_FILE_SYNC__COUCHDB__URL",
+                "https://couch.example.com:6984",
+            );
+        }
+        unsafe {
+            std::env::set_var("COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL", "120");
+        }
+        unsafe {
+            std::env::set_var("COUCHDB_FILE_SYNC__LOGGING__LEVEL", "debug");
+        }
 
         let config = AppConfig::load(None).unwrap();
         assert_eq!(config.couchdb.url, "https://couch.example.com:6984");
@@ -757,7 +769,9 @@ logging:
         .unwrap();
 
         // Env var overrides file value
-        std::env::set_var("COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL", "200");
+        unsafe {
+            std::env::set_var("COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL", "200");
+        }
 
         let config = AppConfig::load(Some(config_path)).unwrap();
 
@@ -771,19 +785,31 @@ logging:
 
         // --- Restore original env vars ---
         if let Some(v) = old_url {
-            std::env::set_var("COUCHDB_FILE_SYNC__COUCHDB__URL", v);
+            unsafe {
+                std::env::set_var("COUCHDB_FILE_SYNC__COUCHDB__URL", v);
+            }
         } else {
-            std::env::remove_var("COUCHDB_FILE_SYNC__COUCHDB__URL");
+            unsafe {
+                std::env::remove_var("COUCHDB_FILE_SYNC__COUCHDB__URL");
+            }
         }
         if let Some(v) = old_interval {
-            std::env::set_var("COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL", v);
+            unsafe {
+                std::env::set_var("COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL", v);
+            }
         } else {
-            std::env::remove_var("COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL");
+            unsafe {
+                std::env::remove_var("COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL");
+            }
         }
         if let Some(v) = old_log {
-            std::env::set_var("COUCHDB_FILE_SYNC__LOGGING__LEVEL", v);
+            unsafe {
+                std::env::set_var("COUCHDB_FILE_SYNC__LOGGING__LEVEL", v);
+            }
         } else {
-            std::env::remove_var("COUCHDB_FILE_SYNC__LOGGING__LEVEL");
+            unsafe {
+                std::env::remove_var("COUCHDB_FILE_SYNC__LOGGING__LEVEL");
+            }
         }
     }
 
