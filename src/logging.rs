@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
 
-const ROTATION_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
+const ROTATION_INTERVAL: StdDuration = StdDuration::from_hours(24);
 
 /// State of the underlying log file.
 enum LogFileState {
@@ -24,6 +24,11 @@ pub struct AppLogWriter {
 }
 
 impl AppLogWriter {
+    /// Create a log writer for the given path and rotation policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the log file cannot be opened for appending.
     pub fn new(path: PathBuf, rotation: RotationConfig) -> io::Result<Self> {
         Self::new_for_date(path, rotation, Local::now().date_naive())
     }
@@ -124,10 +129,10 @@ fn rotated_log_path(path: &Path, date: NaiveDate) -> PathBuf {
         .and_then(|stem| stem.to_str())
         .unwrap_or("log");
     let extension = path.extension().and_then(|ext| ext.to_str());
-    let rotated_name = match extension {
-        Some(ext) => format!("{stem}-{}.{}", date.format("%Y-%m-%d"), ext),
-        None => format!("{stem}-{}", date.format("%Y-%m-%d")),
-    };
+    let rotated_name = extension.map_or_else(
+        || format!("{stem}-{}", date.format("%Y-%m-%d")),
+        |ext| format!("{stem}-{}.{}", date.format("%Y-%m-%d"), ext),
+    );
 
     match path.parent() {
         Some(parent) => parent.join(rotated_name),

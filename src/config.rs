@@ -7,7 +7,7 @@ use std::path::PathBuf;
 pub struct SyncPath {
     /// Local directory path
     pub local: PathBuf,
-    /// Remote path prefix in CouchDB (e.g., "notes/" or "obsidian/")
+    /// Remote path prefix in `CouchDB` (e.g., "notes/" or "obsidian/")
     #[serde(default)]
     pub remote: String,
 }
@@ -34,6 +34,10 @@ pub struct AppConfig {
 
 impl AppConfig {
     /// Load configuration from file and environment
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration cannot be loaded or deserialized.
     pub fn load(config_path: Option<PathBuf>) -> Result<Self> {
         let mut config_builder = config::Config::builder();
         if let Some(path) = config_path {
@@ -51,7 +55,7 @@ impl AppConfig {
 
         // Build and deserialize
         let config = config_builder.build()?;
-        let app_config: AppConfig = config.try_deserialize()?;
+        let app_config: Self = config.try_deserialize()?;
 
         Ok(app_config)
     }
@@ -73,6 +77,7 @@ pub fn default_user_config_dir() -> Option<PathBuf> {
     Some(config_home.join("couchdb-file-sync"))
 }
 
+#[must_use]
 pub fn default_user_config_file() -> Option<PathBuf> {
     default_user_config_dir().map(|dir| dir.join("couchdb-file-sync.yaml"))
 }
@@ -86,6 +91,7 @@ pub fn default_user_state_dir() -> Option<PathBuf> {
     Some(state_home.join("couchdb-file-sync"))
 }
 
+#[must_use]
 pub fn default_log_file() -> Option<PathBuf> {
     default_user_state_dir().map(|dir| dir.join("couchdb-file-sync.log"))
 }
@@ -115,13 +121,14 @@ pub enum LogLevel {
 
 impl LogLevel {
     /// Return the tracing-compatible filter string
-    pub fn as_filter_str(&self) -> &'static str {
+    #[must_use]
+    pub const fn as_filter_str(&self) -> &'static str {
         match self {
-            LogLevel::Trace => "trace",
-            LogLevel::Debug => "debug",
-            LogLevel::Info => "info",
-            LogLevel::Warn => "warn",
-            LogLevel::Error => "error",
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
         }
     }
 }
@@ -149,12 +156,13 @@ pub enum ConflictStrategy {
 
 impl ConflictStrategy {
     /// Return the serialized form (matches serde rename)
-    pub fn as_str(&self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
         match self {
-            ConflictStrategy::KeepBoth => "keep-both",
-            ConflictStrategy::KeepLocal => "keep-local",
-            ConflictStrategy::KeepRemote => "keep-remote",
-            ConflictStrategy::Skip => "skip",
+            Self::KeepBoth => "keep-both",
+            Self::KeepLocal => "keep-local",
+            Self::KeepRemote => "keep-remote",
+            Self::Skip => "skip",
         }
     }
 }
@@ -174,11 +182,12 @@ pub enum MatrixMessageType {
 
 impl MatrixMessageType {
     /// Return the Matrix wire format string
-    pub fn as_str(&self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
         match self {
-            MatrixMessageType::Notice => "m.notice",
-            MatrixMessageType::Text => "m.text",
-            MatrixMessageType::Emote => "m.emote",
+            Self::Notice => "m.notice",
+            Self::Text => "m.text",
+            Self::Emote => "m.emote",
         }
     }
 }
@@ -213,7 +222,7 @@ pub struct MatrixCredentials {
     pub room_id: String,
 }
 
-/// Unified CouchDB authentication
+/// Unified `CouchDB` authentication
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CouchDbAuth {
     pub username: String,
@@ -222,7 +231,7 @@ pub struct CouchDbAuth {
 
 // ─── Config structs ────────────────────────────────────────────────────────
 
-/// CouchDB connection configuration
+/// `CouchDB` connection configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CouchDbConfig {
     #[serde(default = "default_db_url")]
@@ -352,35 +361,35 @@ fn default_db_name() -> String {
     "couchdb_file_sync_files".to_string()
 }
 
-fn default_timeout() -> u64 {
+const fn default_timeout() -> u64 {
     30
 }
 
-fn default_retry() -> u32 {
+const fn default_retry() -> u32 {
     3
 }
 
-fn default_poll_interval() -> u64 {
+const fn default_poll_interval() -> u64 {
     60
 }
 
-fn default_debounce_ms() -> u64 {
+const fn default_debounce_ms() -> u64 {
     500
 }
 
-fn default_batch_size() -> usize {
+const fn default_batch_size() -> usize {
     100
 }
 
-fn default_max_file_size() -> u64 {
+const fn default_max_file_size() -> u64 {
     1024 * 1024 * 1024 // 1GB
 }
 
-fn default_parallel() -> bool {
+const fn default_parallel() -> bool {
     true
 }
 
-fn default_max_parallel() -> usize {
+const fn default_max_parallel() -> usize {
     4
 }
 
@@ -653,9 +662,9 @@ mod tests {
     #[test]
     fn test_sync_path_default_remote() {
         // When remote is not serialized, it should default to empty string
-        let yaml = r#"
+        let yaml = r"
 local: /home/user/docs
-"#;
+";
         let sync_path: SyncPath = serde_norway::from_str(yaml).unwrap();
         assert_eq!(sync_path.local, PathBuf::from("/home/user/docs"));
         assert_eq!(

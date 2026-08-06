@@ -14,28 +14,30 @@ pub enum DocType {
     Leaf,
 }
 
-/// Non-empty CouchDB revision newtype
+/// Non-empty `CouchDB` revision newtype
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CouchRev(String);
 
 impl CouchRev {
-    /// The default initial revision for newly created CouchDB documents.
+    /// The default initial revision for newly created `CouchDB` documents.
     ///
     /// This literal is non-empty, so it is always a valid `CouchRev`.
     /// Construct it via [`CouchRev::default`] so call sites never need the
     /// panic-prone `CouchRev::new(Self::DEFAULT_REV).unwrap()` pattern.
     pub const DEFAULT_REV: &str = "1-";
 
-    /// Create a new CouchRev. Returns None if the revision string is empty.
+    /// Create a new `CouchRev`. Returns None if the revision string is empty.
+    #[must_use]
     pub fn new(rev: &str) -> Option<Self> {
         if rev.is_empty() {
             None
         } else {
-            Some(CouchRev(rev.to_string()))
+            Some(Self(rev.to_string()))
         }
     }
 
     /// Return the revision string.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -45,7 +47,7 @@ impl Default for CouchRev {
     /// The single validated default revision, constructed directly from the
     /// known-valid `DEFAULT_REV` literal so this cannot panic.
     fn default() -> Self {
-        CouchRev(Self::DEFAULT_REV.to_string())
+        Self(Self::DEFAULT_REV.to_string())
     }
 }
 
@@ -73,7 +75,7 @@ impl rusqlite::types::ToSql for CouchRev {
 impl rusqlite::types::FromSql for CouchRev {
     fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
         value.as_str().and_then(|s| {
-            CouchRev::new(s)
+            Self::new(s)
                 .ok_or_else(|| rusqlite::types::FromSqlError::Other(Box::new(std::fmt::Error)))
         })
     }
@@ -84,20 +86,24 @@ impl rusqlite::types::FromSql for CouchRev {
 pub struct TimestampMillis(u64);
 
 impl TimestampMillis {
-    pub fn new(ms: u64) -> Self {
-        TimestampMillis(ms)
+    #[must_use]
+    pub const fn new(ms: u64) -> Self {
+        Self(ms)
     }
 
-    pub fn as_u64(&self) -> u64 {
+    #[must_use]
+    pub const fn as_u64(&self) -> u64 {
         self.0
     }
 
+    #[must_use]
     pub fn now() -> Self {
-        TimestampMillis(chrono::Utc::now().timestamp_millis() as u64)
+        Self(u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0))
     }
 
     pub fn to_datetime(&self) -> DateTime<Utc> {
-        DateTime::from_timestamp_millis(self.0 as i64).unwrap_or_else(Utc::now)
+        DateTime::from_timestamp_millis(i64::try_from(self.0).unwrap_or(i64::MAX))
+            .unwrap_or_else(Utc::now)
     }
 }
 
@@ -107,7 +113,7 @@ impl fmt::Display for TimestampMillis {
     }
 }
 
-/// File metadata stored in CouchDB (matches Obsidian LiveSync format)
+/// File metadata stored in `CouchDB` (matches Obsidian `LiveSync` format)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileDoc {
     #[serde(rename = "_id")]
@@ -138,6 +144,7 @@ pub struct FileDoc {
 }
 
 impl FileDoc {
+    #[must_use]
     pub fn new(path: String, _hash: String, size: u64) -> Self {
         let now = TimestampMillis::now();
         Self {
@@ -154,12 +161,14 @@ impl FileDoc {
     }
 
     /// Check if this is a file document (not a chunk)
+    #[must_use]
     pub fn is_file(&self) -> bool {
         // Files have type "plain" and IDs that don't start with "h:"
         matches!(self.doc_type, DocType::Plain) || !self.id.starts_with("h:")
     }
 
-    /// Get modification time as DateTime
+    /// Get modification time as `DateTime`
+    #[must_use]
     pub fn modified_at(&self) -> DateTime<Utc> {
         self.mtime.to_datetime()
     }
@@ -198,8 +207,8 @@ impl TypedCouchDocument for FileDoc {
     }
 
     fn merge_ids(&mut self, other: &Self) {
-        self.id = other.id.clone();
-        self.rev = other.rev.clone();
+        self.id.clone_from(&other.id);
+        self.rev.clone_from(&other.rev);
     }
 }
 
@@ -215,6 +224,7 @@ pub struct FileState {
 }
 
 impl FileState {
+    #[must_use]
     pub fn new(path: String, hash: String, size: u64, modified_at: DateTime<Utc>) -> Self {
         Self {
             path,
@@ -227,7 +237,7 @@ impl FileState {
     }
 }
 
-/// Remote file state from CouchDB
+/// Remote file state from `CouchDB`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteState {
     pub hash: String,
@@ -284,7 +294,7 @@ mod tests {
         assert!(doc.rev.is_none());
         assert!(doc.children.is_empty());
         // ctime and mtime should be set to approximately now
-        let now_ms = Utc::now().timestamp_millis() as u64;
+        let now_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0);
         assert!(doc.ctime.as_u64() > 0 && (now_ms - doc.ctime.as_u64()) < 5000);
         assert!(doc.mtime.as_u64() > 0 && (now_ms - doc.mtime.as_u64()) < 5000);
     }
@@ -339,7 +349,7 @@ mod tests {
 
     #[test]
     fn test_file_doc_modified_at() {
-        let mtime_ms: u64 = 1722153600000; // 2024-07-28
+        let mtime_ms: u64 = 1_722_153_600_000; // 2024-07-28
         let doc = FileDoc {
             id: "/path/to/file.txt".into(),
             rev: None,
@@ -352,7 +362,10 @@ mod tests {
             deleted: false,
         };
         let modified = doc.modified_at();
-        assert_eq!(modified.timestamp_millis() as u64, mtime_ms);
+        assert_eq!(
+            u64::try_from(modified.timestamp_millis()).unwrap_or(0),
+            mtime_ms
+        );
     }
 
     #[test]
@@ -371,7 +384,7 @@ mod tests {
 
     #[test]
     fn test_remote_state_from_file_doc() {
-        let mtime_ms = 1722153600000u64;
+        let mtime_ms = 1_722_153_600_000u64;
         let doc = FileDoc {
             id: "/remote/path.txt".into(),
             rev: Some("1-abc123".into()),

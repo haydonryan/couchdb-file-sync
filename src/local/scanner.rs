@@ -47,6 +47,8 @@ pub struct Scanner {
 
 impl Scanner {
     /// Create a new scanner for the given root directory
+    #[must_use]
+    #[cfg_attr(not(test), allow(clippy::missing_const_for_fn))]
     pub fn new(root_dir: SyncDirPath, ignore_matcher: IgnoreMatcher) -> Self {
         Self {
             root_dir,
@@ -61,6 +63,10 @@ impl Scanner {
     /// The blocking walkdir/hash work runs on tokio's blocking thread pool via
     /// [`tokio::task::spawn_blocking`] so the async executor is never stalled by
     /// the scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blocking scan task fails.
     pub async fn full_scan(&self) -> Result<Vec<FileState>> {
         self.full_scan_with_stored(Arc::new(Vec::new())).await
     }
@@ -74,17 +80,21 @@ impl Scanner {
     ///
     /// `stored_states` is shared with the blocking task through an [`Arc`] so
     /// the (potentially large) state table is never copied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blocking scan task fails.
     pub async fn full_scan_with_stored(
         &self,
         stored_states: Arc<Vec<FileState>>,
     ) -> Result<Vec<FileState>> {
         let scanner = self.clone();
-        tokio::task::spawn_blocking(move || scanner.scan_blocking(&stored_states)).await?
+        Ok(tokio::task::spawn_blocking(move || scanner.scan_blocking(&stored_states)).await?)
     }
 
     /// Walk the directory tree and hash every file using blocking filesystem
     /// calls. Called on a blocking thread pool by [`Self::full_scan`].
-    fn scan_blocking(&self, stored_states: &[FileState]) -> Result<Vec<FileState>> {
+    fn scan_blocking(&self, stored_states: &[FileState]) -> Vec<FileState> {
         let mut states = Vec::new();
         // Index stored states by relative path for O(1) reuse lookups. Keys are
         // borrowed, so no path/hash strings are copied.
@@ -108,9 +118,8 @@ impl Scanner {
             }
 
             // Check ignore patterns
-            let relative_path = match path.strip_prefix(self.root_dir.as_path()) {
-                Ok(p) => p,
-                Err(_) => continue,
+            let Ok(relative_path) = path.strip_prefix(self.root_dir.as_path()) else {
+                continue;
             };
 
             if self.ignore_matcher.should_ignore(relative_path) {
@@ -134,7 +143,7 @@ impl Scanner {
             }
         }
 
-        Ok(states)
+        states
     }
 
     /// Scan a single file, always computing the SHA-256 hash.
@@ -142,6 +151,10 @@ impl Scanner {
     /// Used by the watcher quick-scan path ([`Self::scan_single`]) where no
     /// stored-state shortcut applies; behavior is identical to
     /// [`Self::scan_file_with_stored`] with no stored state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or hashed.
     pub fn scan_file(&self, path: &Path) -> Result<FileState> {
         self.scan_file_with_stored(path, None)
     }
@@ -152,6 +165,11 @@ impl Scanner {
     /// `stored` is the previously recorded state for this file, if any. When it
     /// is `None` (or the mtime/size shortcut does not apply) the SHA-256 hash is
     /// computed from the file content, preserving existing detection behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path cannot be resolved within the scan root or
+    /// the file cannot be read and hashed.
     pub fn scan_file_with_stored(
         &self,
         path: &Path,
@@ -167,9 +185,10 @@ impl Scanner {
         // path through a symlinked root, as in #2941) do we canonicalize and
         // re-derive the residual path with the canonical-with-lexical fallback
         // below.
-        let (resolved_path, relative_path) = match path.strip_prefix(self.root_dir.as_path()) {
-            Ok(rel) => (path.to_path_buf(), rel.to_path_buf()),
-            Err(_) => {
+        let (resolved_path, relative_path) =
+            if let Ok(rel) = path.strip_prefix(self.root_dir.as_path()) {
+                (path.to_path_buf(), rel.to_path_buf())
+            } else {
                 // SyncDirPath::new() canonicalizes the scan root at
                 // construction. On macOS, temp/sync roots under /var/folders
                 // are symlinks to their real location under /private/var/
@@ -189,8 +208,7 @@ impl Scanner {
                     .strip_prefix(self.root_dir.as_path())?
                     .to_path_buf();
                 (resolved, relative)
-            }
-        };
+            };
         let path_str = relative_path.to_string_lossy().to_string();
 
         // Get modification time and size from the same metadata the hash
@@ -214,17 +232,16 @@ impl Scanner {
             _ => None,
         };
 
-        let hash = match reuse_hash {
-            Some(hash) => hash,
-            None => {
-                #[cfg(test)]
-                self.hash_computations
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // Compute the hash from the same resolved path as the
-                // relative-path derivation so hashing and residual derivation
-                // stay consistent.
-                compute_file_hash(&resolved_path)?
-            }
+        let hash = if let Some(hash) = reuse_hash {
+            hash
+        } else {
+            #[cfg(test)]
+            self.hash_computations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Compute the hash from the same resolved path as the
+            // relative-path derivation so hashing and residual derivation
+            // stay consistent.
+            compute_file_hash(&resolved_path)?
         };
 
         Ok(FileState {
@@ -240,6 +257,7 @@ impl Scanner {
     /// Number of file hashes computed by this scanner since it was created
     /// (test-only).
     #[cfg(test)]
+    #[must_use]
     pub fn hash_computations(&self) -> u64 {
         self.hash_computations
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -309,7 +327,12 @@ impl Scanner {
         changes
     }
 
-    /// Quick scan for a specific path
+    /// Quick scan for a single file by relative path, returning `None` if it
+    /// does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file exists but cannot be read or hashed.
     pub fn scan_single(&self, relative_path: &Path) -> Result<Option<FileState>> {
         let full_path = self.root_dir.as_path().join(relative_path);
 
@@ -330,6 +353,11 @@ impl Scanner {
 }
 
 /// Compute SHA-256 hash of a file
+/// Compute the SHA-256 hash of a file, returning it as a lowercase hex string.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened or read.
 pub fn compute_file_hash(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -346,6 +374,7 @@ pub fn compute_file_hash(path: &Path) -> Result<String> {
 }
 
 /// Compute hash from bytes
+#[must_use]
 pub fn compute_bytes_hash(bytes: &[u8]) -> String {
     let result = Sha256::digest(bytes);
     hex::encode(result)
@@ -413,11 +442,11 @@ mod tests {
 
         // Place the mtime far enough in the past that the file is not racily
         // clean, so the mtime+size shortcut is eligible.
-        let old_mtime = SystemTime::now() - Duration::from_secs(3600);
+        let old_mtime = SystemTime::now() - Duration::from_hours(1);
         set_mtime(&file_path, old_mtime);
 
         let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
 
@@ -452,11 +481,11 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("edit.txt");
         std::fs::write(&file_path, b"AAAA").unwrap();
-        let old_mtime = SystemTime::now() - Duration::from_secs(3600);
+        let old_mtime = SystemTime::now() - Duration::from_hours(1);
         set_mtime(&file_path, old_mtime);
 
         let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
 
@@ -494,11 +523,11 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("edit.txt");
         std::fs::write(&file_path, b"AAAA").unwrap();
-        let old_mtime = SystemTime::now() - Duration::from_secs(3600);
+        let old_mtime = SystemTime::now() - Duration::from_hours(1);
         set_mtime(&file_path, old_mtime);
 
         let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
 
@@ -545,7 +574,7 @@ mod tests {
         set_mtime(&file_path, racy_mtime);
 
         let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
 
@@ -583,13 +612,13 @@ mod tests {
         assert_eq!(changes[0].change_type(), ChangeType::Modified);
     }
 
-    /// full_scan_with_stored over an unchanged tree must reuse every stored
-    /// hash (zero file re-reads) while producing the same states as full_scan.
+    /// `full_scan_with_stored` over an unchanged tree must reuse every stored
+    /// hash (zero file re-reads) while producing the same states as `full_scan`.
     #[tokio::test]
     async fn test_full_scan_with_stored_reuses_all_hashes_on_unchanged_tree() {
         let temp_dir = TempDir::new().unwrap();
-        let root = SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap();
-        let old_mtime = SystemTime::now() - Duration::from_secs(3600);
+        let root = SyncDirPath::new(temp_dir.path()).unwrap();
+        let old_mtime = SystemTime::now() - Duration::from_hours(1);
         for (i, name) in ["a.txt", "b.txt", "c.txt"].iter().enumerate() {
             let file_path = root.as_path().join(name);
             std::fs::write(&file_path, format!("content {i}")).unwrap();
@@ -637,7 +666,7 @@ mod tests {
         std::fs::write(&file_path, b"Hello, world!").unwrap();
 
         let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
 
@@ -667,7 +696,7 @@ mod tests {
         std::fs::write(&file_path, b"nested content").unwrap();
 
         let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
         let state = scanner.scan_file(&file_path).unwrap();
@@ -699,7 +728,7 @@ mod tests {
         std::fs::write(&file_path, b"Hello, world!").unwrap();
 
         let scanner = Scanner::new(
-            SyncDirPath::new(base.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(base.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
 
@@ -715,7 +744,7 @@ mod tests {
     fn test_scan_file_returns_error_for_missing_file() {
         let temp_dir = TempDir::new().unwrap();
         let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
         let missing = temp_dir.path().join("does-not-exist.txt");
@@ -734,7 +763,7 @@ mod tests {
         std::fs::write(temp_dir.path().join("c.txt"), b"ccc").unwrap();
 
         let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
         let states = scanner.full_scan().await.unwrap();
@@ -754,7 +783,7 @@ mod tests {
         std::fs::write(temp_dir.path().join("nested").join("child.txt"), b"child").unwrap();
 
         let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
         let states = scanner.full_scan().await.unwrap();
@@ -772,7 +801,7 @@ mod tests {
         std::fs::write(temp_dir.path().join("file.txt"), b"data").unwrap();
 
         let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
         let states = scanner.full_scan().await.unwrap();
@@ -789,10 +818,7 @@ mod tests {
         std::fs::write(temp_dir.path().join("also_keep.rs"), b"rust").unwrap();
 
         let matcher = IgnoreMatcher::from_content("*.log");
-        let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
-            matcher,
-        );
+        let scanner = Scanner::new(SyncDirPath::new(temp_dir.path()).unwrap(), matcher);
         let states = scanner.full_scan().await.unwrap();
 
         let paths: Vec<&str> = states.iter().map(|s| s.path.as_str()).collect();
@@ -808,7 +834,7 @@ mod tests {
         std::fs::write(temp_dir.path().join(".hidden"), b"hidden").unwrap();
 
         let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
         let states = scanner.full_scan().await.unwrap();
@@ -822,7 +848,7 @@ mod tests {
     async fn test_full_scan_empty_directory() {
         let temp_dir = TempDir::new().unwrap();
         let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
         let states = scanner.full_scan().await.unwrap();
@@ -842,7 +868,7 @@ mod tests {
         std::fs::write(&file_path, b"scan me").unwrap();
 
         let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
         let result = scanner.scan_single(Path::new("target.txt")).unwrap();
@@ -857,7 +883,7 @@ mod tests {
     fn test_scan_single_returns_none_for_missing_file() {
         let temp_dir = TempDir::new().unwrap();
         let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
         let result = scanner.scan_single(Path::new("nonexistent.txt")).unwrap();
@@ -874,10 +900,7 @@ mod tests {
         std::fs::write(temp_dir.path().join("secret.log"), b"logs").unwrap();
 
         let matcher = IgnoreMatcher::from_content("*.log");
-        let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
-            matcher,
-        );
+        let scanner = Scanner::new(SyncDirPath::new(temp_dir.path()).unwrap(), matcher);
         let result = scanner.scan_single(Path::new("secret.log")).unwrap();
 
         assert!(
@@ -892,7 +915,7 @@ mod tests {
         std::fs::write(temp_dir.path().join(".hidden"), b"secret").unwrap();
 
         let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
         let result = scanner.scan_single(Path::new(".hidden")).unwrap();
@@ -909,7 +932,7 @@ mod tests {
         std::fs::create_dir_all(temp_dir.path().join("adir")).unwrap();
 
         let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
         let result = scanner.scan_single(Path::new("adir")).unwrap();
@@ -926,7 +949,7 @@ mod tests {
     fn test_detect_changes_no_changes() {
         let temp_dir = TempDir::new().unwrap();
         let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
 
@@ -943,7 +966,7 @@ mod tests {
     fn test_detect_changes_new_file_created() {
         let temp_dir = TempDir::new().unwrap();
         let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
 
@@ -968,7 +991,7 @@ mod tests {
     fn test_detect_changes_modified_file() {
         let temp_dir = TempDir::new().unwrap();
         let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
 
@@ -998,7 +1021,7 @@ mod tests {
     fn test_detect_changes_deleted_file() {
         let temp_dir = TempDir::new().unwrap();
         let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
 
@@ -1021,7 +1044,7 @@ mod tests {
     fn test_detect_changes_mixed_changes() {
         let temp_dir = TempDir::new().unwrap();
         let scanner = Scanner::new(
-            SyncDirPath::new(temp_dir.path().to_path_buf()).unwrap(),
+            SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
 
@@ -1043,7 +1066,10 @@ mod tests {
 
         let changes = scanner.detect_changes(&current, &stored);
         assert_eq!(changes.len(), 3);
-        let change_paths: Vec<&str> = changes.iter().map(|c| c.path()).collect();
+        let change_paths: Vec<&str> = changes
+            .iter()
+            .map(crate::models::change::Change::path)
+            .collect();
         assert!(change_paths.contains(&"create.txt"));
         assert!(change_paths.contains(&"modify.txt"));
         assert!(change_paths.contains(&"delete.txt"));

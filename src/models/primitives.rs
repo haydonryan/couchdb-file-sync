@@ -6,18 +6,20 @@ use std::str::FromStr;
 pub struct FileSize(u64);
 
 impl FileSize {
-    pub fn new(size: u64) -> Self {
-        FileSize(size)
+    #[must_use]
+    pub const fn new(size: u64) -> Self {
+        Self(size)
     }
 
-    pub fn as_u64(self) -> u64 {
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
         self.0
     }
 }
 
 impl From<u64> for FileSize {
     fn from(size: u64) -> Self {
-        FileSize(size)
+        Self(size)
     }
 }
 
@@ -36,26 +38,27 @@ impl Deref for FileSize {
 
 impl rusqlite::types::ToSql for FileSize {
     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-        let v: i64 = self.0 as i64;
+        let v: i64 = i64::try_from(self.0).unwrap_or(i64::MAX);
         Ok(rusqlite::types::ToSqlOutput::from(v))
     }
 }
 
 impl rusqlite::types::FromSql for FileSize {
     fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
-        i64::column_result(value).map(|v| FileSize(v as u64))
+        i64::column_result(value).map(|v| Self(u64::try_from(v).unwrap_or(0)))
     }
 }
 
-/// A CouchDB database name.
+/// A `CouchDB` database name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseName(String);
 
 impl DatabaseName {
     pub fn new(name: impl Into<String>) -> Self {
-        DatabaseName(name.into())
+        Self(name.into())
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -77,11 +80,11 @@ impl Deref for DatabaseName {
 impl FromStr for DatabaseName {
     type Err = std::convert::Infallible;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(DatabaseName(s.to_string()))
+        Ok(Self(s.to_string()))
     }
 }
 
-/// A remote path prefix for CouchDB documents.
+/// A remote path prefix for `CouchDB` documents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemotePath(String);
 
@@ -92,9 +95,10 @@ impl RemotePath {
         if !p.is_empty() && !p.ends_with('/') {
             p.push('/');
         }
-        RemotePath(p)
+        Self(p)
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -118,18 +122,20 @@ impl Deref for RemotePath {
 pub struct TouchBucket(i64);
 
 impl TouchBucket {
-    pub fn new(bucket: i64) -> Self {
-        TouchBucket(bucket)
+    #[must_use]
+    pub const fn new(bucket: i64) -> Self {
+        Self(bucket)
     }
 
-    pub fn as_i64(self) -> i64 {
+    #[must_use]
+    pub const fn as_i64(self) -> i64 {
         self.0
     }
 }
 
 impl From<i64> for TouchBucket {
     fn from(v: i64) -> Self {
-        TouchBucket(v)
+        Self(v)
     }
 }
 
@@ -138,11 +144,13 @@ impl From<i64> for TouchBucket {
 pub struct UploadCount(pub usize);
 
 impl UploadCount {
-    pub fn new(count: usize) -> Self {
-        UploadCount(count)
+    #[must_use]
+    pub const fn new(count: usize) -> Self {
+        Self(count)
     }
 
-    pub fn as_usize(self) -> usize {
+    #[must_use]
+    pub const fn as_usize(self) -> usize {
         self.0
     }
 }
@@ -158,11 +166,13 @@ impl std::fmt::Display for UploadCount {
 pub struct DownloadCount(pub usize);
 
 impl DownloadCount {
-    pub fn new(count: usize) -> Self {
-        DownloadCount(count)
+    #[must_use]
+    pub const fn new(count: usize) -> Self {
+        Self(count)
     }
 
-    pub fn as_usize(self) -> usize {
+    #[must_use]
+    pub const fn as_usize(self) -> usize {
         self.0
     }
 }
@@ -181,8 +191,9 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
-    pub fn new(last_seq: String, last_sync_at: chrono::DateTime<chrono::Utc>) -> Self {
-        Checkpoint {
+    #[must_use]
+    pub const fn new(last_seq: String, last_sync_at: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
             last_seq,
             last_sync_at,
         }

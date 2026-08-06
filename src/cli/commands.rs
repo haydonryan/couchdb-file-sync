@@ -27,9 +27,14 @@ use tracing::{error, info, warn};
 const EMBEDDED_CONFIG_TEMPLATE: &str = include_str!("../../couchdb-file-sync.yaml.example");
 const SYSTEMD_UNIT_NAME: &str = "couchdb-file-sync.service";
 
-/// Initialize a new sync directory
-pub async fn init(
-    path: PathBuf,
+/// Initialize a new sync directory.
+///
+/// # Errors
+///
+/// Returns an error if the embedded config template cannot be read or the
+/// initial ignore file cannot be written.
+pub fn init(
+    path: &Path,
     _db_url: Option<String>,
     _db_name: Option<String>,
     path_configured: bool,
@@ -51,7 +56,7 @@ pub async fn init(
 
     // Create directory if it doesn't exist
     if !path.exists() {
-        std::fs::create_dir_all(&path)?;
+        std::fs::create_dir_all(path)?;
     }
 
     // Create .couchdb-file-sync subdirectory for state
@@ -61,7 +66,7 @@ pub async fn init(
     // Create .sync-ignore if it doesn't exist
     let sync_ignore = path.join(".sync-ignore");
     if !sync_ignore.exists() {
-        let default_ignore = r#"# CouchDB File Sync ignore patterns
+        let default_ignore = r"# CouchDB File Sync ignore patterns
 # Add files/directories to ignore (gitignore-style syntax)
 
 # CouchDB File Sync internal files
@@ -91,7 +96,7 @@ Thumbs.db
 # Dependencies
 node_modules/
 target/
-"#;
+";
         std::fs::write(&sync_ignore, default_ignore)?;
     }
 
@@ -115,6 +120,13 @@ target/
     Ok(())
 }
 
+/// Install a user-scoped systemd service for this binary.
+///
+/// # Errors
+///
+/// Returns an error if the install paths cannot be detected, directories or
+/// the binary cannot be written, the config file cannot be ensured, the
+/// service file cannot be written, or `systemctl --user` operations fail.
 pub fn install_user_service() -> Result<()> {
     let paths = InstallPaths::detect()?;
 
@@ -141,11 +153,17 @@ pub fn install_user_service() -> Result<()> {
         }
     }
     println!("✓ User service: {}", paths.service_file.display());
-    println!("✓ Enabled and started {}", SYSTEMD_UNIT_NAME);
+    println!("✓ Enabled and started {SYSTEMD_UNIT_NAME}");
 
     Ok(())
 }
 
+/// Remove the user-scoped systemd service for this binary.
+///
+/// # Errors
+///
+/// Returns an error if the service cannot be stopped/disabled, files cannot
+/// be removed, or `systemctl --user` operations fail.
 pub fn uninstall_user_service() -> Result<()> {
     let paths = InstallPaths::detect()?;
 
@@ -259,22 +277,16 @@ fn run_systemctl_user_ignore_missing(args: &[&str]) -> Result<()> {
     let missing_status = Command::new("systemctl")
         .args(["--user", "status", SYSTEMD_UNIT_NAME])
         .status()
-        .with_context(|| {
-            format!(
-                "Failed to run systemctl --user status {}",
-                SYSTEMD_UNIT_NAME
-            )
-        })?;
+        .with_context(|| format!("Failed to run systemctl --user status {SYSTEMD_UNIT_NAME}"))?;
 
-    if !missing_status.success() {
-        Ok(())
-    } else {
+    if missing_status.success() {
         anyhow::bail!(
             "systemctl --user {} exited with status {}",
             args.join(" "),
             status
         );
     }
+    Ok(())
 }
 
 fn render_systemd_service(paths: &InstallPaths) -> String {
@@ -401,7 +413,7 @@ impl InstallPaths {
 /// contextual, user-facing error instead of panicking when the path is empty
 /// or cannot be resolved (e.g. `sync ""`).
 fn resolve_sync_dir(path: &Path) -> Result<SyncDirPath> {
-    SyncDirPath::new(path.to_path_buf())
+    SyncDirPath::new(path)
         .with_context(|| format!("cannot resolve sync directory '{}'", path.display()))
 }
 
@@ -409,8 +421,13 @@ fn resolve_sync_dir(path: &Path) -> Result<SyncDirPath> {
 ///
 /// When `dry_run` is true the full sync pipeline (triage, upload/download/
 /// delete detection, and conflict identification) is walked through without
-/// writing anything to CouchDB, the local filesystem, or the state DB, and a
+/// writing anything to `CouchDB`, the local filesystem, or the state DB, and a
 /// summary of what would happen is printed instead.
+///
+/// # Errors
+///
+/// Returns an error if the local state DB cannot be opened, the `CouchDB`
+/// connection cannot be established, or the sync pipeline fails.
 pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<SyncReport> {
     info!("Running sync in: {}", path.display());
 
@@ -463,6 +480,11 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
 }
 
 /// Rebuild the remote scope from the local filesystem.
+///
+/// # Errors
+///
+/// Returns an error if the local state DB cannot be opened, the `CouchDB`
+/// connection cannot be established, or the rebuild fails.
 pub async fn rebuild_remote(path: PathBuf, config: AppConfig) -> Result<SyncReport> {
     info!("Rebuilding remote from local in: {}", path.display());
 
@@ -489,6 +511,11 @@ pub async fn rebuild_remote(path: PathBuf, config: AppConfig) -> Result<SyncRepo
 }
 
 /// Rebuild the local filesystem from the remote scope.
+///
+/// # Errors
+///
+/// Returns an error if the local state DB cannot be opened, the `CouchDB`
+/// connection cannot be established, or the rebuild fails.
 pub async fn rebuild_local(path: PathBuf, config: AppConfig) -> Result<SyncReport> {
     info!("Rebuilding local from remote in: {}", path.display());
 
@@ -515,8 +542,8 @@ pub async fn rebuild_local(path: PathBuf, config: AppConfig) -> Result<SyncRepor
 }
 
 /// Send Telegram notifications for any unnotified conflicts
-/// If session_notified is provided, only notify about conflicts not in that set (daemon mode)
-/// If session_notified is None, notify about all conflicts not marked as notified in DB (one-time sync)
+/// If `session_notified` is provided, only notify about conflicts not in that set (daemon mode)
+/// If `session_notified` is None, notify about all conflicts not marked as notified in DB (one-time sync)
 async fn notify_conflicts_telegram(
     config: &AppConfig,
     db_path: &Path,
@@ -556,19 +583,19 @@ async fn notify_conflicts_telegram(
     };
 
     // Filter to only new conflicts based on mode
-    let new_conflicts: Vec<_> = match &session_notified {
-        Some(notified) => {
+    let new_conflicts: Vec<_> = session_notified.as_ref().map_or_else(
+        || {
+            // One-time sync: only conflicts not marked notified in DB
+            conflicts.iter().filter(|c| !c.is_notified()).collect()
+        },
+        |notified_paths| {
             // Daemon mode: only conflicts not notified this session
             conflicts
                 .iter()
-                .filter(|c| !notified.contains(&c.path))
+                .filter(|c| !notified_paths.contains(&c.path))
                 .collect()
-        }
-        None => {
-            // One-time sync: only conflicts not marked notified in DB
-            conflicts.iter().filter(|c| !c.is_notified()).collect()
-        }
-    };
+        },
+    );
 
     if new_conflicts.is_empty() {
         return;
@@ -579,7 +606,7 @@ async fn notify_conflicts_telegram(
         .notify_new_conflicts(&new_conflicts, &sync_dir_str)
         .await
     {
-        Ok(_) => {
+        Ok(()) => {
             info!(
                 "Sent Telegram notification for {} new conflict(s)",
                 new_conflicts.len()
@@ -626,7 +653,7 @@ fn format_sync_error_summary(errors: &[String]) -> String {
     let mut lines = Vec::new();
 
     for error in errors.iter().take(max_errors) {
-        lines.push(format!("• {}", error));
+        lines.push(format!("• {error}"));
     }
 
     if errors.len() > max_errors {
@@ -641,15 +668,14 @@ async fn notify_sync_error_telegram(
     sync_dir: Option<&Path>,
     error_message: &str,
 ) {
-    let notifier = match telegram_error_notifier(config) {
-        Some(notifier) => notifier,
-        None => return,
+    let Some(notifier) = telegram_error_notifier(config) else {
+        return;
     };
 
-    let message = match sync_dir {
-        Some(path) => format!("Sync path: {}\n{}", path.display(), error_message),
-        None => error_message.to_string(),
-    };
+    let message = sync_dir.map_or_else(
+        || error_message.to_string(),
+        |path| format!("Sync path: {}\n{}", path.display(), error_message),
+    );
 
     if let Err(e) = notifier.notify_error(&message).await {
         warn!("Failed to send Telegram error notification: {}", e);
@@ -694,8 +720,8 @@ fn matrix_error_notifier(config: &AppConfig) -> Option<MatrixNotifier> {
 }
 
 /// Send Matrix notifications for any unnotified conflicts
-/// If session_notified is provided, only notify about conflicts not in that set (daemon mode)
-/// If session_notified is None, notify about all conflicts not marked as notified in DB (one-time sync)
+/// If `session_notified` is provided, only notify about conflicts not in that set (daemon mode)
+/// If `session_notified` is None, notify about all conflicts not marked as notified in DB (one-time sync)
 async fn notify_conflicts_matrix(
     config: &AppConfig,
     db_path: &Path,
@@ -753,19 +779,19 @@ async fn notify_conflicts_matrix(
     };
 
     // Filter to only new conflicts based on mode
-    let new_conflicts: Vec<_> = match &session_notified {
-        Some(notified) => {
+    let new_conflicts: Vec<_> = session_notified.as_ref().map_or_else(
+        || {
+            // One-time sync: only conflicts not marked notified in DB
+            conflicts.iter().filter(|c| !c.is_notified()).collect()
+        },
+        |notified_paths| {
             // Daemon mode: only conflicts not notified this session
             conflicts
                 .iter()
-                .filter(|c| !notified.contains(&c.path))
+                .filter(|c| !notified_paths.contains(&c.path))
                 .collect()
-        }
-        None => {
-            // One-time sync: only conflicts not marked notified in DB
-            conflicts.iter().filter(|c| !c.is_notified()).collect()
-        }
-    };
+        },
+    );
 
     if new_conflicts.is_empty() {
         return;
@@ -776,7 +802,7 @@ async fn notify_conflicts_matrix(
         .notify_new_conflicts(&new_conflicts, &sync_dir_str)
         .await
     {
-        Ok(_) => {
+        Ok(()) => {
             info!(
                 "Sent Matrix notification for {} new conflict(s)",
                 new_conflicts.len()
@@ -805,20 +831,21 @@ async fn notify_sync_error_matrix(
     sync_dir: Option<&Path>,
     error_message: &str,
 ) {
-    let notifier = match matrix_error_notifier(config) {
-        Some(notifier) => notifier,
-        None => return,
+    let Some(notifier) = matrix_error_notifier(config) else {
+        return;
     };
 
-    let message = match sync_dir {
-        Some(path) => format!(
-            "Sync path: {}
+    let message = sync_dir.map_or_else(
+        || error_message.to_string(),
+        |path| {
+            format!(
+                "Sync path: {}
 {}",
-            path.display(),
-            error_message
-        ),
-        None => error_message.to_string(),
-    };
+                path.display(),
+                error_message
+            )
+        },
+    );
 
     if let Err(e) = notifier.notify_error(&message).await {
         warn!("Failed to send Matrix error notification: {}", e);
@@ -826,6 +853,13 @@ async fn notify_sync_error_matrix(
 }
 
 /// Run continuous sync daemon
+/// Run sync continuously on the given paths, either on a fixed interval or in
+/// live mode with a filesystem watcher and `CouchDB` changes feed.
+///
+/// # Errors
+///
+/// Returns an error if a sync cycle fails fatally or a notification cannot be
+/// sent.
 pub async fn daemon(
     paths: Vec<SyncPath>,
     config: AppConfig,
@@ -849,7 +883,10 @@ pub async fn daemon(
         let mut handles = Vec::new();
         for sync_path in paths {
             let mut path_config = config.clone();
-            path_config.couchdb.remote_path = sync_path.remote.clone();
+            path_config
+                .couchdb
+                .remote_path
+                .clone_from(&sync_path.remote);
             let local_path = sync_path.local.clone();
 
             handles.push(tokio::spawn(async move {
@@ -858,13 +895,13 @@ pub async fn daemon(
                     notify_sync_error_telegram(
                         &path_config,
                         Some(&local_path),
-                        &format!("Live sync error: {}", e),
+                        &format!("Live sync error: {e}"),
                     )
                     .await;
                     notify_sync_error_matrix(
                         &path_config,
                         Some(&local_path),
-                        &format!("Live sync error: {}", e),
+                        &format!("Live sync error: {e}"),
                     )
                     .await;
                 }
@@ -878,7 +915,7 @@ pub async fn daemon(
         return Ok(());
     }
 
-    println!("CouchDB File Sync daemon started (interval: {}s)", interval);
+    println!("CouchDB File Sync daemon started (interval: {interval}s)");
     println!("Syncing {} path(s): {}", paths.len(), path_list.join(", "));
     println!("Press Ctrl+C to stop");
 
@@ -892,7 +929,10 @@ pub async fn daemon(
 
         for sync_path in &paths {
             let mut path_config = config.clone();
-            path_config.couchdb.remote_path = sync_path.remote.clone();
+            path_config
+                .couchdb
+                .remote_path
+                .clone_from(&sync_path.remote);
 
             match daemon_sync(&sync_path.local, &path_config, &mut session_notified).await {
                 Ok(_) => {}
@@ -901,13 +941,13 @@ pub async fn daemon(
                     notify_sync_error_telegram(
                         &path_config,
                         Some(&sync_path.local),
-                        &format!("Sync error: {}", e),
+                        &format!("Sync error: {e}"),
                     )
                     .await;
                     notify_sync_error_matrix(
                         &path_config,
                         Some(&sync_path.local),
-                        &format!("Sync error: {}", e),
+                        &format!("Sync error: {e}"),
                     )
                     .await;
                 }
@@ -970,7 +1010,7 @@ struct TouchTracker {
 }
 
 impl TouchTracker {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             entries: Vec::new(),
         }
@@ -994,11 +1034,12 @@ impl TouchTracker {
         let millis = mtime
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() as i64;
-        millis / 5000
+            .as_millis();
+        i64::try_from(millis).unwrap_or(i64::MAX) / 5000
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
     info!("Starting live sync in: {}", path.display());
 
@@ -1026,12 +1067,11 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
         sync_dir.clone(),
         (*ignore_matcher).clone(),
     );
-    let initial_since: String = match engine.get_checkpoint().await? {
-        Some(cp) => cp.last_seq,
-        None => {
-            info!("No checkpoint found, starting changes feed from 'now'");
-            "now".to_string()
-        }
+    let initial_since: String = if let Some(cp) = engine.get_checkpoint().await? {
+        cp.last_seq
+    } else {
+        info!("No checkpoint found, starting changes feed from 'now'");
+        "now".to_string()
     };
 
     let (local_tx, mut local_rx) = mpsc::channel::<Change>(256);
@@ -1049,13 +1089,13 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
             notify_sync_error_telegram(
                 &watcher_config,
                 Some(&watcher_root),
-                &format!("Local watcher error: {}", e),
+                &format!("Local watcher error: {e}"),
             )
             .await;
             notify_sync_error_matrix(
                 &watcher_config,
                 Some(&watcher_root),
-                &format!("Local watcher error: {}", e),
+                &format!("Local watcher error: {e}"),
             )
             .await;
         }
@@ -1070,13 +1110,13 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
             notify_sync_error_telegram(
                 &remote_config_notify,
                 Some(&remote_root),
-                &format!("Remote changes feed error: {}", e),
+                &format!("Remote changes feed error: {e}"),
             )
             .await;
             notify_sync_error_matrix(
                 &remote_config_notify,
                 Some(&remote_root),
-                &format!("Remote changes feed error: {}", e),
+                &format!("Remote changes feed error: {e}"),
             )
             .await;
         }
@@ -1087,7 +1127,7 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
     loop {
         tokio::select! {
             Some(change) = local_rx.recv() => {
-                if let Err(e) = handle_local_change(&mut engine, &mut touched, &change).await {
+                if let Err(e) = handle_local_change(&mut engine, &touched, &change).await {
                     warn!("Live local change error for {}: {}", change.path(), e);
                     notify_sync_error_telegram(
                         &config,
@@ -1109,13 +1149,13 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
                     notify_sync_error_telegram(
                         &config,
                         Some(&path),
-                        &format!("Live remote change error: {}", e),
+                        &format!("Live remote change error: {e}"),
                     )
                     .await;
                     notify_sync_error_matrix(
                         &config,
                         Some(&path),
-                        &format!("Live remote change error: {}", e),
+                        &format!("Live remote change error: {e}"),
                     )
                     .await;
                 }
@@ -1175,7 +1215,7 @@ async fn run_remote_changes(
             Err(e) => {
                 if let Some(status) = e
                     .downcast_ref::<reqwest::Error>()
-                    .and_then(|err| err.status())
+                    .and_then(reqwest::Error::status)
                 {
                     if status == StatusCode::BAD_REQUEST {
                         warn!("Changes feed returned 400; resetting since to \"now\" and retrying");
@@ -1185,10 +1225,9 @@ async fn run_remote_changes(
                     }
                 }
                 error!("Changes feed error: {}", e);
-                notify_sync_error_telegram(&config, None, &format!("Changes feed error: {}", e))
+                notify_sync_error_telegram(&config, None, &format!("Changes feed error: {e}"))
                     .await;
-                notify_sync_error_matrix(&config, None, &format!("Changes feed error: {}", e))
-                    .await;
+                notify_sync_error_matrix(&config, None, &format!("Changes feed error: {e}")).await;
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
@@ -1197,7 +1236,7 @@ async fn run_remote_changes(
 
 async fn handle_local_change(
     engine: &mut SyncEngine,
-    touched: &mut TouchTracker,
+    touched: &TouchTracker,
     change: &Change,
 ) -> Result<()> {
     let mtime = local_mtime(engine.root_dir(), change.path()).await;
@@ -1254,34 +1293,34 @@ async fn handle_remote_change(
             let local_mtime_val = local_meta
                 .and_then(|meta| meta.modified().ok())
                 .unwrap_or_else(SystemTime::now);
-            let remote_mtime = change
-                .mtime()
-                .map(|dt| UNIX_EPOCH + Duration::from_millis(dt.timestamp_millis() as u64));
+            let remote_mtime = change.mtime().map(|dt| {
+                UNIX_EPOCH
+                    + Duration::from_millis(u64::try_from(dt.timestamp_millis()).unwrap_or(0))
+            });
 
-            let apply_remote = match remote_mtime {
-                Some(remote) => {
-                    if !local_exists {
-                        true
+            let apply_remote = remote_mtime.is_none_or(|remote| {
+                if local_exists {
+                    let local_ms = local_mtime_val
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+                    let remote_ms = remote
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+                    let local_ms = i64::try_from(local_ms).unwrap_or(i64::MAX);
+                    let remote_ms = i64::try_from(remote_ms).unwrap_or(i64::MAX);
+                    let diff = local_ms - remote_ms;
+                    let tolerance_ms = 1000;
+                    if diff.abs() <= tolerance_ms {
+                        false
                     } else {
-                        let local_ms = local_mtime_val
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as i64;
-                        let remote_ms = remote
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as i64;
-                        let diff = local_ms - remote_ms;
-                        let tolerance_ms = 1000;
-                        if diff.abs() <= tolerance_ms {
-                            false
-                        } else {
-                            diff < 0
-                        }
+                        diff < 0
                     }
+                } else {
+                    true
                 }
-                None => true,
-            };
+            });
 
             if apply_remote {
                 touched.mark(&local_rel, SystemTime::now());
@@ -1306,8 +1345,13 @@ async fn local_mtime(root: &Path, relative_path: &str) -> SystemTime {
 }
 
 /// List conflicts
-pub async fn conflicts(path: PathBuf, json: bool) -> Result<()> {
-    let db_path = state_db_path(&path);
+/// List conflicts for a sync directory.
+///
+/// # Errors
+///
+/// Returns an error if the local state DB cannot be opened or read.
+pub fn conflicts(path: &Path, json: bool) -> Result<()> {
+    let db_path = state_db_path(path);
     let local_db = LocalDb::open(&db_path)?;
 
     let conflicts = local_db.get_conflicts()?;
@@ -1339,6 +1383,12 @@ pub async fn conflicts(path: PathBuf, json: bool) -> Result<()> {
 }
 
 /// Resolve conflicts interactively
+/// Interactively resolve conflicts for a sync directory.
+///
+/// # Errors
+///
+/// Returns an error if the local state DB cannot be opened or a conflict
+/// cannot be resolved.
 pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
     let db_path = state_db_path(&path);
     let local_db = LocalDb::open(&db_path)?;
@@ -1392,7 +1442,7 @@ pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
         let local_content = match tokio::fs::read(&local_file_path).await {
             Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
             Err(e) => {
-                println!("Could not read local file: {}", e);
+                println!("Could not read local file: {e}");
                 String::new()
             }
         };
@@ -1401,7 +1451,7 @@ pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
         let remote_content = match engine.get_remote_content(&conflict.path).await {
             Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
             Err(e) => {
-                println!("Could not fetch remote file: {}", e);
+                println!("Could not fetch remote file: {e}");
                 String::new()
             }
         };
@@ -1467,12 +1517,7 @@ fn print_side_by_side_diff(local: &str, remote: &str) {
         match change.tag() {
             ChangeTag::Equal => {
                 let truncated = truncate_str(line, width);
-                println!(
-                    " {:<width$} │ {:<width$}",
-                    truncated,
-                    truncated,
-                    width = width
-                );
+                println!(" {truncated:<width$} │ {truncated:<width$}");
             }
             ChangeTag::Delete => {
                 // Line only in local (deleted from remote's perspective)
@@ -1515,8 +1560,13 @@ fn truncate_str(s: &str, max_width: usize) -> String {
 }
 
 /// Show sync status
-pub async fn status(path: PathBuf, json: bool, _config: &AppConfig) -> Result<()> {
-    let db_path = state_db_path(&path);
+/// Show sync status for a sync directory.
+///
+/// # Errors
+///
+/// Returns an error if the local state DB cannot be opened or read.
+pub fn status(path: &Path, json: bool, _config: &AppConfig) -> Result<()> {
+    let db_path = state_db_path(path);
     let local_db = LocalDb::open(&db_path)?;
 
     let file_states = local_db.get_all_file_states()?;
@@ -1524,9 +1574,9 @@ pub async fn status(path: PathBuf, json: bool, _config: &AppConfig) -> Result<()
     let checkpoint = local_db.get_checkpoint()?;
 
     // Count files by walking directory
-    let file_count = walkdir::WalkDir::new(&path)
+    let file_count = walkdir::WalkDir::new(path)
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|e| e.file_type().is_file())
         .count();
 
@@ -1543,7 +1593,7 @@ pub async fn status(path: PathBuf, json: bool, _config: &AppConfig) -> Result<()
         println!("CouchDB File Sync Status");
         println!("==============");
         println!("Sync directory: {}", path.display());
-        println!("Local files:    {}", file_count);
+        println!("Local files:    {file_count}");
         println!("Tracked files:  {}", file_states.len());
         println!("Pending conflicts: {}", conflicts.len());
 
@@ -1633,7 +1683,7 @@ fn print_sync_report(report: &SyncReport, dry_run: bool) {
         println!();
         println!("Errors:");
         for error in &report.errors {
-            println!("  • {}", error);
+            println!("  • {error}");
         }
     }
 }
@@ -1657,7 +1707,7 @@ mod tests {
             Err(e) => e,
         };
         // The error must be user-facing and contextual, not a panic message.
-        let msg = format!("{:#}", err);
+        let msg = format!("{err:#}");
         assert!(
             msg.contains("cannot resolve sync directory"),
             "expected contextual error, got: {msg}"
@@ -1745,10 +1795,10 @@ mod tests {
 
     #[test]
     fn test_format_sync_error_summary_multiple_within_limit() {
-        let errors: Vec<String> = (1..=5).map(|i| format!("error {}", i)).collect();
+        let errors: Vec<String> = (1..=5).map(|i| format!("error {i}")).collect();
         let result = format_sync_error_summary(&errors);
         let expected = (1..=5)
-            .map(|i| format!("• error {}", i))
+            .map(|i| format!("• error {i}"))
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(result, expected);
@@ -1756,7 +1806,7 @@ mod tests {
 
     #[test]
     fn test_format_sync_error_summary_truncation() {
-        let errors: Vec<String> = (1..=15).map(|i| format!("error {}", i)).collect();
+        let errors: Vec<String> = (1..=15).map(|i| format!("error {i}")).collect();
         let result = format_sync_error_summary(&errors);
         let lines: Vec<&str> = result.lines().collect();
         assert_eq!(lines.len(), 11);
@@ -1765,10 +1815,9 @@ mod tests {
 
     #[test]
     fn test_format_sync_error_summary_exactly_ten() {
-        let errors: Vec<String> = (1..=10).map(|i| format!("error {}", i)).collect();
+        let errors: Vec<String> = (1..=10).map(|i| format!("error {i}")).collect();
         let result = format_sync_error_summary(&errors);
-        let lines: Vec<&str> = result.lines().collect();
-        assert_eq!(lines.len(), 10);
+        assert_eq!(result.lines().count(), 10);
         assert!(!result.contains("...and"));
     }
 

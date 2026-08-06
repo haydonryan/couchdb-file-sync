@@ -14,7 +14,7 @@ use tracing::{debug, warn};
 #[cfg(not(test))]
 const RETRY_BASE_BACKOFF_MS: u64 = 250;
 
-/// CouchDB client wrapper
+/// `CouchDB` client wrapper
 pub struct CouchDb {
     client: Client,
     db: Database,
@@ -24,16 +24,16 @@ pub struct CouchDb {
     auth: Option<(String, String)>,
     /// Remote path prefix to sync (e.g., "notes/" or "obsidian/")
     remote_path: RemotePath,
-    /// Request timeout in seconds applied to all CouchDB HTTP operations.
+    /// Request timeout in seconds applied to all `CouchDB` HTTP operations.
     timeout_seconds: u64,
-    /// Maximum total attempts (including the initial one) for a CouchDB
+    /// Maximum total attempts (including the initial one) for a `CouchDB`
     /// operation before giving up on transient connectivity failures.
     retry_attempts: u32,
     /// Test-only canned responses used to exercise the sync pipeline without a
-    /// live CouchDB server. Only present in test builds.
+    /// live `CouchDB` server. Only present in test builds.
     #[cfg(test)]
     test_state: Option<CannedCouch>,
-    /// Test-only counter of CouchDB write attempts (save/delete/chunk ops).
+    /// Test-only counter of `CouchDB` write attempts (save/delete/chunk ops).
     /// Only present in test builds.
     #[cfg(test)]
     test_write_calls: std::sync::atomic::AtomicUsize,
@@ -43,7 +43,8 @@ pub struct CouchDb {
     test_backoff: Duration,
 }
 
-/// Test-only canned responses for the CouchDB client.
+/// Test-only canned responses for the `CouchDB` client.
+///
 /// When `test_state` is set, read methods return this data instead of hitting
 /// the network and write methods record a call instead of mutating anything.
 #[cfg(test)]
@@ -73,7 +74,7 @@ pub struct CannedCouch {
 }
 
 /// Test-only tracker of the maximum number of concurrent in-flight canned
-/// CouchDB operations, used to assert that the sync apply loops respect the
+/// `CouchDB` operations, used to assert that the sync apply loops respect the
 /// bounded-concurrency limit.
 #[cfg(test)]
 #[derive(Default)]
@@ -103,7 +104,7 @@ impl ConcurrencyProbe {
     }
 }
 
-/// Entry from a CouchDB changes feed
+/// Entry from a `CouchDB` changes feed
 #[derive(Debug, Clone)]
 pub struct ChangeFeedEntry {
     pub change: Change,
@@ -132,15 +133,20 @@ fn seq_to_string(value: &Value) -> String {
 }
 
 impl CouchDb {
-    /// Create a new CouchDB client.
+    /// Create a new `CouchDB` client.
     ///
-    /// `timeout_seconds` is applied as the request timeout for every CouchDB
+    /// `timeout_seconds` is applied as the request timeout for every `CouchDB`
     /// HTTP operation (both the direct reqwest client and the `couch_rs`
     /// client). `retry_attempts` caps the total number of attempts made for an
     /// operation when it fails with a transient connectivity error (see
     /// [`Self::retry_transient`]); the operation is attempted at most
     /// `retry_attempts` times in total, with exponential backoff between
     /// attempts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `couch_rs` client cannot be created or the
+    /// connection to `CouchDB` cannot be established.
     pub async fn new(
         url: &str,
         username: Option<&str>,
@@ -167,10 +173,10 @@ impl CouchDb {
         };
 
         let base = url.trim_end_matches('/');
-        let base_db_url = if base.ends_with(&format!("/{}", db_name)) {
+        let base_db_url = if base.ends_with(&format!("/{db_name}")) {
             base.to_string()
         } else {
-            format!("{}/{}", base, db_name)
+            format!("{base}/{db_name}")
         };
 
         Ok(Self {
@@ -199,10 +205,15 @@ impl CouchDb {
         Ok(info.update_seq)
     }
 
-    /// Create a CouchDb instance for testing without connecting to a real server.
+    /// Create a `CouchDb` instance for testing without connecting to a real server.
     /// Only fields needed for path conversion and sync metadata are populated.
-    /// Panics if any method requiring actual CouchDB access is called.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the structural `couch_rs` client cannot be created, and panics
+    /// if any method requiring actual `CouchDB` access is called.
     #[cfg(test)]
+    #[must_use]
     pub fn for_test(remote_path: &str) -> Self {
         let remote_path = RemotePath::new(remote_path);
         // Create a client and database handle without connecting.
@@ -238,6 +249,7 @@ impl CouchDb {
     /// write-call counter and do nothing, so tests can assert that a dry-run
     /// never issues any remote writes.
     #[cfg(test)]
+    #[must_use]
     pub fn for_test_with_canned(remote_path: &str, canned: CannedCouch) -> Self {
         let mut client = Self::for_test(remote_path);
         client.test_state = Some(canned);
@@ -246,12 +258,18 @@ impl CouchDb {
 
     /// Number of write attempts issued against this test client.
     #[cfg(test)]
+    #[must_use]
     pub fn test_write_calls(&self) -> usize {
         self.test_write_calls
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Fetch changes from CouchDB using the _changes feed (longpoll)
+    /// Fetch changes from `CouchDB` using the _changes feed (longpoll)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the changes feed request fails or the update
+    /// sequence cannot be fetched.
     pub async fn get_changes_feed(
         &self,
         since: &str,
@@ -296,9 +314,8 @@ impl CouchDb {
                 continue;
             }
 
-            let doc = match row.doc {
-                Some(doc) => doc,
-                None => continue,
+            let Some(doc) = row.doc else {
+                continue;
             };
 
             if !doc.is_file() {
@@ -326,6 +343,7 @@ impl CouchDb {
 
     /// Check if a path is within the configured remote path
     /// Check if a path is within the configured remote path
+    #[must_use]
     pub fn is_path_allowed(&self, path: &str) -> bool {
         if self.remote_path.is_empty() {
             true
@@ -336,18 +354,21 @@ impl CouchDb {
     }
 
     /// Get the normalized remote path prefix used for this sync scope.
+    #[must_use]
     pub fn remote_prefix(&self) -> &str {
         &self.remote_path
     }
 
-    /// Configured request timeout in seconds applied to CouchDB operations.
-    pub fn timeout_seconds(&self) -> u64 {
+    /// Configured request timeout in seconds applied to `CouchDB` operations.
+    #[must_use]
+    pub const fn timeout_seconds(&self) -> u64 {
         self.timeout_seconds
     }
 
-    /// Maximum total attempts (including the initial one) made for a CouchDB
+    /// Maximum total attempts (including the initial one) made for a `CouchDB`
     /// operation when it fails with a transient connectivity error.
-    pub fn retry_attempts(&self) -> u32 {
+    #[must_use]
+    pub const fn retry_attempts(&self) -> u32 {
         self.retry_attempts
     }
 
@@ -386,7 +407,8 @@ impl CouchDb {
 
     /// Delay to wait before the next retry attempt (pathological: real sleeps
     /// in production, a tiny fixed delay in test builds to keep tests fast).
-    fn backoff(&self, attempts: u32) -> Duration {
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    const fn backoff(&self, attempts: u32) -> Duration {
         #[cfg(test)]
         {
             let _ = attempts;
@@ -394,14 +416,13 @@ impl CouchDb {
         }
         #[cfg(not(test))]
         {
-            Duration::from_millis(
-                RETRY_BASE_BACKOFF_MS.saturating_mul(1u64 << (attempts - 1).min(6)),
-            )
+            let shift = if attempts >= 7 { 6 } else { attempts - 1 };
+            Duration::from_millis(RETRY_BASE_BACKOFF_MS.saturating_mul(1u64 << shift))
         }
     }
 
     /// Whether `err` represents a transient connectivity failure that is safe
-    /// to retry (connection refused/reset, timeouts, DNS failures, and CouchDB
+    /// to retry (connection refused/reset, timeouts, DNS failures, and `CouchDB`
     /// 429/5xx responses).
     fn is_transient<E: std::fmt::Display>(err: &E) -> bool {
         let lower = err.to_string().to_ascii_lowercase();
@@ -426,6 +447,7 @@ impl CouchDb {
     }
 
     /// Get the full remote path for a local file
+    #[must_use]
     pub fn get_remote_path(&self, local_path: &str) -> String {
         if self.remote_path.is_empty() {
             local_path.to_string()
@@ -436,6 +458,7 @@ impl CouchDb {
     }
 
     /// Get the local path from a remote path (strips the remote prefix)
+    #[must_use]
     pub fn get_local_path(&self, remote_path: &str) -> String {
         if self.remote_path.is_empty() {
             remote_path.to_string()
@@ -449,6 +472,11 @@ impl CouchDb {
     }
 
     /// Get a document by ID
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `CouchDB` request fails, or `Ok(None)` if the
+    /// document does not exist.
     pub async fn get_file(&self, path: &str) -> Result<Option<FileDoc>> {
         // Check if path is within allowed remote path
         if !self.is_path_allowed(path) {
@@ -475,6 +503,10 @@ impl CouchDb {
     }
 
     /// Save a document
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `CouchDB` request fails.
     pub async fn save_file(&self, doc: &mut FileDoc) -> Result<()> {
         #[cfg(test)]
         if let Some(state) = &self.test_state {
@@ -519,6 +551,10 @@ impl CouchDb {
     }
 
     /// Delete a document
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `CouchDB` request fails.
     pub async fn delete_file(&self, path: &str) -> Result<()> {
         #[cfg(test)]
         if self.test_state.is_some() {
@@ -537,6 +573,10 @@ impl CouchDb {
 
     /// Get all documents (files only - not chunks, including deleted)
     /// Filtered by the configured remote path
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `CouchDB` request fails.
     pub async fn get_all_files(&self) -> Result<Vec<FileDoc>> {
         let collection = self
             .retry_transient(|| self.db.get_all::<FileDoc>())
@@ -550,6 +590,11 @@ impl CouchDb {
 
     /// Get changes since the last checkpoint
     /// Returns remote files within the configured remote path
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `CouchDB` changes request or the update
+    /// sequence fetch fails.
     pub async fn get_changes(&self, since: Option<&str>) -> Result<(Vec<Change>, String)> {
         debug!("get_changes called with since = {:?}", since);
 
@@ -605,6 +650,11 @@ impl CouchDb {
     }
 
     /// Fetch remote file metadata (without downloading chunks)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `CouchDB` request fails, or `Ok(None)` if the
+    /// document does not exist.
     pub async fn fetch_metadata(&self, path: &str) -> Result<Option<FileDoc>> {
         #[cfg(test)]
         if let Some(state) = &self.test_state {
@@ -642,7 +692,11 @@ impl CouchDb {
         }
     }
 
-    /// Test connection to CouchDB
+    /// Test connection to `CouchDB`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection cannot be established.
     pub async fn ping(&self) -> Result<bool> {
         // Get all files (limit 1) to test connection
         match self.retry_transient(|| self.db.get_all::<FileDoc>()).await {
@@ -678,6 +732,10 @@ impl CouchDb {
     }
 
     /// Get file content by fetching and combining all chunks
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file document or any chunk cannot be fetched.
     pub async fn get_file_content(&self, path: &str) -> Result<Vec<u8>> {
         #[cfg(test)]
         if let Some(state) = &self.test_state {
@@ -695,9 +753,8 @@ impl CouchDb {
         }
 
         // First get the file document to find chunk IDs
-        let doc = match self.get_file(path).await? {
-            Some(d) => d,
-            None => anyhow::bail!("File not found: {}", path),
+        let Some(doc) = self.get_file(path).await? else {
+            anyhow::bail!("File not found: {path}");
         };
 
         if doc.children.is_empty() {
@@ -732,7 +789,7 @@ impl CouchDb {
         format!("h:{:x}{:x}", timestamp, rand::random::<u32>())
     }
 
-    /// Save a chunk document to CouchDB
+    /// Save a chunk document to `CouchDB`
     async fn save_chunk(&self, chunk: &ChunkDoc) -> Result<()> {
         let url = format!("{}/{}", self.base_db_url, chunk.id);
 
@@ -765,6 +822,10 @@ impl CouchDb {
     }
 
     /// Upload file content as chunks and return the chunk IDs
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a chunk cannot be saved to `CouchDB`.
     pub async fn upload_file_content(&self, content: &[u8]) -> Result<Vec<String>> {
         #[cfg(test)]
         if self.test_state.is_some() {
@@ -791,6 +852,10 @@ impl CouchDb {
     }
 
     /// Delete old chunks that are no longer referenced
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a chunk cannot be deleted from `CouchDB`.
     pub async fn delete_chunks(&self, chunk_ids: &[String]) -> Result<()> {
         #[cfg(test)]
         if self.test_state.is_some() {
@@ -819,15 +884,12 @@ impl CouchDb {
                                 chunk_id, status, body
                             );
                             anyhow::bail!(
-                                "Failed to delete old chunk {}: {} - {}",
-                                chunk_id,
-                                status,
-                                body
+                                "Failed to delete old chunk {chunk_id}: {status} - {body}"
                             );
                         }
                         Err(e) => {
                             warn!("Failed to delete old chunk {}: {}", chunk_id, e);
-                            anyhow::bail!("Failed to delete old chunk {}: {}", chunk_id, e);
+                            anyhow::bail!("Failed to delete old chunk {chunk_id}: {e}");
                         }
                     }
                 }
@@ -837,18 +899,19 @@ impl CouchDb {
     }
 }
 
-/// Helper to create CouchDB URL from components
+/// Helper to create `CouchDB` URL from components
+#[must_use]
 pub fn build_couch_url(host: &str, port: u16) -> String {
-    format!("http://{}:{}", host, port)
+    format!("http://{host}:{port}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Helper to create a CouchDb instance for testing without a real CouchDB.
-    /// The methods under test (is_path_allowed, get_remote_path, get_local_path)
-    /// only depend on self.remote_path, so we use dummy couch_rs values.
+    /// Helper to create a `CouchDb` instance for testing without a real `CouchDB`.
+    /// The methods under test (`is_path_allowed`, `get_remote_path`, `get_local_path`)
+    /// only depend on `self.remote_path`, so we use dummy `couch_rs` values.
     fn test_couchdb(remote_path: &str) -> CouchDb {
         let client = Client::new_no_auth("http://localhost:15984").unwrap();
         let db = Database::new("test_db".to_string(), client.clone());
@@ -1014,7 +1077,7 @@ mod tests {
         assert_eq!(seq_to_string(&value), "[\"seq1\",\"seq2\"]");
     }
 
-    /// Test that get_file returns Ok(None) for paths outside the allowed prefix
+    /// Test that `get_file` returns Ok(None) for paths outside the allowed prefix
     #[tokio::test]
     async fn get_file_returns_none_for_disallowed_path() {
         let db = test_couchdb("notes/");
@@ -1023,7 +1086,7 @@ mod tests {
         assert!(result.unwrap().is_none());
     }
 
-    /// Test that fetch_metadata returns Ok(None) for paths outside the allowed prefix
+    /// Test that `fetch_metadata` returns Ok(None) for paths outside the allowed prefix
     #[tokio::test]
     async fn fetch_metadata_returns_none_for_disallowed_path() {
         let db = test_couchdb("notes/");
@@ -1181,7 +1244,7 @@ mod tests {
     // Task 2895: surface delete_chunks HTTP failures
     // -----------------------------------------------------------------------
 
-    /// Build a CouchDb instance pointed at a caller-supplied base URL, with no
+    /// Build a `CouchDb` instance pointed at a caller-supplied base URL, with no
     /// canned state, so `delete_chunks` issues real HTTP requests to the fake
     /// server in these tests.
     fn couchdb_at(base_db_url: &str) -> CouchDb {
@@ -1203,7 +1266,7 @@ mod tests {
         }
     }
 
-    /// Spawn an in-process fake CouchDB server backed by a real hyper HTTP
+    /// Spawn an in-process fake `CouchDB` server backed by a real hyper HTTP
     /// server that serves one chunk document on GET and answers DELETE with
     /// `delete_status`. Using hyper means HTTP/1.1 framing, keep-alive and
     /// connection reuse are handled correctly by construction, so the tests are
@@ -1223,7 +1286,7 @@ mod tests {
         // runtime that runs the hyper accept loop.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake couch");
         let addr = listener.local_addr().expect("fake couch addr");
-        let base_db_url = format!("http://{}/test_db", addr);
+        let base_db_url = format!("http://{addr}/test_db");
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let conn_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let shutdown_thread = shutdown.clone();
@@ -1272,6 +1335,10 @@ mod tests {
     /// DELETE with the configured status. hyper handles keep-alive and
     /// connection reuse, so the server tolerates reqwest reusing the pooled
     /// connection across the GET and DELETE that `delete_chunks` issues.
+    // `async` is required: hyper's `service_fn` must return a future resolving
+    // to `Result`, so the (test-only) fake server keeps this signature even
+    // though the body contains no awaits.
+    #[allow(clippy::unused_async)]
     async fn handle_fake_couch_req(
         req: hyper::Request<hyper::body::Incoming>,
         delete_status: u16,
@@ -1312,8 +1379,7 @@ mod tests {
         server.join().expect("fake couch server join");
         assert!(
             result.is_err(),
-            "failed chunk delete must be surfaced, got: {:?}",
-            result
+            "failed chunk delete must be surfaced, got: {result:?}"
         );
     }
 
@@ -1327,12 +1393,11 @@ mod tests {
         server.join().expect("fake couch server join");
         assert!(
             result.is_ok(),
-            "successful chunk delete must return Ok, got: {:?}",
-            result
+            "successful chunk delete must return Ok, got: {result:?}"
         );
     }
 
-    /// Regression test for the macOS-CI flake: the fake CouchDB server must not
+    /// Regression test for the macOS-CI flake: the fake `CouchDB` server must not
     /// reset the socket between the GET and DELETE requests issued by the real
     /// reqwest client during `delete_chunks`. The fake server is a real hyper
     /// HTTP server, so framing and keep-alive are handled correctly, and
@@ -1355,8 +1420,7 @@ mod tests {
         let result = db.delete_chunks(&["chunk1".to_string()]).await;
         assert!(
             result.is_ok(),
-            "GET then DELETE on one fake server must succeed, got: {:?}",
-            result
+            "GET then DELETE on one fake server must succeed, got: {result:?}"
         );
 
         // Drain the pooled connection so the connection thread can observe the
@@ -1372,9 +1436,8 @@ mod tests {
         let used = conn_count.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
             (1..=2).contains(&used),
-            "fake CouchDB used {} connections for two requests, indicating it is resetting \
-             connections and forcing reconnects",
-            used
+            "fake CouchDB used {used} connections for two requests, indicating it is resetting \
+             connections and forcing reconnects"
         );
     }
 }

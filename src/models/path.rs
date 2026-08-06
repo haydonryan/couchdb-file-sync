@@ -14,26 +14,33 @@ impl SyncDirPath {
     /// Create a new `SyncDirPath`, canonicalizing the given path.
     ///
     /// Returns an error if the path does not exist or cannot be canonicalized.
-    pub fn new(path: PathBuf) -> Result<Self> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path cannot be canonicalized and cannot be made
+    /// absolute.
+    pub fn new(path: &Path) -> Result<Self> {
         let canonical = match path.canonicalize() {
             Ok(p) => p,
             Err(_) => {
                 // Fall back to making the path absolute if it doesn't exist yet
                 // (e.g. during early setup or in tests)
-                std::path::absolute(&path)
+                std::path::absolute(path)
                     .with_context(|| format!("failed to resolve sync dir: {}", path.display()))?
             }
         };
-        Ok(SyncDirPath(canonical))
+        Ok(Self(canonical))
     }
 
     /// Return the underlying path as a `Path`.
+    #[must_use]
     pub fn as_path(&self) -> &Path {
         &self.0
     }
 
     /// Return the underlying path as a `PathBuf`.
-    pub fn as_path_buf(&self) -> &PathBuf {
+    #[must_use]
+    pub const fn as_path_buf(&self) -> &PathBuf {
         &self.0
     }
 }
@@ -99,7 +106,7 @@ mod tests {
     // the reproducible unresolvable case here.
     #[test]
     fn sync_dir_path_new_rejects_unresolvable_path() {
-        let err = SyncDirPath::new(PathBuf::from(""))
+        let err = SyncDirPath::new(Path::new(""))
             .expect_err("SyncDirPath::new should reject an unresolvable path");
         // The error is contextual, not a panic.
         assert!(
@@ -113,7 +120,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sync-dir-path-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let sync_dir = SyncDirPath::new(dir.clone()).expect("valid directory should resolve");
+        let sync_dir = SyncDirPath::new(&dir).expect("valid directory should resolve");
         assert_eq!(sync_dir.as_path(), dir.canonicalize().unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);

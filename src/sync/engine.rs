@@ -6,7 +6,7 @@ use crate::models::{
 };
 use crate::sync::triage;
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
@@ -18,7 +18,7 @@ const APPLY_CONCURRENCY_LIMIT: usize = 8;
 
 /// The main sync engine
 pub struct SyncEngine {
-    /// Shared CouchDB client; all operations are `&self` so the same client is
+    /// Shared `CouchDB` client; all operations are `&self` so the same client is
     /// used concurrently by the bounded batch apply loops.
     couchdb: Arc<CouchDb>,
     local_db: AsyncLocalDb,
@@ -60,7 +60,7 @@ impl AsyncLocalDb {
         }
     }
 
-    /// Run one blocking LocalDb operation on the blocking thread pool,
+    /// Run one blocking `LocalDb` operation on the blocking thread pool,
     /// holding the mutex for the full duration of the call so operations are
     /// serialized exactly as they were on the single sync executor thread.
     async fn run<T, F>(&self, op: F) -> Result<T>
@@ -80,7 +80,8 @@ impl AsyncLocalDb {
     }
 
     async fn get_all_file_states(&self) -> Result<Vec<FileState>> {
-        self.run(|db| db.get_all_file_states()).await
+        self.run(super::super::local::db::LocalDb::get_all_file_states)
+            .await
     }
 
     async fn get_file_state(&self, path: &str) -> Result<Option<FileState>> {
@@ -89,7 +90,7 @@ impl AsyncLocalDb {
     }
 
     async fn get_file_states(&self, paths: &[&str]) -> Result<HashMap<String, FileState>> {
-        let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+        let paths: Vec<String> = paths.iter().map(std::string::ToString::to_string).collect();
         self.run(move |db| {
             db.get_file_states(&paths.iter().map(String::as_str).collect::<Vec<_>>())
         })
@@ -115,7 +116,8 @@ impl AsyncLocalDb {
     }
 
     async fn get_checkpoint(&self) -> Result<Option<Checkpoint>> {
-        self.run(|db| db.get_checkpoint()).await
+        self.run(super::super::local::db::LocalDb::get_checkpoint)
+            .await
     }
 
     async fn save_checkpoint(&self, seq: &str) -> Result<()> {
@@ -134,7 +136,8 @@ impl AsyncLocalDb {
     }
 
     async fn get_conflicts(&self) -> Result<Vec<Conflict>> {
-        self.run(|db| db.get_conflicts()).await
+        self.run(super::super::local::db::LocalDb::get_conflicts)
+            .await
     }
 
     async fn get_conflict(&self, path: &str) -> Result<Option<Conflict>> {
@@ -143,14 +146,15 @@ impl AsyncLocalDb {
     }
 
     async fn reset_sync_state(&self) -> Result<()> {
-        self.run(|db| db.reset_sync_state()).await
+        self.run(super::super::local::db::LocalDb::reset_sync_state)
+            .await
     }
 }
 
 /// Owned handle to the per-file apply state used by the bounded-concurrency
 /// sync loops.
 ///
-/// Cloning this handle is cheap (an `Arc` for the CouchDB client, the shared
+/// Cloning this handle is cheap (an `Arc` for the `CouchDB` client, the shared
 /// `AsyncLocalDb` handle, and a `PathBuf`), so each task in a sync batch can
 /// process its own file without borrowing `SyncEngine`.
 #[derive(Clone)]
@@ -169,11 +173,14 @@ impl ApplyWorker {
         let relative_path = local_path.trim_start_matches('/');
         let file_path = self.root_dir.as_path().join(relative_path);
         let metadata = tokio::fs::metadata(&file_path).await?;
-        let mtime = metadata
-            .modified()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let mtime = u64::try_from(
+            metadata
+                .modified()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(0);
 
         debug!("[UPLOAD] File path: {:?}", file_path);
         debug!("[UPLOAD] Size: {} bytes", metadata.len());
@@ -189,17 +196,14 @@ impl ApplyWorker {
         );
 
         let (existing_rev, existing_ctime, old_chunk_ids) =
-            match self.couchdb.get_file(remote_path).await? {
-                Some(existing) => {
-                    debug!("[UPLOAD] Existing doc found, rev: {:?}", existing.rev);
-                    debug!("[UPLOAD] Existing ctime: {} ms", existing.ctime.as_u64());
-                    debug!("[UPLOAD] Existing chunks: {}", existing.children.len());
-                    (existing.rev, existing.ctime.as_u64(), existing.children)
-                }
-                None => {
-                    debug!("[UPLOAD] No existing doc, creating new");
-                    (None, mtime, Vec::new())
-                }
+            if let Some(existing) = self.couchdb.get_file(remote_path).await? {
+                debug!("[UPLOAD] Existing doc found, rev: {:?}", existing.rev);
+                debug!("[UPLOAD] Existing ctime: {} ms", existing.ctime.as_u64());
+                debug!("[UPLOAD] Existing chunks: {}", existing.children.len());
+                (existing.rev, existing.ctime.as_u64(), existing.children)
+            } else {
+                debug!("[UPLOAD] No existing doc, creating new");
+                (None, mtime, Vec::new())
             };
 
         let mut doc = crate::models::FileDoc {
@@ -247,15 +251,12 @@ impl ApplyWorker {
         local_path: &str,
         require_doc: bool,
     ) -> Result<Option<usize>> {
-        let doc = match self.couchdb.fetch_metadata(remote_path).await? {
-            Some(d) => d,
-            None => {
-                if require_doc {
-                    anyhow::bail!("Document not found in CouchDB: {}", remote_path);
-                }
-                warn!("Document not found in CouchDB: {}", remote_path);
-                return Ok(None);
+        let Some(doc) = self.couchdb.fetch_metadata(remote_path).await? else {
+            if require_doc {
+                anyhow::bail!("Document not found in CouchDB: {remote_path}");
             }
+            warn!("Document not found in CouchDB: {}", remote_path);
+            return Ok(None);
         };
 
         let relative_path = local_path.trim_start_matches('/');
@@ -275,7 +276,7 @@ impl ApplyWorker {
                 // content": propagate it instead of swallowing it. Otherwise a
                 // transient network/auth/server error would silently truncate
                 // a valid local file to zero bytes and record it as synced.
-                anyhow::bail!("failed to fetch content for {}: {}", remote_path, e);
+                anyhow::bail!("failed to fetch content for {remote_path}: {e}");
             }
         };
 
@@ -300,7 +301,7 @@ impl ApplyWorker {
         Ok(Some(content.len()))
     }
 
-    /// Apply a change to CouchDB
+    /// Apply a change to `CouchDB`
     async fn apply_to_couchdb(&self, change: &Change) -> Result<()> {
         let remote_path = self.couchdb.get_remote_path(change.path());
         debug!("[UPLOAD] Starting: {} -> {}", change.path(), remote_path);
@@ -405,7 +406,7 @@ async fn apply_one_upload(
     if !dry_run {
         if is_deleted {
             match worker.apply_to_couchdb(&change).await {
-                Ok(_) => {
+                Ok(()) => {
                     // Preserve the original post-delete local state refresh.
                     worker.local_db.delete_file_state(change.path()).await?;
                 }
@@ -565,6 +566,10 @@ impl SyncEngine {
     }
 
     /// Perform a full sync cycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any stage of the sync pipeline fails.
     pub async fn sync(&mut self) -> Result<SyncReport> {
         self.run_cycle(false).await
     }
@@ -573,16 +578,20 @@ impl SyncEngine {
     ///
     /// Walks the full sync pipeline (local scan, remote fetch, triage, and
     /// conflict detection) but skips every write: nothing is written to
-    /// CouchDB, the local filesystem, or the state database. The returned
+    /// `CouchDB`, the local filesystem, or the state database. The returned
     /// `SyncReport` reflects what *would* have been uploaded, downloaded,
     /// deleted, and conflicted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any read-only stage of the sync pipeline fails.
     pub async fn sync_dry_run(&mut self) -> Result<SyncReport> {
         self.run_cycle(true).await
     }
 
     /// Shared sync-cycle implementation.
     ///
-    /// When `dry_run` is true every write operation (CouchDB writes, local
+    /// When `dry_run` is true every write operation (`CouchDB` writes, local
     /// filesystem writes, and state-DB saves) is skipped while the read-only
     /// triage, conflict detection, and report generation still run.
     async fn run_cycle(&self, dry_run: bool) -> Result<SyncReport> {
@@ -671,6 +680,11 @@ impl SyncEngine {
     }
 
     /// Rebuild the remote scope so it exactly matches the local filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the local scan, remote fetch, or any upload/delete
+    /// fails.
     pub async fn rebuild_remote_from_local(&mut self) -> Result<SyncReport> {
         info!("========== REMOTE REBUILD STARTING ==========");
 
@@ -703,6 +717,11 @@ impl SyncEngine {
     }
 
     /// Rebuild the local filesystem so it exactly matches the remote scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the local scan, remote fetch, or any download/delete
+    /// fails.
     pub async fn rebuild_local_from_remote(&mut self) -> Result<SyncReport> {
         info!("========== LOCAL REBUILD STARTING ==========");
 
@@ -811,7 +830,10 @@ impl SyncEngine {
 
             // Prebuild a set of changed paths so per-file membership checks
             // are O(1) instead of an O(M) scan over the changes list.
-            let changed_paths: HashSet<&str> = changes.iter().map(|c| c.path()).collect();
+            let changed_paths: HashSet<&str> = changes
+                .iter()
+                .map(super::super::models::change::Change::path)
+                .collect();
 
             for state in &current_states {
                 // Check if this file is in the changes list
@@ -826,7 +848,7 @@ impl SyncEngine {
                     // never be applied locally.
                     let stored = stored_map.get(&state.path);
                     let couch_rev = stored.and_then(|s| s.couch_rev.clone());
-                    let last_sync_at = stored.map(|s| s.last_sync_at).unwrap_or(state.last_sync_at);
+                    let last_sync_at = stored.map_or(state.last_sync_at, |s| s.last_sync_at);
                     let preserved_state = FileState {
                         path: state.path.clone(),
                         hash: state.hash.clone(),
@@ -852,7 +874,7 @@ impl SyncEngine {
         Ok(changes)
     }
 
-    /// Fetch remote changes from CouchDB
+    /// Fetch remote changes from `CouchDB`
     async fn fetch_remote_changes(&self) -> Result<(Vec<Change>, String)> {
         let checkpoint = self.local_db.get_checkpoint().await?;
         let since = checkpoint.map(|cp| cp.last_seq);
@@ -865,6 +887,7 @@ impl SyncEngine {
     /// In dry-run mode the identical-content "silent sync" branch skips the
     /// state-DB save; conflict detection still runs and conflicts are returned
     /// as if they would be recorded.
+    #[allow(clippy::too_many_lines)]
     async fn detect_conflicts(
         &self,
         local_changes: &[Change],
@@ -987,25 +1010,20 @@ impl SyncEngine {
 
         // ── Handle needs_comparison pairs (requires I/O) ──────────────────
         for decision in &triage_result.needs_comparison {
-            let lc = match &decision.local_change {
-                Some(c) => c,
-                None => continue,
+            let Some(lc) = &decision.local_change else {
+                continue;
             };
-            let _rc = match &decision.remote_change {
-                Some(c) => c,
-                None => continue,
+            let Some(_rc) = &decision.remote_change else {
+                continue;
             };
 
             let remote_path = self.couchdb.get_remote_path(lc.path());
             debug!("  => Remote is newer, fetching content to compare...");
 
             // Fetch remote metadata
-            let remote_doc = match self.couchdb.fetch_metadata(&remote_path).await? {
-                Some(doc) => doc,
-                None => {
-                    debug!("  Remote document not found!");
-                    continue;
-                }
+            let Some(remote_doc) = self.couchdb.fetch_metadata(&remote_path).await? else {
+                debug!("  Remote document not found!");
+                continue;
             };
 
             // Get local state for comparison
@@ -1062,9 +1080,10 @@ impl SyncEngine {
                 );
 
                 // Convert mtime (milliseconds since epoch) to DateTime
-                use chrono::TimeZone;
                 let remote_modified_at = Utc
-                    .timestamp_millis_opt(remote_doc.mtime.as_u64() as i64)
+                    .timestamp_millis_opt(
+                        i64::try_from(remote_doc.mtime.as_u64()).unwrap_or(i64::MAX),
+                    )
                     .single()
                     .unwrap_or_else(Utc::now);
 
@@ -1151,7 +1170,7 @@ impl SyncEngine {
         ))
     }
 
-    /// Upload one local file to CouchDB (delegates to the shared apply worker).
+    /// Upload one local file to `CouchDB` (delegates to the shared apply worker).
     async fn upload_local_file(
         &self,
         local_path: &str,
@@ -1174,7 +1193,7 @@ impl SyncEngine {
             .await
     }
 
-    /// Apply a change to CouchDB (delegates to the shared apply worker).
+    /// Apply a change to `CouchDB` (delegates to the shared apply worker).
     async fn apply_to_couchdb(&self, change: &Change) -> Result<()> {
         self.apply_worker().apply_to_couchdb(change).await
     }
@@ -1185,74 +1204,109 @@ impl SyncEngine {
     }
 
     /// Get list of conflicts
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the local database cannot be read.
     pub async fn get_conflicts(&self) -> Result<Vec<Conflict>> {
         self.local_db.get_conflicts().await
     }
 
     /// Apply a local change immediately (live sync)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the change cannot be applied to `CouchDB`.
     pub async fn apply_local_change(&mut self, change: &Change) -> Result<()> {
         self.apply_to_couchdb(change).await
     }
 
     /// Apply a remote change immediately (live sync)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the change cannot be applied to the filesystem.
     pub async fn apply_remote_change(&mut self, change: &Change) -> Result<()> {
         self.apply_to_filesystem(change).await
     }
 
     /// Get local tracked file state
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the local database cannot be read.
     pub async fn get_file_state(&self, path: &str) -> Result<Option<FileState>> {
         self.local_db.get_file_state(path).await
     }
 
     /// Save sync checkpoint
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint cannot be persisted.
     pub async fn save_checkpoint(&self, seq: &str) -> Result<()> {
         self.local_db.save_checkpoint(seq).await
     }
 
     /// Get sync checkpoint
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the local database cannot be read.
     pub async fn get_checkpoint(&self) -> Result<Option<Checkpoint>> {
         self.local_db.get_checkpoint().await
     }
 
     /// Convert local path to remote path using the configured prefix
+    #[must_use]
     pub fn local_to_remote_path(&self, local_path: &str) -> String {
         self.couchdb.get_remote_path(local_path)
     }
 
     /// Convert remote path to local path by stripping the configured prefix
+    #[must_use]
     pub fn remote_to_local_path(&self, remote_path: &str) -> String {
         self.couchdb.get_local_path(remote_path)
     }
 
     /// Get remote file content (converts local path to remote path)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the remote file or any of its chunks cannot be
+    /// fetched.
     pub async fn get_remote_content(&self, local_path: &str) -> Result<Vec<u8>> {
         let remote_path = self.couchdb.get_remote_path(local_path);
         self.couchdb.get_file_content(&remote_path).await
     }
 
     /// Get the root directory
-    pub fn root_dir(&self) -> &SyncDirPath {
+    #[must_use]
+    pub const fn root_dir(&self) -> &SyncDirPath {
         &self.root_dir
     }
 
     /// Get the ignore matcher (for testing)
-    pub fn ignore_matcher(&self) -> &IgnoreMatcher {
+    #[must_use]
+    pub const fn ignore_matcher(&self) -> &IgnoreMatcher {
         &self.ignore_matcher
     }
 
     /// Resolve a conflict
     /// Note: `local_path` is the local file path (stored in conflict), which gets
-    /// converted to remote path when interacting with CouchDB
+    /// converted to remote path when interacting with `CouchDB`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no conflict exists for the path or the chosen
+    /// resolution strategy fails to apply.
     pub async fn resolve_conflict(
         &mut self,
         local_path: &str,
         strategy: ResolutionStrategy,
     ) -> Result<()> {
-        let _conflict = match self.local_db.get_conflict(local_path).await? {
-            Some(c) => c,
-            None => {
-                anyhow::bail!("No conflict found for path: {}", local_path);
-            }
+        let Some(_conflict) = self.local_db.get_conflict(local_path).await? else {
+            anyhow::bail!("No conflict found for path: {local_path}");
         };
 
         // Convert local path to remote path for CouchDB operations
@@ -1275,7 +1329,7 @@ impl SyncEngine {
             }
             ResolutionStrategy::KeepBoth => {
                 // Save remote as .remote file
-                let local_remote_path = format!("{}.remote", local_path);
+                let local_remote_path = format!("{local_path}.remote");
                 self.download_remote_file(&remote_path, &local_remote_path, true)
                     .await?;
                 info!("Saved remote version as: {}", local_remote_path);
@@ -1306,7 +1360,7 @@ mod tests {
     use chrono::{Duration, Utc};
     use std::path::PathBuf;
 
-    /// Create a minimal CouchDb instance for testing construction.
+    /// Create a minimal `CouchDb` instance for testing construction.
     /// Not all methods work without a real server.
     fn test_couchdb() -> CouchDb {
         CouchDb::for_test("test-prefix/")
@@ -1318,7 +1372,7 @@ mod tests {
 
     fn test_root(path: &str) -> SyncDirPath {
         std::fs::create_dir_all(path).expect("create test dir");
-        SyncDirPath::new(PathBuf::from(path)).expect("create SyncDirPath")
+        SyncDirPath::new(&PathBuf::from(path)).expect("create SyncDirPath")
     }
 
     #[tokio::test]
@@ -1434,7 +1488,7 @@ mod tests {
     #[tokio::test]
     async fn get_local_state_returns_byte_identical_hash_after_blocking_compute() {
         let dir = tempfile::tempdir().unwrap();
-        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
         std::fs::write(root.as_path().join("data.bin"), b"regression content").unwrap();
 
         let engine = SyncEngine::new(test_couchdb(), test_local_db(), root.clone());
@@ -1481,7 +1535,7 @@ mod tests {
     #[tokio::test]
     async fn dry_run_counts_local_uploads_and_remotes_deletes_without_writing() {
         let dir = tempfile::tempdir().unwrap();
-        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
         // New local file (would upload)
         std::fs::write(root.as_path().join("new.txt"), "hello new\n").unwrap();
         // A previously tracked file that no longer exists (would delete remote)
@@ -1509,7 +1563,7 @@ mod tests {
         );
         assert_eq!(report.downloaded.0, 0);
         assert_eq!(report.deleted_local, 0);
-        assert!(report.conflicts == 0);
+        assert_eq!(report.conflicts, 0);
         assert!(report.errors.is_empty());
 
         // Trieage ran: the planned upload is the new file.
@@ -1540,7 +1594,7 @@ mod tests {
     #[tokio::test]
     async fn dry_run_counts_downloads_without_writing_files_or_state() {
         let dir = tempfile::tempdir().unwrap();
-        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
         // Tracked local file, unchanged on disk.
         std::fs::write(root.as_path().join("foo.txt"), "foo-content").unwrap();
         let local = test_local_db();
@@ -1562,7 +1616,7 @@ mod tests {
             changes: vec![
                 // Unchanged local file now has a new rev -> download
                 Change::remote_modified(
-                    format!("{}foo.txt", remote_prefix),
+                    format!("{remote_prefix}foo.txt"),
                     "someremotehash".to_string(),
                     11,
                     Utc::now(),
@@ -1570,7 +1624,7 @@ mod tests {
                 ),
                 // Brand new remote file -> download
                 Change::remote_created(
-                    format!("{}bar.txt", remote_prefix),
+                    format!("{remote_prefix}bar.txt"),
                     "barhash".to_string(),
                     3,
                     Utc::now(),
@@ -1593,7 +1647,7 @@ mod tests {
         assert_eq!(report.uploaded.0, 0);
         assert_eq!(report.deleted_local, 0);
         assert_eq!(report.deleted_remote, 0);
-        assert!(report.conflicts == 0);
+        assert_eq!(report.conflicts, 0);
 
         // Nothing was written locally:
         assert!(
@@ -1627,7 +1681,7 @@ mod tests {
     #[tokio::test]
     async fn dry_run_detects_conflicts_without_persisting_them() {
         let dir = tempfile::tempdir().unwrap();
-        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
         // Local file changed since last sync.
         std::fs::write(root.as_path().join("both.txt"), "local-content").unwrap();
         let local = test_local_db();
@@ -1700,7 +1754,7 @@ mod tests {
     #[tokio::test]
     async fn dry_run_does_not_save_state_for_identical_content() {
         let dir = tempfile::tempdir().unwrap();
-        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
         // Local file has the same content as remote; only local tracking is stale.
         std::fs::write(root.as_path().join("same.txt"), "same-content").unwrap();
         let local = test_local_db();
@@ -1769,7 +1823,7 @@ mod tests {
     #[tokio::test]
     async fn unchanged_tree_second_sync_skips_identical_file_state_rewrites() {
         let dir = tempfile::tempdir().unwrap();
-        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
         let file_path = root.as_path().join("keep.txt");
         std::fs::write(&file_path, "unchanged content").unwrap();
 
@@ -1841,12 +1895,12 @@ mod tests {
     #[tokio::test]
     async fn unchanged_tree_sync_reuses_stored_hashes_without_rehashing() {
         let dir = tempfile::tempdir().unwrap();
-        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
         let file_path = root.as_path().join("keep.txt");
         std::fs::write(&file_path, "stable content").unwrap();
 
         // Make the file not racily clean so the mtime+size shortcut applies.
-        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let old = std::time::SystemTime::now() - std::time::Duration::from_hours(1);
         filetime::set_file_mtime(&file_path, filetime::FileTime::from_system_time(old)).unwrap();
 
         // Seed a fully-tracked, unchanged file whose stored mtime/size/hash all
@@ -1916,7 +1970,7 @@ mod tests {
     #[tokio::test]
     async fn bytes_hash_matches_file_hash_for_equivalent_content() {
         let dir = tempfile::tempdir().unwrap();
-        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
         let file_path = root.as_path().join("content.bin");
 
         // Representative content: empty, small text, binary, and content large
@@ -1942,7 +1996,7 @@ mod tests {
     #[tokio::test]
     async fn upload_saved_hash_matches_transferred_content_buffer() {
         let dir = tempfile::tempdir().unwrap();
-        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
         let content: Vec<u8> = b"upload content bytes".to_vec();
         std::fs::write(root.as_path().join("up.txt"), &content).unwrap();
 
@@ -1977,7 +2031,7 @@ mod tests {
     #[tokio::test]
     async fn download_saved_hash_matches_transferred_content_buffer() {
         let dir = tempfile::tempdir().unwrap();
-        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
         let content: Vec<u8> = b"downloaded content bytes".to_vec();
         let remote_path = "prefix/dl.txt";
 
@@ -2029,7 +2083,7 @@ mod tests {
         // error instead of being swallowed into an empty-file write plus
         // synced state (which would silently truncate a valid local file).
         let dir = tempfile::tempdir().unwrap();
-        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
 
         // Scenario A: existing valid local file with tracked state. The failed
         // content fetch must surface as an error and leave file + state intact.
@@ -2140,7 +2194,7 @@ mod tests {
         // file and saving synced state (behavior preserved from before the
         // error-propagation fix).
         let dir = tempfile::tempdir().unwrap();
-        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
 
         let remote_path = "prefix/empty.txt";
         let mut remote_doc = FileDoc::new(remote_path.to_string(), String::new(), 0);
@@ -2190,7 +2244,7 @@ mod tests {
     // ── Regressions for moving blocking LocalDb (rusqlite) I/O off the
     // async executor (#2937) ─────────────────────────────────────────────
 
-    /// get_conflicts() synthesizes `local_state.last_sync_at` with `Utc::now()`
+    /// `get_conflicts()` synthesizes `local_state.last_sync_at` with `Utc::now()`
     /// on every read (that field is not persisted in the conflicts table), so
     /// strip it from both sides before comparing retrieved conflicts.
     fn conflicts_without_volatile_last_sync(conflicts: &[Conflict]) -> serde_json::Value {
@@ -2311,7 +2365,7 @@ mod tests {
         // SyncEngine: reads and writes go through spawn_blocking and must
         // return/update identical data.
         let dir = tempfile::tempdir().unwrap();
-        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
         let local = test_local_db();
         local.save_checkpoint("42-seq").unwrap();
         let conflict = Conflict::new(
@@ -2379,7 +2433,7 @@ mod tests {
         // race on a shared state DB; TempDir removes the dir (state DB
         // included) when the test ends.
         let dir = tempfile::tempdir().unwrap();
-        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
         std::fs::write(root.as_path().join("a.txt"), "hello\n").unwrap();
         let state_db = root.as_path().join("state.db");
 
@@ -2430,13 +2484,12 @@ mod tests {
 
     #[tokio::test]
     async fn upload_batch_applies_with_bounded_concurrency_and_collects_every_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
-
         // Larger than APPLY_CONCURRENCY_LIMIT so the loop is forced to run in
         // waves; a couple of uploads fail at the canned `save_file` step so we
         // can verify every per-file error is still collected (none dropped).
         const N: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
         let mut changes = Vec::with_capacity(N);
         let mut save_errors = std::collections::HashSet::new();
         for i in 0..N {
@@ -2495,10 +2548,9 @@ mod tests {
 
     #[tokio::test]
     async fn download_batch_applies_with_bounded_concurrency_and_collects_every_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = SyncDirPath::new(dir.path().to_path_buf()).unwrap();
-
         const N: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
         let mut changes = Vec::with_capacity(N);
         let mut metadata = std::collections::HashMap::new();
         let mut contents = std::collections::HashMap::new();

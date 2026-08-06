@@ -17,11 +17,11 @@ impl std::str::FromStr for ResolutionStrategy {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "keep-local" => Ok(ResolutionStrategy::KeepLocal),
-            "keep-remote" => Ok(ResolutionStrategy::KeepRemote),
-            "keep-both" => Ok(ResolutionStrategy::KeepBoth),
-            "skip" => Ok(ResolutionStrategy::Skip),
-            _ => Err(format!("Unknown resolution strategy: {}", s)),
+            "keep-local" => Ok(Self::KeepLocal),
+            "keep-remote" => Ok(Self::KeepRemote),
+            "keep-both" => Ok(Self::KeepBoth),
+            "skip" => Ok(Self::Skip),
+            _ => Err(format!("Unknown resolution strategy: {s}")),
         }
     }
 }
@@ -29,10 +29,10 @@ impl std::str::FromStr for ResolutionStrategy {
 impl std::fmt::Display for ResolutionStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ResolutionStrategy::KeepLocal => write!(f, "keep-local"),
-            ResolutionStrategy::KeepRemote => write!(f, "keep-remote"),
-            ResolutionStrategy::KeepBoth => write!(f, "keep-both"),
-            ResolutionStrategy::Skip => write!(f, "skip"),
+            Self::KeepLocal => write!(f, "keep-local"),
+            Self::KeepRemote => write!(f, "keep-remote"),
+            Self::KeepBoth => write!(f, "keep-both"),
+            Self::Skip => write!(f, "skip"),
         }
     }
 }
@@ -59,6 +59,7 @@ pub struct Conflict {
 }
 
 impl Conflict {
+    #[must_use]
     pub fn new(path: String, local_state: FileState, remote_state: RemoteState) -> Self {
         Self {
             path,
@@ -69,11 +70,12 @@ impl Conflict {
         }
     }
 
+    #[must_use]
     pub fn is_notified(&self) -> bool {
         self.notification_mode == NotificationMode::Notified
     }
 
-    pub fn mark_notified(&mut self) {
+    pub const fn mark_notified(&mut self) {
         self.notification_mode = NotificationMode::Notified;
     }
 }
@@ -114,7 +116,7 @@ mod tests {
         let conflict = Conflict::new(
             "/path/to/file.txt".into(),
             local_state.clone(),
-            remote_state.clone(),
+            remote_state,
         );
         assert_eq!(conflict.path, "/path/to/file.txt");
         assert_eq!(conflict.notification_mode, NotificationMode::Pending);
@@ -202,9 +204,9 @@ mod tests {
             ResolutionStrategy::Skip,
         ];
         for variant in &variants {
-            let display = format!("{}", variant);
+            let display = format!("{variant}");
             let parsed: ResolutionStrategy = display.parse().unwrap();
-            assert_eq!(*variant, parsed, "round-trip failed for {:?}", variant);
+            assert_eq!(*variant, parsed, "round-trip failed for {variant:?}");
         }
     }
 

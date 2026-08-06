@@ -34,6 +34,7 @@ impl Drop for TestDir {
 
 #[tokio::test]
 #[ignore = "requires a running CouchDB server (see COUCHDB_FILE_SYNC_TEST_DB_* env vars)"]
+#[allow(clippy::too_many_lines)]
 async fn dry_run_does_not_modify_state_db_or_remote_couchdb() -> Result<()> {
     let test_dir = TestDir::new("dry-run")?;
     let state_dir = test_dir.join(".couchdb-file-sync");
@@ -68,7 +69,7 @@ async fn dry_run_does_not_modify_state_db_or_remote_couchdb() -> Result<()> {
         let mut engine = SyncEngine::with_ignore(
             couchdb,
             local_db,
-            SyncDirPath::new(test_dir.path.clone()).unwrap(),
+            SyncDirPath::new(&test_dir.path).unwrap(),
             IgnoreMatcher::empty(),
         );
 
@@ -209,7 +210,7 @@ fn env_var_first(keys: &[&str]) -> Option<String> {
 }
 
 fn env_opt_first(keys: &[&str], default: Option<&str>) -> Option<String> {
-    env_var_first(keys).or_else(|| default.map(|d| d.to_string()))
+    env_var_first(keys).or_else(|| default.map(std::string::ToString::to_string))
 }
 
 fn unique_suffix() -> String {

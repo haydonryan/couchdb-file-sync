@@ -14,6 +14,7 @@ pub struct MatrixNotifier {
 
 impl MatrixNotifier {
     /// Create a new Matrix notifier
+    #[must_use]
     pub fn new(
         homeserver_url: String,
         access_token: String,
@@ -30,6 +31,10 @@ impl MatrixNotifier {
     }
 
     /// Send notification for multiple new conflicts (single message per sync run)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Matrix API request fails.
     pub async fn notify_new_conflicts(
         &self,
         conflicts: &[&Conflict],
@@ -63,6 +68,10 @@ impl MatrixNotifier {
     }
 
     /// Send sync error notification
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Matrix API request fails.
     pub async fn notify_error(&self, error: &str) -> Result<()> {
         let message = format!(
             "❌ <b>CouchDB File Sync Error</b>\n\n{}\n\nTimestamp: {}",
@@ -99,13 +108,17 @@ impl MatrixNotifier {
 
         if !response.status().is_success() {
             let error_text = response.text().await?;
-            anyhow::bail!("Matrix API error: {}", error_text);
+            anyhow::bail!("Matrix API error: {error_text}");
         }
 
         Ok(())
     }
 
     /// Test the connection by checking if the room is accessible
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Matrix API request fails.
     pub async fn test(&self) -> Result<bool> {
         let url = format!(
             "{}/_matrix/client/v3/rooms/{}/state/m.room.name",

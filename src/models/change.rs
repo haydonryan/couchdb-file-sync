@@ -12,9 +12,9 @@ pub enum ChangeType {
 impl std::fmt::Display for ChangeType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ChangeType::Created => write!(f, "created"),
-            ChangeType::Modified => write!(f, "modified"),
-            ChangeType::Deleted => write!(f, "deleted"),
+            Self::Created => write!(f, "created"),
+            Self::Modified => write!(f, "modified"),
+            Self::Deleted => write!(f, "deleted"),
         }
     }
 }
@@ -63,98 +63,107 @@ pub enum Change {
 }
 
 impl Change {
+    #[must_use]
     pub fn path(&self) -> &str {
         match self {
-            Change::LocalCreated { path, .. }
-            | Change::LocalModified { path, .. }
-            | Change::LocalDeleted { path }
-            | Change::RemoteCreated { path, .. }
-            | Change::RemoteModified { path, .. }
-            | Change::RemoteDeleted { path, .. } => path,
+            Self::LocalCreated { path, .. }
+            | Self::LocalModified { path, .. }
+            | Self::LocalDeleted { path }
+            | Self::RemoteCreated { path, .. }
+            | Self::RemoteModified { path, .. }
+            | Self::RemoteDeleted { path, .. } => path,
         }
     }
 
-    pub fn change_type(&self) -> ChangeType {
+    #[must_use]
+    pub const fn change_type(&self) -> ChangeType {
         match self {
-            Change::LocalCreated { .. } | Change::RemoteCreated { .. } => ChangeType::Created,
-            Change::LocalModified { .. } | Change::RemoteModified { .. } => ChangeType::Modified,
-            Change::LocalDeleted { .. } | Change::RemoteDeleted { .. } => ChangeType::Deleted,
+            Self::LocalCreated { .. } | Self::RemoteCreated { .. } => ChangeType::Created,
+            Self::LocalModified { .. } | Self::RemoteModified { .. } => ChangeType::Modified,
+            Self::LocalDeleted { .. } | Self::RemoteDeleted { .. } => ChangeType::Deleted,
         }
     }
 
-    pub fn source(&self) -> ChangeSource {
+    #[must_use]
+    pub const fn source(&self) -> ChangeSource {
         match self {
-            Change::LocalCreated { .. }
-            | Change::LocalModified { .. }
-            | Change::LocalDeleted { .. } => ChangeSource::Local,
-            Change::RemoteCreated { .. }
-            | Change::RemoteModified { .. }
-            | Change::RemoteDeleted { .. } => ChangeSource::Remote,
+            Self::LocalCreated { .. } | Self::LocalModified { .. } | Self::LocalDeleted { .. } => {
+                ChangeSource::Local
+            }
+            Self::RemoteCreated { .. }
+            | Self::RemoteModified { .. }
+            | Self::RemoteDeleted { .. } => ChangeSource::Remote,
         }
     }
 
+    #[must_use]
     pub fn hash(&self) -> Option<&str> {
         match self {
-            Change::LocalCreated { hash, .. }
-            | Change::LocalModified { hash, .. }
-            | Change::RemoteCreated { hash, .. }
-            | Change::RemoteModified { hash, .. } => Some(hash),
-            Change::LocalDeleted { .. } | Change::RemoteDeleted { .. } => None,
+            Self::LocalCreated { hash, .. }
+            | Self::LocalModified { hash, .. }
+            | Self::RemoteCreated { hash, .. }
+            | Self::RemoteModified { hash, .. } => Some(hash),
+            Self::LocalDeleted { .. } | Self::RemoteDeleted { .. } => None,
         }
     }
 
-    pub fn size(&self) -> Option<u64> {
+    #[must_use]
+    pub const fn size(&self) -> Option<u64> {
         match self {
-            Change::LocalCreated { size, .. }
-            | Change::LocalModified { size, .. }
-            | Change::RemoteCreated { size, .. }
-            | Change::RemoteModified { size, .. } => Some(*size),
-            Change::LocalDeleted { .. } | Change::RemoteDeleted { .. } => None,
+            Self::LocalCreated { size, .. }
+            | Self::LocalModified { size, .. }
+            | Self::RemoteCreated { size, .. }
+            | Self::RemoteModified { size, .. } => Some(*size),
+            Self::LocalDeleted { .. } | Self::RemoteDeleted { .. } => None,
         }
     }
 
-    pub fn mtime(&self) -> Option<&DateTime<Utc>> {
+    #[must_use]
+    pub const fn mtime(&self) -> Option<&DateTime<Utc>> {
         match self {
-            Change::RemoteCreated { mtime, .. } | Change::RemoteModified { mtime, .. } => {
-                Some(mtime)
+            Self::RemoteCreated { mtime, .. } | Self::RemoteModified { mtime, .. } => Some(mtime),
+            Self::LocalCreated { .. } | Self::LocalModified { .. } | Self::LocalDeleted { .. } => {
+                None
             }
-            Change::LocalCreated { .. }
-            | Change::LocalModified { .. }
-            | Change::LocalDeleted { .. } => None,
-            Change::RemoteDeleted { mtime, .. } => mtime.as_ref(),
+            Self::RemoteDeleted { mtime, .. } => mtime.as_ref(),
         }
     }
 
+    #[must_use]
     pub fn rev(&self) -> Option<&str> {
         match self {
-            Change::RemoteCreated { rev, .. } | Change::RemoteModified { rev, .. } => Some(rev),
-            Change::LocalCreated { .. }
-            | Change::LocalModified { .. }
-            | Change::LocalDeleted { .. }
-            | Change::RemoteDeleted { .. } => None,
+            Self::RemoteCreated { rev, .. } | Self::RemoteModified { rev, .. } => Some(rev),
+            Self::LocalCreated { .. }
+            | Self::LocalModified { .. }
+            | Self::LocalDeleted { .. }
+            | Self::RemoteDeleted { .. } => None,
         }
     }
 
-    pub fn local_created(path: String, hash: String, size: u64) -> Self {
-        Change::LocalCreated { path, hash, size }
+    #[must_use]
+    pub const fn local_created(path: String, hash: String, size: u64) -> Self {
+        Self::LocalCreated { path, hash, size }
     }
 
-    pub fn local_modified(path: String, hash: String, size: u64) -> Self {
-        Change::LocalModified { path, hash, size }
+    #[must_use]
+    pub const fn local_modified(path: String, hash: String, size: u64) -> Self {
+        Self::LocalModified { path, hash, size }
     }
 
-    pub fn local_deleted(path: String) -> Self {
-        Change::LocalDeleted { path }
+    #[must_use]
+    pub const fn local_deleted(path: String) -> Self {
+        Self::LocalDeleted { path }
     }
 
-    pub fn remote_created(
+    #[must_use]
+    pub const fn remote_created(
         path: String,
         hash: String,
         size: u64,
         mtime: DateTime<Utc>,
         rev: String,
     ) -> Self {
-        Change::RemoteCreated {
+        Self::RemoteCreated {
             path,
             hash,
             size,
@@ -163,14 +172,15 @@ impl Change {
         }
     }
 
-    pub fn remote_modified(
+    #[must_use]
+    pub const fn remote_modified(
         path: String,
         hash: String,
         size: u64,
         mtime: DateTime<Utc>,
         rev: String,
     ) -> Self {
-        Change::RemoteModified {
+        Self::RemoteModified {
             path,
             hash,
             size,
@@ -179,8 +189,9 @@ impl Change {
         }
     }
 
-    pub fn remote_deleted(path: String, mtime: Option<DateTime<Utc>>) -> Self {
-        Change::RemoteDeleted { path, mtime }
+    #[must_use]
+    pub const fn remote_deleted(path: String, mtime: Option<DateTime<Utc>>) -> Self {
+        Self::RemoteDeleted { path, mtime }
     }
 }
 
@@ -191,7 +202,8 @@ pub struct ChangeBatch {
 }
 
 impl ChangeBatch {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             changes: Vec::new(),
         }
@@ -201,11 +213,13 @@ impl ChangeBatch {
         self.changes.push(change);
     }
 
-    pub fn is_empty(&self) -> bool {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
         self.changes.is_empty()
     }
 
-    pub fn len(&self) -> usize {
+    #[must_use]
+    pub const fn len(&self) -> usize {
         self.changes.len()
     }
 
@@ -213,6 +227,7 @@ impl ChangeBatch {
         self.changes.iter()
     }
 
+    #[must_use]
     pub fn local_changes(&self) -> Vec<Change> {
         self.changes
             .iter()
@@ -221,6 +236,7 @@ impl ChangeBatch {
             .collect()
     }
 
+    #[must_use]
     pub fn remote_changes(&self) -> Vec<Change> {
         self.changes
             .iter()

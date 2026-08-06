@@ -25,13 +25,18 @@ impl Default for IgnoreMatcher {
 
 impl IgnoreMatcher {
     /// Create an empty matcher (ignores nothing)
-    pub fn empty() -> Self {
+    #[must_use]
+    pub const fn empty() -> Self {
         Self {
             patterns: Vec::new(),
         }
     }
 
     /// Load patterns from a .sync-ignore file
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the ignore file cannot be read.
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         Ok(Self::from_content(&content))
@@ -105,6 +110,7 @@ impl IgnoreMatcher {
     }
 
     /// Check if a path matches any ignore pattern
+    #[must_use]
     pub fn is_ignored(&self, path: &str, _is_dir: bool) -> bool {
         let mut ignored = false;
 
@@ -118,6 +124,7 @@ impl IgnoreMatcher {
     }
 
     /// Check if a file should be ignored
+    #[must_use]
     pub fn should_ignore(&self, path: &Path) -> bool {
         let path_str = path.to_string_lossy();
 
@@ -144,7 +151,8 @@ impl IgnoreMatcher {
     }
 
     /// Returns true if no patterns are defined
-    pub fn is_empty(&self) -> bool {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
         self.patterns.is_empty()
     }
 }

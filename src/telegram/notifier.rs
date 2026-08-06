@@ -12,6 +12,7 @@ pub struct TelegramNotifier {
 
 impl TelegramNotifier {
     /// Create a new Telegram notifier
+    #[must_use]
     pub fn new(bot_token: String, chat_id: String) -> Self {
         Self {
             bot_token,
@@ -21,6 +22,10 @@ impl TelegramNotifier {
     }
 
     /// Send notification for multiple new conflicts (single message per sync run)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Telegram API request fails.
     pub async fn notify_new_conflicts(
         &self,
         conflicts: &[&Conflict],
@@ -57,6 +62,10 @@ impl TelegramNotifier {
     }
 
     /// Send sync error notification
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Telegram API request fails.
     pub async fn notify_error(&self, error: &str) -> Result<()> {
         let message = format!(
             "❌ <b>CouchDB File Sync Error</b>\n\n{}\n\nTimestamp: {}",
@@ -83,13 +92,17 @@ impl TelegramNotifier {
 
         if !response.status().is_success() {
             let error_text = response.text().await?;
-            anyhow::bail!("Telegram API error: {}", error_text);
+            anyhow::bail!("Telegram API error: {error_text}");
         }
 
         Ok(())
     }
 
     /// Test the connection
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Telegram API request fails.
     pub async fn test(&self) -> Result<bool> {
         let url = format!("https://api.telegram.org/bot{}/getMe", self.bot_token);
 

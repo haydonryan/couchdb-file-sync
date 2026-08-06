@@ -42,7 +42,7 @@ struct RateLimitedWarn {
 }
 
 impl RateLimitedWarn {
-    fn new(interval: Duration) -> Self {
+    const fn new(interval: Duration) -> Self {
         Self {
             interval,
             last: Mutex::new(None),
@@ -57,7 +57,7 @@ impl RateLimitedWarn {
         let mut last = self
             .last
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
         if let Some(prev) = *last {
             if now.duration_since(prev) < self.interval {
@@ -78,7 +78,7 @@ struct EventSender {
 }
 
 impl EventSender {
-    fn new(tx: mpsc::Sender<WatcherEvent>, warn_interval: Duration) -> Self {
+    const fn new(tx: mpsc::Sender<WatcherEvent>, warn_interval: Duration) -> Self {
         Self {
             tx,
             drop_warn: RateLimitedWarn::new(warn_interval),
@@ -101,6 +101,10 @@ impl EventSender {
 
 impl FileWatcher {
     /// Create a new file watcher
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying notify debouncer cannot be created.
     pub fn new(
         root_dir: SyncDirPath,
         ignore_matcher: IgnoreMatcher,
@@ -117,7 +121,7 @@ impl FileWatcher {
             move |result: DebounceEventResult| match result {
                 Ok(events) => {
                     for event in events {
-                        let _ = process_event(event, &sender, &closure_matcher, &root);
+                        process_event(&event, &sender, &closure_matcher, &root);
                     }
                 }
                 Err(errors) => {
@@ -145,11 +149,12 @@ impl FileWatcher {
     }
 
     /// Get the event receiver
-    pub fn events(&mut self) -> &mut mpsc::Receiver<WatcherEvent> {
+    pub const fn events(&mut self) -> &mut mpsc::Receiver<WatcherEvent> {
         &mut self.event_rx
     }
 
     /// Convert watcher events to changes
+    #[must_use]
     pub fn event_to_change(&self, event: WatcherEvent) -> Option<Change> {
         match event {
             WatcherEvent::FileCreated(path) => {
@@ -189,17 +194,17 @@ impl FileWatcher {
     fn relative_path(&self, path: &Path) -> Option<PathBuf> {
         path.strip_prefix(self.root_dir.as_path())
             .ok()
-            .map(|p| p.to_path_buf())
+            .map(std::path::Path::to_path_buf)
     }
 }
 
 /// Process a debounced event and send to channel
 fn process_event(
-    event: DebouncedEvent,
+    event: &DebouncedEvent,
     sender: &EventSender,
     matcher: &IgnoreMatcher,
     root: &Path,
-) -> Result<()> {
+) {
     let paths: Vec<_> = event.paths.iter().collect();
 
     match event.kind {
@@ -208,7 +213,7 @@ fn process_event(
                 if should_ignore(path, matcher, root) {
                     continue;
                 }
-                let event = WatcherEvent::FileCreated(path.to_path_buf());
+                let event = WatcherEvent::FileCreated((*path).clone());
                 sender.send(event);
             }
         }
@@ -225,7 +230,7 @@ fn process_event(
                                 if should_ignore(path, matcher, root) {
                                     continue;
                                 }
-                                sender.send(WatcherEvent::FileDeleted(path.to_path_buf()));
+                                sender.send(WatcherEvent::FileDeleted((*path).clone()));
                             }
                         }
                         RenameMode::To => {
@@ -234,19 +239,18 @@ fn process_event(
                                 if should_ignore(path, matcher, root) {
                                     continue;
                                 }
-                                sender.send(WatcherEvent::FileCreated(path.to_path_buf()));
+                                sender.send(WatcherEvent::FileCreated((*path).clone()));
                             }
                         }
                         RenameMode::Both if paths.len() >= 2 => {
                             // Both paths in one event - first is old, second is new
                             if !should_ignore(paths[0], matcher, root) {
-                                sender.send(WatcherEvent::FileDeleted(paths[0].to_path_buf()));
+                                sender.send(WatcherEvent::FileDeleted(paths[0].clone()));
                             }
                             if !should_ignore(paths[1], matcher, root) {
-                                sender.send(WatcherEvent::FileCreated(paths[1].to_path_buf()));
+                                sender.send(WatcherEvent::FileCreated(paths[1].clone()));
                             }
                         }
-                        RenameMode::Both => {}
                         _ => {}
                     }
                 }
@@ -256,7 +260,7 @@ fn process_event(
                         if should_ignore(path, matcher, root) {
                             continue;
                         }
-                        sender.send(WatcherEvent::FileModified(path.to_path_buf()));
+                        sender.send(WatcherEvent::FileModified((*path).clone()));
                     }
                 }
             }
@@ -266,22 +270,19 @@ fn process_event(
                 if should_ignore(path, matcher, root) {
                     continue;
                 }
-                let event = WatcherEvent::FileDeleted(path.to_path_buf());
+                let event = WatcherEvent::FileDeleted((*path).clone());
                 sender.send(event);
             }
         }
         _ => {}
     }
-
-    Ok(())
 }
 
 /// Check if a path should be ignored
 fn should_ignore(path: &Path, matcher: &IgnoreMatcher, root: &Path) -> bool {
     // Get relative path
-    let relative = match path.strip_prefix(root) {
-        Ok(r) => r,
-        Err(_) => return true, // Ignore if not under root
+    let Ok(relative) = path.strip_prefix(root) else {
+        return true; // Ignore if not under root
     };
 
     // Check ignore patterns
@@ -300,6 +301,10 @@ pub struct AsyncFileWatcher {
 
 impl AsyncFileWatcher {
     /// Create and start watching
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying [`FileWatcher`] cannot be created.
     pub fn start(
         root_dir: SyncDirPath,
         ignore_matcher: IgnoreMatcher,
@@ -315,6 +320,7 @@ impl AsyncFileWatcher {
     }
 
     /// Convert watcher events to changes
+    #[must_use]
     pub fn event_to_change(&self, event: WatcherEvent) -> Option<Change> {
         self.inner.event_to_change(event)
     }
@@ -337,7 +343,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // Helper: construct a minimal FileWatcher for testing
     // -----------------------------------------------------------------------
-    fn test_watcher(root: PathBuf) -> FileWatcher {
+    fn test_watcher(root: &Path) -> FileWatcher {
         let (_tx, event_rx) = tokio::sync::mpsc::channel(100);
         FileWatcher {
             root_dir: SyncDirPath::new(root).expect("valid test root"),
@@ -351,7 +357,7 @@ mod tests {
             event: Event {
                 kind,
                 paths,
-                attrs: Default::default(),
+                attrs: notify_debouncer_full::notify::event::EventAttributes::default(),
             },
             time: Instant::now(),
         }
@@ -363,7 +369,7 @@ mod tests {
     #[test]
     fn test_relative_path_basic() {
         let root = PathBuf::from("/home/user/sync");
-        let w = test_watcher(root);
+        let w = test_watcher(&root);
 
         let path = Path::new("/home/user/sync/docs/file.txt");
         assert_eq!(w.relative_path(path), Some(PathBuf::from("docs/file.txt")));
@@ -372,7 +378,7 @@ mod tests {
     #[test]
     fn test_relative_path_root_itself() {
         let root = PathBuf::from("/home/user/sync");
-        let w = test_watcher(root.clone());
+        let w = test_watcher(&root);
 
         // strip_prefix on the root itself gives an empty path
         assert_eq!(w.relative_path(&root), Some(PathBuf::from("")));
@@ -381,7 +387,7 @@ mod tests {
     #[test]
     fn test_relative_path_not_under_root() {
         let root = PathBuf::from("/home/user/sync");
-        let w = test_watcher(root);
+        let w = test_watcher(&root);
 
         let path = Path::new("/other/path.txt");
         assert_eq!(w.relative_path(path), None);
@@ -390,7 +396,7 @@ mod tests {
     #[test]
     fn test_relative_path_deeply_nested() {
         let root = PathBuf::from("/a/b");
-        let w = test_watcher(root);
+        let w = test_watcher(&root);
 
         let path = Path::new("/a/b/c/d/e/f.txt");
         assert_eq!(w.relative_path(path), Some(PathBuf::from("c/d/e/f.txt")));
@@ -470,7 +476,7 @@ mod tests {
     #[test]
     fn test_event_to_change_created() {
         let root = PathBuf::from("/root");
-        let w = test_watcher(root);
+        let w = test_watcher(&root);
 
         let event = WatcherEvent::FileCreated(PathBuf::from("/root/new.txt"));
         let change = w.event_to_change(event).unwrap();
@@ -482,7 +488,7 @@ mod tests {
     #[test]
     fn test_event_to_change_modified() {
         let root = PathBuf::from("/root");
-        let w = test_watcher(root);
+        let w = test_watcher(&root);
 
         let event = WatcherEvent::FileModified(PathBuf::from("/root/existing.txt"));
         let change = w.event_to_change(event).unwrap();
@@ -494,7 +500,7 @@ mod tests {
     #[test]
     fn test_event_to_change_deleted() {
         let root = PathBuf::from("/root");
-        let w = test_watcher(root);
+        let w = test_watcher(&root);
 
         let event = WatcherEvent::FileDeleted(PathBuf::from("/root/gone.txt"));
         let change = w.event_to_change(event).unwrap();
@@ -506,7 +512,7 @@ mod tests {
     #[test]
     fn test_event_to_change_renamed() {
         let root = PathBuf::from("/root");
-        let w = test_watcher(root);
+        let w = test_watcher(&root);
 
         let event = WatcherEvent::FileRenamed(
             PathBuf::from("/root/old.txt"),
@@ -522,7 +528,7 @@ mod tests {
     #[test]
     fn test_event_to_change_path_outside_root_returns_none() {
         let root = PathBuf::from("/root");
-        let w = test_watcher(root);
+        let w = test_watcher(&root);
 
         let event = WatcherEvent::FileCreated(PathBuf::from("/outside/file.txt"));
         assert!(w.event_to_change(event).is_none());
@@ -543,7 +549,7 @@ mod tests {
             vec![PathBuf::from("/root/new.txt")],
         );
 
-        process_event(event, &sender, &matcher, root).unwrap();
+        process_event(&event, &sender, &matcher, root);
 
         let received = rx.try_recv().unwrap();
         match received {
@@ -564,7 +570,7 @@ mod tests {
             vec![PathBuf::from("/root/file.tmp")],
         );
 
-        process_event(event, &sender, &matcher, root).unwrap();
+        process_event(&event, &sender, &matcher, root);
 
         assert!(rx.try_recv().is_err());
     }
@@ -581,7 +587,7 @@ mod tests {
             vec![PathBuf::from("/outside/file.txt")],
         );
 
-        process_event(event, &sender, &matcher, root).unwrap();
+        process_event(&event, &sender, &matcher, root);
 
         assert!(rx.try_recv().is_err());
     }
@@ -601,7 +607,7 @@ mod tests {
             vec![PathBuf::from("/root/file.txt")],
         );
 
-        process_event(event, &sender, &matcher, root).unwrap();
+        process_event(&event, &sender, &matcher, root);
 
         let received = rx.try_recv().unwrap();
         match received {
@@ -622,7 +628,7 @@ mod tests {
             vec![PathBuf::from("/root/file.txt")],
         );
 
-        process_event(event, &sender, &matcher, root).unwrap();
+        process_event(&event, &sender, &matcher, root);
 
         let received = rx.try_recv().unwrap();
         match received {
@@ -646,7 +652,7 @@ mod tests {
             vec![PathBuf::from("/root/old.txt")],
         );
 
-        process_event(event, &sender, &matcher, root).unwrap();
+        process_event(&event, &sender, &matcher, root);
 
         let received = rx.try_recv().unwrap();
         match received {
@@ -667,7 +673,7 @@ mod tests {
             vec![PathBuf::from("/root/new.txt")],
         );
 
-        process_event(event, &sender, &matcher, root).unwrap();
+        process_event(&event, &sender, &matcher, root);
 
         let received = rx.try_recv().unwrap();
         match received {
@@ -691,7 +697,7 @@ mod tests {
             ],
         );
 
-        process_event(event, &sender, &matcher, root).unwrap();
+        process_event(&event, &sender, &matcher, root);
 
         // Should emit FileDeleted for the first path and FileCreated for the second
         let mut deleted = false;
@@ -727,7 +733,7 @@ mod tests {
             vec![PathBuf::from("/root/only.txt")],
         );
 
-        process_event(event, &sender, &matcher, root).unwrap();
+        process_event(&event, &sender, &matcher, root);
 
         assert!(rx.try_recv().is_err());
     }
@@ -747,7 +753,7 @@ mod tests {
             vec![PathBuf::from("/root/gone.txt")],
         );
 
-        process_event(event, &sender, &matcher, root).unwrap();
+        process_event(&event, &sender, &matcher, root);
 
         let received = rx.try_recv().unwrap();
         match received {
@@ -771,7 +777,7 @@ mod tests {
             vec![PathBuf::from("/root/file.old")],
         );
 
-        process_event(event, &sender, &matcher, root).unwrap();
+        process_event(&event, &sender, &matcher, root);
 
         assert!(rx.try_recv().is_err());
     }
@@ -788,7 +794,7 @@ mod tests {
             vec![PathBuf::from("/root/file.swp")],
         );
 
-        process_event(event, &sender, &matcher, root).unwrap();
+        process_event(&event, &sender, &matcher, root);
 
         assert!(rx.try_recv().is_err());
     }
@@ -797,6 +803,7 @@ mod tests {
     // Debouncer ownership (story #2663 regression guard)
     // -----------------------------------------------------------------------
     #[test]
+    #[allow(clippy::used_underscore_binding)]
     fn file_watcher_owns_debouncer() {
         // FileWatcher must own the notify Debouncer (not Box::leak it) so the
         // watcher thread is cleaned up when FileWatcher is dropped. If the
@@ -805,7 +812,7 @@ mod tests {
         // the debouncer, this assertion would fail at runtime.
         let tmp = tempfile::tempdir().expect("temporary dir");
         let watcher = FileWatcher::new(
-            SyncDirPath::new(tmp.path().to_path_buf()).expect("valid test root"),
+            SyncDirPath::new(tmp.path()).expect("valid test root"),
             IgnoreMatcher::empty(),
             100,
         )
@@ -825,7 +832,7 @@ mod tests {
     #[derive(Clone)]
     struct SharedBuf(Arc<Mutex<Vec<u8>>>);
 
-    impl<'a> MakeWriter<'a> for SharedBuf {
+    impl MakeWriter<'_> for SharedBuf {
         type Writer = SharedBufSink;
 
         fn make_writer(&self) -> Self::Writer {
@@ -866,13 +873,13 @@ mod tests {
             for _ in 0..100 {
                 sender.send(WatcherEvent::FileCreated(path.clone()));
             }
-            sender.send(WatcherEvent::FileCreated(path.clone()));
+            sender.send(WatcherEvent::FileCreated(path));
         });
 
         let output = String::from_utf8(
             buffer
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
         )
         .expect("tracing output is utf-8");
@@ -892,7 +899,7 @@ mod tests {
 
         with_default(subscriber, || {
             let (tx, _rx) = tokio::sync::mpsc::channel(100);
-            let sender = EventSender::new(tx, Duration::from_secs(60));
+            let sender = EventSender::new(tx, Duration::from_mins(1));
             let path = PathBuf::from("/root/burst.txt");
 
             for _ in 0..100 {
@@ -908,7 +915,7 @@ mod tests {
         let output = String::from_utf8(
             buffer
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
         )
         .expect("tracing output is utf-8");
@@ -932,7 +939,7 @@ mod tests {
             let _guard = warn
                 .last
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             panic!("poison the rate-limit lock");
         }));
 

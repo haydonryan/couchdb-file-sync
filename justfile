@@ -9,7 +9,7 @@ build:
 check:
     cargo check --workspace
     cargo fmt --all -- --check
-    cargo clippy --workspace --all-targets --all-features -- -D warnings
+    cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::pedantic -W clippy::nursery
     cargo audit
     cargo deny check all
     cargo test --workspace
@@ -38,7 +38,7 @@ pre-commit:
       echo "cargo fmt updated files. Review and stage the formatting changes, then commit again." >&2
       exit 1
     fi
-    cargo clippy --all-targets --all-features -- -D warnings
+    cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::pedantic -W clippy::nursery
     cargo audit
     cargo deny check all
     cargo test

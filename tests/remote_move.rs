@@ -45,8 +45,8 @@ async fn remote_move_deletes_old_local_path() -> Result<()> {
     fs::write(&old_local, "hello\n")?;
 
     let (url, db_name, user, pass, remote_path) = test_db_config();
-    let old_remote = format!("{}old.txt", remote_path);
-    let new_remote = format!("{}new.txt", remote_path);
+    let old_remote = format!("{remote_path}old.txt");
+    let new_remote = format!("{remote_path}new.txt");
     let cleanup_docs = vec![old_remote.clone(), new_remote.clone()];
     let mut cleanup_chunks: Vec<String> = Vec::new();
 
@@ -64,11 +64,8 @@ async fn remote_move_deletes_old_local_path() -> Result<()> {
 
     let test_result: Result<()> = async {
         let local_db = LocalDb::open(&state_db)?;
-        let mut engine = SyncEngine::new(
-            couchdb,
-            local_db,
-            SyncDirPath::new(test_dir.path.clone()).unwrap(),
-        );
+        let mut engine =
+            SyncEngine::new(couchdb, local_db, SyncDirPath::new(&test_dir.path).unwrap());
         engine.sync().await?;
 
         // Simulate a remote move: copy doc to new ID and mark old ID deleted.
@@ -115,11 +112,8 @@ async fn remote_move_deletes_old_local_path() -> Result<()> {
             3,
         )
         .await?;
-        let mut engine = SyncEngine::new(
-            couchdb,
-            local_db,
-            SyncDirPath::new(test_dir.path.clone()).unwrap(),
-        );
+        let mut engine =
+            SyncEngine::new(couchdb, local_db, SyncDirPath::new(&test_dir.path).unwrap());
         engine.sync().await?;
 
         let new_local = test_dir.join("new.txt");
@@ -144,7 +138,7 @@ async fn remote_move_deletes_old_local_path() -> Result<()> {
     )
     .await
     {
-        eprintln!("cleanup failed: {}", err);
+        eprintln!("cleanup failed: {err}");
     }
 
     test_result
@@ -198,7 +192,7 @@ fn env_var_first(keys: &[&str]) -> Option<String> {
 }
 
 fn env_opt_first(keys: &[&str], default: Option<&str>) -> Option<String> {
-    env_var_first(keys).or_else(|| default.map(|d| d.to_string()))
+    env_var_first(keys).or_else(|| default.map(std::string::ToString::to_string))
 }
 
 fn unique_suffix() -> String {
@@ -210,10 +204,13 @@ fn unique_suffix() -> String {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or_default()
 }
 
 fn dedup_strings(items: Vec<String>) -> Vec<String> {

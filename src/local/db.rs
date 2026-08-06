@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use tracing::info;
 
-/// Local SQLite database for state tracking
+/// Local `SQLite` database for state tracking
 pub struct LocalDb {
     conn: Connection,
     /// Number of `save_file_state` writes issued (test-only; counts every
@@ -19,6 +19,11 @@ pub struct LocalDb {
 
 impl LocalDb {
     /// Open or create the local database
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database file cannot be opened or the schema
+    /// cannot be initialized.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let conn = Connection::open(path)?;
         let db = Self {
@@ -32,6 +37,11 @@ impl LocalDb {
     }
 
     /// Create an in-memory database (for testing)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the in-memory database cannot be created or the
+    /// schema cannot be initialized.
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         let db = Self {
@@ -46,7 +56,7 @@ impl LocalDb {
     /// Initialize database schema
     fn init_schema(&self) -> Result<()> {
         self.conn.execute_batch(
-            r#"
+            r"
             -- File state table
             CREATE TABLE IF NOT EXISTS file_states (
                 path TEXT PRIMARY KEY,
@@ -94,7 +104,7 @@ impl LocalDb {
             CREATE INDEX IF NOT EXISTS idx_changes_path ON change_queue(path);
             CREATE INDEX IF NOT EXISTS idx_changes_processed ON change_queue(processed);
             CREATE INDEX IF NOT EXISTS idx_conflicts_notified ON conflicts(notified);
-            "#,
+            ",
         )?;
         Ok(())
     }
@@ -102,6 +112,10 @@ impl LocalDb {
     // === File State Operations ===
 
     /// Get file state by path
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query against the local database fails.
     pub fn get_file_state(&self, path: &str) -> Result<Option<FileState>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, hash, size, modified_at, couch_rev, last_sync_at 
@@ -131,18 +145,22 @@ impl LocalDb {
     /// state; paths without a stored state are simply absent from the result,
     /// matching the per-path [`Self::get_file_state`] behavior. The whole
     /// batch is loaded with one `WHERE path IN (...)` prepared statement
-    /// (chunked only when the path set would exceed SQLite's bind-parameter
+    /// (chunked only when the path set would exceed `SQLite`'s bind-parameter
     /// limit) instead of one prepared-statement query per path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the batch query against the local database fails.
     pub fn get_file_states(&self, paths: &[&str]) -> Result<HashMap<String, FileState>> {
+        // SQLite limits the number of bind parameters in a single statement.
+        // Chunk large path sets so we never exceed the limit while still
+        // issuing far fewer queries than one-per-path.
+        const MAX_PARAMS_PER_QUERY: usize = 900;
         let mut states = HashMap::new();
         if paths.is_empty() {
             return Ok(states);
         }
 
-        // SQLite limits the number of bind parameters in a single statement.
-        // Chunk large path sets so we never exceed the limit while still
-        // issuing far fewer queries than one-per-path.
-        const MAX_PARAMS_PER_QUERY: usize = 900;
         for chunk in paths.chunks(MAX_PARAMS_PER_QUERY) {
             let placeholders = vec!["?"; chunk.len()].join(", ");
             let sql = format!(
@@ -171,6 +189,11 @@ impl LocalDb {
     }
 
     /// Save or update file state
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file state cannot be written to the local
+    /// database.
     pub fn save_file_state(&self, state: &FileState) -> Result<()> {
         #[cfg(test)]
         self.save_file_state_calls
@@ -206,11 +229,17 @@ impl LocalDb {
     /// Number of `save_file_state` writes issued since this database was
     /// created (test-only).
     #[cfg(test)]
+    #[allow(clippy::missing_const_for_fn)]
     pub fn save_file_state_calls(&self) -> u64 {
         self.save_file_state_calls.get()
     }
 
     /// Delete file state
+    /// Delete a file state by path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete statement cannot be executed.
     pub fn delete_file_state(&self, path: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM file_states WHERE path = ?", params![path])?;
@@ -218,6 +247,11 @@ impl LocalDb {
     }
 
     /// Get all file states
+    /// Get all file states.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query against the local database fails.
     pub fn get_all_file_states(&self) -> Result<Vec<FileState>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, hash, size, modified_at, couch_rev, last_sync_at 
@@ -242,6 +276,11 @@ impl LocalDb {
     }
 
     /// Clear all tracked file state
+    /// Remove all file states.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete statement cannot be executed.
     pub fn clear_file_states(&self) -> Result<usize> {
         let count = self.conn.execute("DELETE FROM file_states", [])?;
         Ok(count)
@@ -250,6 +289,11 @@ impl LocalDb {
     // === Change Queue Operations ===
 
     /// Add change to queue
+    /// Queue a change for later processing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the change cannot be inserted into the queue.
     pub fn queue_change(&self, change: &Change) -> Result<()> {
         self.conn.execute(
             "INSERT INTO change_queue (path, change_type, source, timestamp, hash, size)
@@ -267,6 +311,11 @@ impl LocalDb {
     }
 
     /// Get unprocessed changes
+    /// Get all pending (unprocessed) changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query against the local database fails.
     pub fn get_pending_changes(&self) -> Result<Vec<Change>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, change_type, source, timestamp, hash, size
@@ -318,6 +367,11 @@ impl LocalDb {
     }
 
     /// Mark changes as processed
+    /// Mark the given paths' queued changes as processed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update statement cannot be executed.
     pub fn mark_changes_processed(&self, paths: &[String]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
 
@@ -333,6 +387,11 @@ impl LocalDb {
     }
 
     /// Clear processed changes
+    /// Remove processed changes from the queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete statement cannot be executed.
     pub fn clear_processed_changes(&self) -> Result<usize> {
         let count = self
             .conn
@@ -343,6 +402,11 @@ impl LocalDb {
     // === Conflict Operations ===
 
     /// Store conflict
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the conflict cannot be inserted into the local
+    /// database.
     pub fn store_conflict(&self, conflict: &Conflict) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO conflicts 
@@ -353,10 +417,10 @@ impl LocalDb {
             params![
                 &conflict.path,
                 &conflict.local_state.hash,
-                conflict.local_state.size as i64,
+                i64::try_from(conflict.local_state.size).unwrap_or(i64::MAX),
                 conflict.local_state.modified_at.to_rfc3339(),
                 &conflict.remote_state.hash,
-                conflict.remote_state.size as i64,
+                i64::try_from(conflict.remote_state.size).unwrap_or(i64::MAX),
                 conflict.remote_state.modified_at.to_rfc3339(),
                 &conflict.remote_state.couch_rev,
                 conflict.detected_at.to_rfc3339(),
@@ -367,6 +431,11 @@ impl LocalDb {
     }
 
     /// Get all conflicts
+    /// Get all stored conflicts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query against the local database fails.
     pub fn get_conflicts(&self) -> Result<Vec<Conflict>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, local_hash, local_size, local_modified_at,
@@ -383,7 +452,7 @@ impl LocalDb {
                 let local_state = FileState {
                     path: path.clone(),
                     hash: row.get(1)?,
-                    size: row.get::<_, i64>(2)? as u64,
+                    size: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
                     modified_at: row.get(3)?,
                     couch_rev: None,
                     last_sync_at: Utc::now(),
@@ -391,7 +460,7 @@ impl LocalDb {
 
                 let remote_state = RemoteState {
                     hash: row.get(4)?,
-                    size: row.get::<_, i64>(5)? as u64,
+                    size: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
                     modified_at: row.get(6)?,
                     couch_rev: CouchRev::new(row.get::<_, String>(7)?.as_str()).unwrap_or_default(),
                     deleted: false,
@@ -412,6 +481,11 @@ impl LocalDb {
     }
 
     /// Get conflict by path
+    /// Get a stored conflict by path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query against the local database fails.
     pub fn get_conflict(&self, path: &str) -> Result<Option<Conflict>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, local_hash, local_size, local_modified_at,
@@ -428,7 +502,7 @@ impl LocalDb {
                 let local_state = FileState {
                     path: path.clone(),
                     hash: row.get(1)?,
-                    size: row.get::<_, i64>(2)? as u64,
+                    size: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
                     modified_at: row.get(3)?,
                     couch_rev: None,
                     last_sync_at: Utc::now(),
@@ -436,7 +510,7 @@ impl LocalDb {
 
                 let remote_state = RemoteState {
                     hash: row.get(4)?,
-                    size: row.get::<_, i64>(5)? as u64,
+                    size: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
                     modified_at: row.get(6)?,
                     couch_rev: CouchRev::new(row.get::<_, String>(7)?.as_str()).unwrap_or_default(),
                     deleted: false,
@@ -457,6 +531,11 @@ impl LocalDb {
     }
 
     /// Mark conflict as notified
+    /// Mark a conflict as notified.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update statement cannot be executed.
     pub fn mark_conflict_notified(&self, path: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE conflicts SET notified = TRUE WHERE path = ?",
@@ -466,6 +545,11 @@ impl LocalDb {
     }
 
     /// Delete conflict
+    /// Delete a stored conflict by path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete statement cannot be executed.
     pub fn delete_conflict(&self, path: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM conflicts WHERE path = ?", params![path])?;
@@ -473,6 +557,11 @@ impl LocalDb {
     }
 
     /// Clear all conflicts
+    /// Remove all stored conflicts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete statement cannot be executed.
     pub fn clear_conflicts(&self) -> Result<usize> {
         let count = self.conn.execute("DELETE FROM conflicts", [])?;
         Ok(count)
@@ -481,6 +570,11 @@ impl LocalDb {
     // === Sync Checkpoint Operations ===
 
     /// Get last sync checkpoint
+    /// Get the stored replication checkpoint, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query against the local database fails.
     pub fn get_checkpoint(&self) -> Result<Option<Checkpoint>> {
         let result = self
             .conn
@@ -498,6 +592,11 @@ impl LocalDb {
     }
 
     /// Save sync checkpoint
+    /// Store the replication checkpoint sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint cannot be written.
     pub fn save_checkpoint(&self, seq: &str) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO sync_checkpoint (id, last_seq, last_sync_at)
@@ -508,12 +607,22 @@ impl LocalDb {
     }
 
     /// Clear the sync checkpoint
+    /// Remove the stored replication checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete statement cannot be executed.
     pub fn clear_checkpoint(&self) -> Result<usize> {
         let count = self.conn.execute("DELETE FROM sync_checkpoint", [])?;
         Ok(count)
     }
 
     /// Remove tracked state that should not survive an authoritative rebuild.
+    /// Reset all sync state (file states, conflicts, and checkpoint).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any of the reset operations fail.
     pub fn reset_sync_state(&self) -> Result<()> {
         self.clear_file_states()?;
         self.conn.execute("DELETE FROM change_queue", [])?;
@@ -526,7 +635,6 @@ impl LocalDb {
 fn parse_change_type(s: &str) -> ChangeType {
     match s {
         "Created" => ChangeType::Created,
-        "Modified" => ChangeType::Modified,
         "Deleted" => ChangeType::Deleted,
         _ => ChangeType::Modified,
     }
@@ -534,7 +642,6 @@ fn parse_change_type(s: &str) -> ChangeType {
 
 fn parse_change_source(s: &str) -> crate::models::ChangeSource {
     match s {
-        "Local" => crate::models::ChangeSource::Local,
         "Remote" => crate::models::ChangeSource::Remote,
         _ => crate::models::ChangeSource::Local,
     }
@@ -549,15 +656,10 @@ fn opt_u64_to_i64(value: Option<u64>) -> Result<Option<i64>> {
 }
 
 fn i64_to_u64(value: i64) -> rusqlite::Result<u64> {
-    if value < 0 {
+    u64::try_from(value).map_err(|_| {
         let err = std::io::Error::new(std::io::ErrorKind::InvalidData, "negative size");
-        return Err(rusqlite::Error::FromSqlConversionFailure(
-            0,
-            Type::Integer,
-            Box::new(err),
-        ));
-    }
-    Ok(value as u64)
+        rusqlite::Error::FromSqlConversionFailure(0, Type::Integer, Box::new(err))
+    })
 }
 
 #[cfg(test)]
@@ -1021,18 +1123,12 @@ mod tests {
     fn test_queue_change_with_all_change_types() {
         let db = test_db();
         let path = "/test/file.txt";
-        let hash = Some("hash".to_string());
+        let hash = "hash".to_string();
         let now = Utc::now();
 
-        let created =
-            Change::local_created(path.to_string(), hash.clone().unwrap_or_default(), 100u64);
-        let modified = Change::remote_modified(
-            path.to_string(),
-            hash.clone().unwrap_or_default(),
-            100u64,
-            now,
-            "1-rev".to_string(),
-        );
+        let created = Change::local_created(path.to_string(), hash.clone(), 100u64);
+        let modified =
+            Change::remote_modified(path.to_string(), hash, 100u64, now, "1-rev".to_string());
         let deleted = Change::local_deleted(path.to_string());
 
         db.queue_change(&created).expect("queue created");

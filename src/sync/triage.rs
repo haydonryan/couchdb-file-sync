@@ -45,6 +45,7 @@ pub struct TriageResult {
 }
 
 /// Convert a remote path to a local path by stripping the remote prefix.
+#[must_use]
 pub fn remote_path_to_local_path(remote_path: &str, remote_prefix: &str) -> String {
     if remote_prefix.is_empty() {
         remote_path.to_string()
@@ -58,6 +59,7 @@ pub fn remote_path_to_local_path(remote_path: &str, remote_prefix: &str) -> Stri
 
 /// Check whether a stored state path was polluted by the remote prefix
 /// (e.g., the local DB accidentally stored a remote-prefixed path).
+#[must_use]
 pub fn is_polluted_state_path(path: &str, remote_prefix: &str) -> bool {
     let remote_prefix = remote_prefix.trim_end_matches('/');
     !remote_prefix.is_empty()
@@ -65,46 +67,45 @@ pub fn is_polluted_state_path(path: &str, remote_prefix: &str) -> bool {
 }
 
 /// Determine whether a remote delete should be applied locally.
+#[must_use]
 pub fn should_apply_remote_delete(
     stored_state: Option<&FileState>,
     remote_mtime: Option<DateTime<Utc>>,
     _file_exists: bool,
 ) -> bool {
-    match stored_state {
-        Some(state) => match remote_mtime {
-            Some(remote_mtime) => remote_mtime > state.last_sync_at,
-            None => true,
-        },
-        None => false,
-    }
+    stored_state.is_some_and(|state| {
+        remote_mtime.is_none_or(|remote_mtime| remote_mtime > state.last_sync_at)
+    })
 }
 
 /// Check whether the remote has changed compared to a stored local state.
 /// Returns `true` if the remote is newer than the last sync.
+#[must_use]
 pub fn remote_is_newer(
     remote_mtime: Option<DateTime<Utc>>,
     stored_state: Option<&FileState>,
 ) -> bool {
     match (remote_mtime, stored_state) {
         (Some(remote_mtime), Some(state)) => remote_mtime > state.last_sync_at,
-        (None, _) => true, // no remote mtime — assume changed
-        (_, None) => true, // no stored state — first sync
+        // no remote mtime — assume changed; no stored state — first sync
+        (None, _) | (_, None) => true,
     }
 }
 
 /// Check whether the remote revision differs from the stored revision.
+#[must_use]
 pub fn remote_revision_changed(remote_rev: Option<&str>, stored_rev: Option<&str>) -> bool {
     match (remote_rev, stored_rev) {
         (Some(remote_rev), Some(stored_rev)) => remote_rev != stored_rev,
-        (Some(_), None) => true,  // no stored rev — new file
-        (None, Some(_)) => false, // no remote rev — skip
-        (None, None) => false,    // no revs at all — skip
+        (Some(_), None) => true, // no stored rev — new file
+        // no remote rev or no revs at all — skip
+        (None, Some(_) | None) => false,
     }
 }
 
 /// Triage local and remote changes to determine what actions are needed.
 ///
-/// This is a pure function with no I/O or CouchDB dependencies. The caller is
+/// This is a pure function with no I/O or `CouchDB` dependencies. The caller is
 /// responsible for:
 /// - Computing content hashes for `needs_comparison` pairs to decide between
 ///   conflict and silent state update.
@@ -113,7 +114,7 @@ pub fn remote_revision_changed(remote_rev: Option<&str>, stored_rev: Option<&str
 /// # Arguments
 ///
 /// * `local_changes` - Changes detected on the local filesystem
-/// * `remote_changes` - Changes fetched from the remote (CouchDB)
+/// * `remote_changes` - Changes fetched from the remote (`CouchDB`)
 /// * `stored_states` - Map from local path to last-known file state
 /// * `remote_prefix` - Prefix used to convert between local and remote paths
 ///
@@ -121,10 +122,11 @@ pub fn remote_revision_changed(remote_rev: Option<&str>, stored_rev: Option<&str
 ///
 /// A `TriageResult` categorising every change into uploads, downloads,
 /// comparison-needed pairs, remote deletes, and skips.
-pub fn triage_changes(
+#[must_use]
+pub fn triage_changes<S: std::hash::BuildHasher>(
     local_changes: &[Change],
     remote_changes: &[Change],
-    stored_states: &HashMap<String, FileState>,
+    stored_states: &HashMap<String, FileState, S>,
     remote_prefix: &str,
 ) -> TriageResult {
     // Build lookup maps
@@ -195,13 +197,8 @@ pub fn triage_changes(
         }
 
         // Remote change not in local changes — check if it should be downloaded
-        let should_download = match stored_state {
-            Some(state) => {
-                let remote_rev = rc.rev();
-                let stored_rev = state.couch_rev.as_deref();
-                remote_revision_changed(remote_rev, stored_rev)
-            }
-            None => {
+        let should_download = stored_state.map_or_else(
+            || {
                 // No local state — check if file exists on disk
                 let relative_path = local_path.trim_start_matches('/');
                 let file_path = std::path::Path::new(relative_path);
@@ -212,8 +209,13 @@ pub fn triage_changes(
                     // New file on remote — download
                     true
                 }
-            }
-        };
+            },
+            |state| {
+                let remote_rev = rc.rev();
+                let stored_rev = state.couch_rev.as_deref();
+                remote_revision_changed(remote_rev, stored_rev)
+            },
+        );
 
         if should_download {
             result.downloads.push(rc.clone());
@@ -232,6 +234,7 @@ pub fn triage_changes(
 
 /// Plan a remote-rebuild operation: upload all local files and delete remote
 /// files that have no corresponding local file.
+#[must_use]
 pub fn plan_remote_rebuild(
     local_states: &[FileState],
     remote_docs: &[crate::models::FileDoc],
@@ -260,6 +263,7 @@ pub fn plan_remote_rebuild(
 
 /// Plan a local-rebuild operation: delete all local files and download all
 /// live remote files.
+#[must_use]
 pub fn plan_local_rebuild(
     local_states: &[FileState],
     remote_docs: &[crate::models::FileDoc],
@@ -778,7 +782,11 @@ mod tests {
 
         // Local delete queued for upload
         assert_eq!(result.uploads.len(), 2);
-        let upload_paths: Vec<&str> = result.uploads.iter().map(|c| c.path()).collect();
+        let upload_paths: Vec<&str> = result
+            .uploads
+            .iter()
+            .map(crate::models::change::Change::path)
+            .collect();
         assert!(upload_paths.contains(&"delete_me.txt"));
         assert!(upload_paths.contains(&"new_file.txt"));
 

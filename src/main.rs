@@ -20,19 +20,19 @@ struct Cli {
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
 
-    /// CouchDB URL
+    /// `CouchDB` URL
     #[arg(long, global = true, env = "COUCHDB_FILE_SYNC_DB_URL")]
     db_url: Option<String>,
 
-    /// CouchDB username
+    /// `CouchDB` username
     #[arg(long, global = true, env = "COUCHDB_FILE_SYNC_DB_USERNAME")]
     db_user: Option<String>,
 
-    /// CouchDB password
+    /// `CouchDB` password
     #[arg(long, global = true, env = "COUCHDB_FILE_SYNC_DB_PASSWORD")]
     db_pass: Option<String>,
 
-    /// CouchDB database name
+    /// `CouchDB` database name
     #[arg(long, global = true, env = "COUCHDB_FILE_SYNC_DB_NAME")]
     db_name: Option<String>,
 
@@ -47,11 +47,11 @@ enum Commands {
         /// Directory to initialize (uses paths from config if not specified)
         path: Option<PathBuf>,
 
-        /// CouchDB URL
+        /// `CouchDB` URL
         #[arg(long)]
         db_url: Option<String>,
 
-        /// CouchDB database name
+        /// `CouchDB` database name
         #[arg(long)]
         db_name: Option<String>,
     },
@@ -87,7 +87,7 @@ enum Commands {
         #[arg(short, long, default_value = "60")]
         interval: u64,
 
-        /// Use live sync (filesystem watcher + CouchDB changes feed)
+        /// Use live sync (filesystem watcher + `CouchDB` changes feed)
         #[arg(long)]
         live: bool,
     },
@@ -126,13 +126,14 @@ enum Commands {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.verbose > 0 {
         match resolved_config_path(cli.config.clone()) {
             Some((path, source)) => {
-                eprintln!("Using config file ({source}): {}", path.display())
+                eprintln!("Using config file ({source}): {}", path.display());
             }
             None => eprintln!("No config file found; using defaults and environment overrides"),
         }
@@ -207,12 +208,11 @@ async fn main() -> Result<()> {
                     );
                 }
                 cli::init(
-                    sync_path.local,
+                    &sync_path.local,
                     db_url.clone(),
                     db_name.clone(),
                     path_configured,
-                )
-                .await?;
+                )?;
             }
         }
         Commands::Sync { path, dry_run } => {
@@ -294,7 +294,7 @@ async fn main() -> Result<()> {
                 if multi {
                     println!("\n=== {} ===", sync_path.local.display());
                 }
-                cli::conflicts(sync_path.local.clone(), json).await?;
+                cli::conflicts(&sync_path.local, json)?;
             }
         }
         Commands::Resolve { path } => {
@@ -326,7 +326,7 @@ async fn main() -> Result<()> {
                 if multi {
                     println!("\n=== {} ===", sync_path.local.display());
                 }
-                cli::status(sync_path.local.clone(), json, &config).await?;
+                cli::status(&sync_path.local, json, &config)?;
             }
         }
         Commands::Install => {
@@ -354,9 +354,9 @@ fn default_user_config_file_if_exists() -> Option<PathBuf> {
         return Some(yaml);
     }
 
-    let yml = yaml.with_extension("yml");
-    if yml.exists() {
-        return Some(yml);
+    let alternate = yaml.with_extension("yml");
+    if alternate.exists() {
+        return Some(alternate);
     }
 
     None
@@ -407,7 +407,7 @@ fn paths_match(left: &std::path::Path, right: &std::path::Path) -> bool {
     }
 }
 
-/// Initialize logging based on verbosity or RUST_LOG env var
+/// Initialize logging based on verbosity or `RUST_LOG` env var
 fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daemon_mode: bool) {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -630,8 +630,7 @@ mod tests {
             let result = default_user_config_file_if_exists();
             assert!(
                 result.is_none(),
-                "expected None for missing config, got {:?}",
-                result
+                "expected None for missing config, got {result:?}"
             );
         });
     }
@@ -726,10 +725,10 @@ mod tests {
     // init_logging tests
     // ============================================================
 
-    /// Smoke test: init_logging with default settings should not panic.
-    /// Note: Only one init_logging test is included because tracing_subscriber::init()
-    /// can only be called once per process. Running multiple init_logging tests would
-    /// require separate test binaries or using try_init() instead of init().
+    /// Smoke test: `init_logging` with default settings should not panic.
+    /// Note: Only one `init_logging` test is included because `tracing_subscriber::init()`
+    /// can only be called once per process. Running multiple `init_logging` tests would
+    /// require separate test binaries or using `try_init()` instead of `init()`.
     #[test]
     fn init_logging_smoke_test_default_verbose() {
         let config = AppConfig::default();
