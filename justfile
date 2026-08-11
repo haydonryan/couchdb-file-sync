@@ -17,7 +17,7 @@ check:
     cargo test --workspace --no-default-features
 
 install:
-    cargo install --path . --bin couchdb-file-sync
+    cargo install --path . --bin couchdb-file-sync --target-dir "${CARGO_TARGET_DIR:-target}"
 
 run *args:
     cargo run --bin couchdb-file-sync -- {{args}}
