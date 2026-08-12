@@ -206,6 +206,25 @@ impl FileDoc {
     }
 }
 
+/// Custom serde adapter that base64-encodes arbitrary bytes to a JSON string
+/// and decodes them back, so chunk content survives JSON transport losslessly
+/// even when it is not valid UTF-8.
+mod b64 {
+    use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(data))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Chunk document containing actual file content
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkDoc {
@@ -213,9 +232,10 @@ pub struct ChunkDoc {
     pub id: String,
     #[serde(rename = "_rev", skip_serializing_if = "Option::is_none")]
     pub rev: Option<String>,
-    /// The actual content data
-    #[serde(default)]
-    pub data: String,
+    /// The actual content data, base64-encoded on the wire so arbitrary
+    /// (non-UTF-8) bytes survive JSON transport losslessly.
+    #[serde(with = "b64", default)]
+    pub data: Vec<u8>,
     /// Document type: "leaf" for chunks
     #[serde(rename = "type", default)]
     pub doc_type: DocType,
@@ -568,11 +588,11 @@ mod tests {
         let chunk = ChunkDoc {
             id: "h:chunk1".into(),
             rev: Some("1-rev".into()),
-            data: "file content here".into(),
+            data: b"file content here".to_vec(),
             doc_type: DocType::Leaf,
         };
         assert_eq!(chunk.id, "h:chunk1");
-        assert_eq!(chunk.data, "file content here");
+        assert_eq!(chunk.data, b"file content here".to_vec());
         assert_eq!(chunk.doc_type, DocType::Leaf);
     }
     #[test]

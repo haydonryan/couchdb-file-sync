@@ -772,7 +772,7 @@ impl CouchDb {
         }
 
         // Fetch each chunk and combine the data
-        let mut content = String::new();
+        let mut content = Vec::new();
         for chunk_id in &doc.children {
             let Some(chunk) = self.get_chunk(chunk_id).await? else {
                 // A missing chunk is a partial/corrupt download: fail it rather
@@ -781,10 +781,10 @@ impl CouchDb {
                     "Chunk {chunk_id} not found for file {path}; refusing to return partial content"
                 );
             };
-            content.push_str(&chunk.data);
+            content.extend_from_slice(&chunk.data);
         }
 
-        Ok(content.into_bytes())
+        Ok(content)
     }
 
     /// Generate a unique chunk ID
@@ -843,15 +843,11 @@ impl CouchDb {
             return Ok(Vec::new());
         }
 
-        let content_str = String::from_utf8_lossy(content);
-
-        // For simplicity, store entire content as a single chunk
-        // (Obsidian LiveSync may split into multiple chunks for large files)
         let chunk_id = Self::generate_chunk_id();
         let chunk = ChunkDoc {
             id: chunk_id.clone(),
             rev: None,
-            data: content_str.to_string(),
+            data: content.to_vec(),
             doc_type: crate::models::DocType::Leaf,
         };
 
@@ -1426,7 +1422,7 @@ mod tests {
         match parts.method {
             hyper::Method::GET => {
                 *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from_static(
-                    br#"{"_id":"chunk1","_rev":"1-abc","data":"hello","type":"leaf"}"#,
+                    br#"{"_id":"chunk1","_rev":"1-abc","data":"aGVsbG8=","type":"leaf"}"#,
                 ));
             }
             hyper::Method::DELETE if delete_status == 200 => {
@@ -2137,6 +2133,153 @@ mod tests {
         assert!(
             err.contains("not found") && err.contains(file_id),
             "error should identify the missing chunk and file: {err}"
+        );
+    }
+
+    /// Spawn an in-process fake `CouchDB` that stores uploaded chunks in
+    /// memory and serves them back, so a byte buffer can round-trip through
+    /// `upload_file_content` → `get_file_content`.
+    fn spawn_fake_chunk_store_couch() -> (
+        String,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake store couch");
+        let addr = listener.local_addr().expect("fake store couch addr");
+        let base_db_url = format!("http://{addr}/test_db");
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_thread = shutdown.clone();
+        let store: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, ChunkDoc>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("fake store couch runtime");
+            runtime.block_on(async move {
+                listener
+                    .set_nonblocking(true)
+                    .expect("set fake store couch nonblocking");
+                let listener =
+                    tokio::net::TcpListener::from_std(listener).expect("fake store couch listener");
+                loop {
+                    if shutdown_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    match tokio::time::timeout(Duration::from_millis(10), listener.accept()).await {
+                        Ok(Ok((stream, _))) => {
+                            let store = store.clone();
+                            let service = hyper::service::service_fn(move |req| {
+                                let store = store.clone();
+                                async move { handle_fake_chunk_store_req(req, store).await }
+                            });
+                            tokio::spawn(async move {
+                                let io = hyper_util::rt::TokioIo::new(stream);
+                                let _ = hyper::server::conn::http1::Builder::new()
+                                    .serve_connection(io, service)
+                                    .await;
+                            });
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_elapsed) => {}
+                    }
+                }
+            });
+        });
+        (base_db_url, handle, shutdown)
+    }
+
+    /// Serve `PUT` chunk storage and `GET` chunk/file-doc retrieval from the
+    /// in-memory store. Any unknown `GET` is treated as a file document whose
+    /// `children` point at every stored chunk id, so downloaded content is
+    /// reassembled from the uploaded chunks.
+    #[allow(clippy::unused_async)]
+    async fn handle_fake_chunk_store_req(
+        req: hyper::Request<hyper::body::Incoming>,
+        store: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, ChunkDoc>>>,
+    ) -> Result<hyper::Response<http_body_util::Full<hyper::body::Bytes>>, hyper::Error> {
+        let (parts, body) = req.into_parts();
+        let mut response =
+            hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::new()));
+        let last_segment = parts
+            .uri
+            .path()
+            .split('/')
+            .next_back()
+            .unwrap_or("")
+            .to_string();
+        match (parts.method.clone(), last_segment.as_str()) {
+            (hyper::Method::PUT, id) if !id.is_empty() => {
+                use http_body_util::BodyExt;
+                let bytes = body.collect().await.expect("collect chunk body").to_bytes();
+                let chunk: ChunkDoc = serde_json::from_slice(&bytes).expect("parse stored chunk");
+                store.lock().insert(id.to_string(), chunk);
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(
+                    r#"{"ok":true,"rev":"1-abc"}"#,
+                ));
+            }
+            (hyper::Method::GET, id) if !id.is_empty() => {
+                let (chunk, children) = {
+                    let store = store.lock();
+                    (
+                        store.get(id).cloned(),
+                        store.keys().cloned().collect::<Vec<_>>(),
+                    )
+                };
+                let body = chunk.map_or_else(
+                    || {
+                        // Any unknown GET is the file doc: point its children
+                        // at every stored chunk id so content is reassembled.
+                        let children_json =
+                            serde_json::to_string(&children).expect("children json");
+                        format!(
+                            r#"{{"_id":"{id}","_rev":"1-abc","children":{children_json},"path":"{id}","type":"plain","size":0}}"#
+                        )
+                    },
+                    |chunk| serde_json::to_string(&chunk).expect("serialize chunk"),
+                );
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(body));
+            }
+            _ => {
+                *response.status_mut() = hyper::StatusCode::NOT_FOUND;
+            }
+        }
+        Ok(response)
+    }
+
+    #[tokio::test]
+    async fn binary_content_round_trips_byte_identical() {
+        let (base_db_url, server, shutdown) = spawn_fake_chunk_store_couch();
+        let db = couchdb_at_full(&base_db_url, "");
+
+        // A deliberately non-UTF-8 buffer that `String::from_utf8_lossy` would
+        // corrupt: contains invalid UTF-8 sequences and null bytes.
+        let original: Vec<u8> = vec![
+            0x00, 0xFF, 0xFE, 0x80, 0xC3, 0x28, 0xED, 0xA0, 0xBD, 0x00, 0x9B, 0x01, 0xE2, 0x28,
+            0xA1,
+        ];
+
+        let chunk_ids = db
+            .upload_file_content(&original)
+            .await
+            .expect("upload content");
+        assert_eq!(
+            chunk_ids.len(),
+            1,
+            "content should be stored as a single chunk"
+        );
+
+        let round_tripped = db
+            .get_file_content("notes/binary.dat")
+            .await
+            .expect("download content");
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake couch server join");
+
+        assert_eq!(
+            round_tripped, original,
+            "non-UTF-8 bytes must round-trip byte-identical through upload+download"
         );
     }
 }
