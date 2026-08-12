@@ -209,6 +209,13 @@ impl ApplyWorker {
                 (None, mtime, Vec::new())
             };
 
+        // Hash the in-memory content buffer we just uploaded instead of
+        // re-reading the file from disk. Since `content` is exactly the bytes
+        // pushed to CouchDB, this keeps both the persisted `FileDoc.hash` and
+        // the saved FileState in agreement with the transferred bytes even
+        // under a mid-sync modification.
+        let hash = compute_bytes_hash(&content);
+
         let mut doc = crate::models::FileDoc {
             id: remote_path.to_string(),
             rev: existing_rev,
@@ -220,6 +227,7 @@ impl ApplyWorker {
             size: metadata.len(),
             doc_type: crate::models::DocType::Plain,
             deleted: false,
+            hash: hash.clone(),
         };
 
         self.couchdb.save_file(&mut doc).await?;
@@ -230,11 +238,6 @@ impl ApplyWorker {
             self.couchdb.delete_chunks(&old_chunk_ids).await?;
         }
 
-        // Hash the in-memory content buffer we just uploaded instead of
-        // re-reading the file from disk. Since `content` is exactly the bytes
-        // pushed to CouchDB, hashing it keeps the saved FileState in agreement
-        // with the transferred bytes even under a mid-sync modification.
-        let hash = compute_bytes_hash(&content);
         let state = FileState {
             path: local_path.to_string(),
             hash,
@@ -284,13 +287,27 @@ impl ApplyWorker {
             }
         };
 
+        // Hash the in-memory content buffer we just fetched instead of
+        // re-reading the file back from disk. This avoids a redundant disk
+        // read and keeps the saved hash equal to the bytes actually transferred.
+        let hash = compute_bytes_hash(&content);
+
+        // When the remote doc records a content hash (uploaded by this tool),
+        // verify the downloaded bytes match it. A mismatch means the transfer
+        // was partial or corrupted: fail the file rather than writing a bad
+        // local copy and recording it as synced. Docs without a stored hash
+        // (older or external) are accepted as-is.
+        if !doc.hash.is_empty() && doc.hash != hash {
+            anyhow::bail!(
+                "content hash mismatch for {remote_path}: remote stored {}, downloaded {}; refusing to write partial/corrupt file",
+                doc.hash,
+                hash
+            );
+        }
+
         tokio::fs::write(&file_path, &content).await?;
         debug!("[DOWNLOAD] Wrote {} bytes to disk", content.len());
 
-        // Hash the in-memory content buffer we just fetched and wrote instead
-        // of re-reading the file back from disk. This avoids a redundant disk
-        // read and keeps the saved hash equal to the bytes actually transferred.
-        let hash = compute_bytes_hash(&content);
         let metadata = tokio::fs::metadata(&file_path).await?;
         let state = FileState {
             path: local_path.to_string(),
@@ -2281,6 +2298,114 @@ mod tests {
         assert_eq!(
             stored.size, 0,
             "empty-content FileState should record size 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_remote_file_fails_on_hash_mismatch() {
+        // Guard for #3624: when the remote doc records a content hash, a
+        // download whose bytes do not match it must fail the file — no corrupt
+        // local copy written, no sync state saved.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+
+        let remote_path = "prefix/corrupt.txt";
+        let mut remote_doc = FileDoc::new(remote_path.to_string(), "stored-remote-hash".into(), 3);
+        remote_doc.rev = Some("1-abc".to_string());
+        remote_doc.path = remote_path.to_string();
+
+        // Canned content is "abc" whose real SHA-256 is not
+        // "stored-remote-hash", so the verification must reject it.
+        let canned = CannedCouch {
+            changes: Vec::new(),
+            last_seq: "1".to_string(),
+            metadata: std::collections::HashMap::from([(remote_path.to_string(), remote_doc)]),
+            contents: std::collections::HashMap::from([(remote_path.to_string(), b"abc".to_vec())]),
+            content_errors: std::collections::HashSet::new(),
+            ..CannedCouch::default()
+        };
+        let engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        engine
+            .download_remote_file(remote_path, "corrupt.txt", true)
+            .await
+            .expect_err("hash mismatch must fail the download");
+
+        assert!(
+            !root.as_path().join("corrupt.txt").exists(),
+            "hash mismatch must not write a corrupt local file"
+        );
+        assert!(
+            engine
+                .get_file_state("corrupt.txt")
+                .await
+                .unwrap()
+                .is_none(),
+            "hash mismatch must not save any FileState"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_remote_file_succeeds_when_hash_matches() {
+        // A download whose bytes match the stored remote hash must succeed and
+        // save sync state (verification must not break the healthy path).
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+
+        let remote_path = "prefix/good.txt";
+        let content = b"hello world";
+        let stored_hash = compute_bytes_hash(content);
+        let mut remote_doc = FileDoc::new(
+            remote_path.to_string(),
+            stored_hash.clone(),
+            content.len() as u64,
+        );
+        remote_doc.rev = Some("1-good".to_string());
+        remote_doc.path = remote_path.to_string();
+
+        let canned = CannedCouch {
+            changes: Vec::new(),
+            last_seq: "1".to_string(),
+            metadata: std::collections::HashMap::from([(remote_path.to_string(), remote_doc)]),
+            contents: std::collections::HashMap::from([(
+                remote_path.to_string(),
+                content.to_vec(),
+            )]),
+            content_errors: std::collections::HashSet::new(),
+            ..CannedCouch::default()
+        };
+        let engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let bytes = engine
+            .download_remote_file(remote_path, "good.txt", true)
+            .await
+            .expect("matching hash download should succeed")
+            .expect("matching hash download should write a file");
+
+        assert_eq!(bytes, content.len());
+        assert_eq!(
+            std::fs::read(root.as_path().join("good.txt")).unwrap(),
+            content,
+            "matching-hash download must write the correct bytes"
+        );
+        let stored = engine
+            .get_file_state("good.txt")
+            .await
+            .unwrap()
+            .expect("matching-hash download should save FileState");
+        assert_eq!(
+            stored.hash, stored_hash,
+            "FileState hash must equal the verified remote hash"
         );
     }
 

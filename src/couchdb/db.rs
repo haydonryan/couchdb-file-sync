@@ -774,14 +774,14 @@ impl CouchDb {
         // Fetch each chunk and combine the data
         let mut content = String::new();
         for chunk_id in &doc.children {
-            match self.get_chunk(chunk_id).await? {
-                Some(chunk) => {
-                    content.push_str(&chunk.data);
-                }
-                None => {
-                    warn!("Chunk {} not found for file {}", chunk_id, path);
-                }
-            }
+            let Some(chunk) = self.get_chunk(chunk_id).await? else {
+                // A missing chunk is a partial/corrupt download: fail it rather
+                // than silently truncating the file and recording it as synced.
+                anyhow::bail!(
+                    "Chunk {chunk_id} not found for file {path}; refusing to return partial content"
+                );
+            };
+            content.push_str(&chunk.data);
         }
 
         Ok(content.into_bytes())
@@ -1492,6 +1492,7 @@ mod tests {
             size: 1,
             doc_type: crate::models::DocType::Plain,
             deleted: false,
+            hash: String::new(),
         }
     }
 
@@ -1777,6 +1778,7 @@ mod tests {
             size: 0,
             doc_type: crate::models::DocType::Plain,
             deleted: true,
+            hash: String::new(),
         }
     }
 
@@ -1807,6 +1809,7 @@ mod tests {
             size: 10,
             doc_type: crate::models::DocType::Plain,
             deleted: false,
+            hash: String::new(),
         };
         let chunk = FileDoc {
             id: "h:chunk1".to_string(),
@@ -1819,6 +1822,7 @@ mod tests {
             size: 0,
             doc_type: crate::models::DocType::Leaf,
             deleted: true,
+            hash: String::new(),
         };
         let docs = vec![live, chunk];
 
@@ -2018,6 +2022,121 @@ mod tests {
             (1..=2).contains(&used),
             "fake CouchDB used {used} connections for two requests, indicating it is resetting \
              connections and forcing reconnects"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 3624: fail partial downloads (missing chunk) and verify hash
+    // -----------------------------------------------------------------------
+
+    /// Spawn a fake `CouchDB` server that serves a `FileDoc` (with one child
+    /// chunk) on GET for the file id but returns `404` for the chunk id —
+    /// simulating a partial/corrupt remote download where a referenced chunk is
+    /// missing. Returns the base database URL, the server thread handle, and a
+    /// shutdown flag.
+    fn spawn_fake_missing_chunk_couch(
+        file_id: &str,
+        chunk_id: &str,
+    ) -> (
+        String,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake chunk couch");
+        let addr = listener.local_addr().expect("fake chunk couch addr");
+        let base_db_url = format!("http://{addr}");
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_thread = shutdown.clone();
+        let file_id = file_id.to_string();
+        let chunk_id = chunk_id.to_string();
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("fake chunk couch runtime");
+            runtime.block_on(async move {
+                listener
+                    .set_nonblocking(true)
+                    .expect("set fake chunk couch nonblocking");
+                let listener =
+                    tokio::net::TcpListener::from_std(listener).expect("fake chunk couch listener");
+                loop {
+                    if shutdown_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    match tokio::time::timeout(Duration::from_millis(10), listener.accept()).await {
+                        Ok(Ok((stream, _))) => {
+                            let file_id = file_id.clone();
+                            let chunk_id = chunk_id.clone();
+                            let service = hyper::service::service_fn(move |req| {
+                                let file_id = file_id.clone();
+                                let chunk_id = chunk_id.clone();
+                                async move {
+                                    handle_fake_missing_chunk_req(req, &file_id, &chunk_id).await
+                                }
+                            });
+                            tokio::spawn(async move {
+                                let io = hyper_util::rt::TokioIo::new(stream);
+                                let _ = hyper::server::conn::http1::Builder::new()
+                                    .serve_connection(io, service)
+                                    .await;
+                            });
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_elapsed) => {}
+                    }
+                }
+            });
+        });
+        (base_db_url, handle, shutdown)
+    }
+
+    /// Serve a `GET` for the file doc (with one child chunk) and `404` for the
+    /// chunk id, mimicking a missing chunk.
+    #[allow(clippy::unused_async)]
+    async fn handle_fake_missing_chunk_req(
+        req: hyper::Request<hyper::body::Incoming>,
+        file_id: &str,
+        chunk_id: &str,
+    ) -> Result<hyper::Response<http_body_util::Full<hyper::body::Bytes>>, hyper::Error> {
+        let (parts, _body) = req.into_parts();
+        let mut response =
+            hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::new()));
+        if parts.method == hyper::Method::GET && parts.uri.path().ends_with(chunk_id) {
+            // The chunk is missing: return 404 so `get_chunk` yields None.
+            *response.status_mut() = hyper::StatusCode::NOT_FOUND;
+        } else if parts.method == hyper::Method::GET {
+            // Any other GET is the file doc (couch_rs percent-encodes the path,
+            // so match on the chunk absence above rather than the file id).
+            let body = format!(
+                r#"{{"_id":"{file_id}","_rev":"1-abc","children":["{chunk_id}"],"path":"{file_id}","type":"plain","size":5}}"#
+            );
+            *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(body));
+        } else {
+            *response.status_mut() = hyper::StatusCode::NOT_FOUND;
+        }
+        Ok(response)
+    }
+
+    #[tokio::test]
+    async fn get_file_content_errors_on_missing_chunk() {
+        let file_id = "notes/missing.md";
+        let chunk_id = "h:chunk1";
+        let (base_db_url, server, shutdown) = spawn_fake_missing_chunk_couch(file_id, chunk_id);
+        let db = couchdb_at_full(&base_db_url, "");
+
+        let result = db.get_file_content(file_id).await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake couch server join");
+
+        assert!(
+            result.is_err(),
+            "a missing chunk must error the download, not truncate; got: {result:?}"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not found") && err.contains(file_id),
+            "error should identify the missing chunk and file: {err}"
         );
     }
 }

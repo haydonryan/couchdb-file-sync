@@ -148,11 +148,16 @@ pub struct FileDoc {
     /// Whether the file is deleted
     #[serde(default)]
     pub deleted: bool,
+    /// Content hash (SHA-256 hex) of the file bytes, persisted on upload so
+    /// downstream downloads can verify integrity against the remote. Older or
+    /// externally-created docs may leave this empty.
+    #[serde(default)]
+    pub hash: String,
 }
 
 impl FileDoc {
     #[must_use]
-    pub fn new(path: String, _hash: String, size: u64) -> Self {
+    pub fn new(path: String, hash: String, size: u64) -> Self {
         let now = TimestampMillis::now();
         Self {
             id: path.clone(),
@@ -165,6 +170,7 @@ impl FileDoc {
             size,
             doc_type: DocType::Plain,
             deleted: false,
+            hash,
         }
     }
 
@@ -283,7 +289,7 @@ impl From<FileDoc> for RemoteState {
             .and_then(CouchRev::new)
             .unwrap_or_default();
         Self {
-            hash: String::new(), // Hash not stored in CouchDB, computed locally
+            hash: doc.hash,
             size: doc.size,
             modified_at,
             couch_rev,
@@ -319,6 +325,7 @@ mod tests {
         assert!(!doc.deleted);
         assert!(doc.rev.is_none());
         assert!(doc.children.is_empty());
+        assert_eq!(doc.hash, "hash1");
         // ctime and mtime should be set to approximately now
         let now_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0);
         assert!(doc.ctime.as_u64() > 0 && (now_ms - doc.ctime.as_u64()) < 5000);
@@ -338,6 +345,7 @@ mod tests {
             size: 100,
             doc_type: DocType::Plain,
             deleted: false,
+            hash: String::new(),
         };
         assert!(doc.is_file());
     }
@@ -355,6 +363,7 @@ mod tests {
             size: 100,
             doc_type: DocType::Plain,
             deleted: false,
+            hash: String::new(),
         };
         assert!(doc.is_file());
     }
@@ -372,6 +381,7 @@ mod tests {
             size: 100,
             doc_type: DocType::Leaf,
             deleted: false,
+            hash: String::new(),
         };
         assert!(!doc.is_file());
     }
@@ -392,6 +402,7 @@ mod tests {
             size: 100,
             doc_type: DocType::Leaf,
             deleted: false,
+            hash: String::new(),
         };
         assert!(!doc.is_file());
     }
@@ -410,6 +421,7 @@ mod tests {
             size: 100,
             doc_type: DocType::Plain,
             deleted: false,
+            hash: String::new(),
         };
         assert!(doc.is_file());
     }
@@ -428,6 +440,7 @@ mod tests {
             size: 100,
             doc_type: DocType::Plain,
             deleted: false,
+            hash: String::new(),
         };
         let modified = doc.modified_at();
         assert_eq!(
@@ -451,6 +464,7 @@ mod tests {
             size: 100,
             doc_type: DocType::Plain,
             deleted: true,
+            hash: String::new(),
         };
         assert_eq!(
             doc.delete_time().timestamp_millis(),
@@ -495,13 +509,13 @@ mod tests {
             size: 512,
             doc_type: DocType::Plain,
             deleted: false,
+            hash: "abc123".into(),
         };
         let remote: RemoteState = doc.into();
-        assert_eq!(remote.hash, "");
+        assert_eq!(remote.hash, "abc123");
         assert_eq!(remote.size, 512);
         assert_eq!(remote.couch_rev.as_str(), "1-abc123");
         assert!(!remote.deleted);
-        assert_eq!(remote.hash, ""); // Hash not stored in CouchDB
     }
 
     #[test]
@@ -517,6 +531,7 @@ mod tests {
             size: 0,
             doc_type: DocType::Plain,
             deleted: true,
+            hash: String::new(),
         };
         let remote: RemoteState = doc.into();
 
@@ -537,6 +552,7 @@ mod tests {
             size: 100,
             doc_type: DocType::Plain,
             deleted: false,
+            hash: String::new(),
         };
         // Test TypedCouchDocument trait methods
         assert_eq!(doc.get_id(), "doc1");
@@ -572,6 +588,7 @@ mod tests {
             size: 100,
             doc_type: DocType::Plain,
             deleted: false,
+            hash: String::new(),
         };
         let other = FileDoc {
             id: "doc2".into(),
@@ -584,6 +601,7 @@ mod tests {
             size: 200,
             doc_type: DocType::Plain,
             deleted: false,
+            hash: String::new(),
         };
         doc.merge_ids(&other);
         assert_eq!(doc.id, "doc2");
