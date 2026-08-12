@@ -132,6 +132,13 @@ pub struct FileDoc {
     /// Modification time in milliseconds
     #[serde(default)]
     pub mtime: TimestampMillis,
+    /// Authoritative soft-delete time in milliseconds. Live files keep this at
+    /// `0`. It is stamped when a file is soft-deleted so downstream clients
+    /// arbitrate the deletion against the *deletion* time rather than the
+    /// deleted file's possibly-stale preserved mtime. Older/external
+    /// tombstones leave it `0`.
+    #[serde(default)]
+    pub deleted_at: TimestampMillis,
     /// File size in bytes
     #[serde(default)]
     pub size: u64,
@@ -154,6 +161,7 @@ impl FileDoc {
             path,
             ctime: now,
             mtime: now,
+            deleted_at: TimestampMillis::default(),
             size,
             doc_type: DocType::Plain,
             deleted: false,
@@ -175,6 +183,20 @@ impl FileDoc {
     #[must_use]
     pub fn modified_at(&self) -> DateTime<Utc> {
         self.mtime.to_datetime()
+    }
+
+    /// The authoritative time a soft-delete tombstone was created.
+    ///
+    /// Tombstones written by this codebase stamp `deleted_at` at delete time;
+    /// older or external tombstones may only carry the deleted file's preserved
+    /// mtime, so this falls back to that when no `deleted_at` is recorded.
+    #[must_use]
+    pub fn delete_time(&self) -> DateTime<Utc> {
+        if self.deleted_at.as_u64() != 0 {
+            self.deleted_at.to_datetime()
+        } else {
+            self.mtime.to_datetime()
+        }
     }
 }
 
@@ -312,6 +334,7 @@ mod tests {
             path: "/path/to/file.txt".into(),
             ctime: TimestampMillis::new(0),
             mtime: TimestampMillis(0),
+            deleted_at: TimestampMillis::default(),
             size: 100,
             doc_type: DocType::Plain,
             deleted: false,
@@ -328,6 +351,7 @@ mod tests {
             path: "/path/to/file.txt".into(),
             ctime: TimestampMillis::new(0),
             mtime: TimestampMillis(0),
+            deleted_at: TimestampMillis::default(),
             size: 100,
             doc_type: DocType::Plain,
             deleted: false,
@@ -344,6 +368,7 @@ mod tests {
             path: "h:abc123".into(),
             ctime: TimestampMillis::new(0),
             mtime: TimestampMillis(0),
+            deleted_at: TimestampMillis::default(),
             size: 100,
             doc_type: DocType::Leaf,
             deleted: false,
@@ -363,6 +388,7 @@ mod tests {
             path: "chunk/without/prefix".into(),
             ctime: TimestampMillis::new(0),
             mtime: TimestampMillis(0),
+            deleted_at: TimestampMillis::default(),
             size: 100,
             doc_type: DocType::Leaf,
             deleted: false,
@@ -380,6 +406,7 @@ mod tests {
             path: "h:not-a-chunk.txt".into(),
             ctime: TimestampMillis::new(0),
             mtime: TimestampMillis(0),
+            deleted_at: TimestampMillis::default(),
             size: 100,
             doc_type: DocType::Plain,
             deleted: false,
@@ -397,6 +424,7 @@ mod tests {
             path: "/path/to/file.txt".into(),
             ctime: TimestampMillis::new(0),
             mtime: TimestampMillis::new(mtime_ms),
+            deleted_at: TimestampMillis::default(),
             size: 100,
             doc_type: DocType::Plain,
             deleted: false,
@@ -405,6 +433,37 @@ mod tests {
         assert_eq!(
             u64::try_from(modified.timestamp_millis()).unwrap_or(0),
             mtime_ms
+        );
+    }
+
+    #[test]
+    fn test_file_doc_delete_time_uses_deleted_at_over_preserved_mtime() {
+        // A tombstone stamps deleted_at at delete time even when the deleted
+        // file's own mtime is old/preserved; delete_time must prefer it.
+        let mut doc = FileDoc {
+            id: "/path/to/file.txt".into(),
+            rev: None,
+            children: vec![],
+            path: "/path/to/file.txt".into(),
+            ctime: TimestampMillis::new(0),
+            mtime: TimestampMillis::new(1000),
+            deleted_at: TimestampMillis::new(9000),
+            size: 100,
+            doc_type: DocType::Plain,
+            deleted: true,
+        };
+        assert_eq!(
+            doc.delete_time().timestamp_millis(),
+            9000,
+            "delete_time must prefer the authoritative deleted_at"
+        );
+
+        // Legacy/external tombstones without deleted_at fall back to mtime.
+        doc.deleted_at = TimestampMillis::default();
+        assert_eq!(
+            doc.delete_time().timestamp_millis(),
+            1000,
+            "delete_time must fall back to mtime when deleted_at is unset"
         );
     }
 
@@ -432,6 +491,7 @@ mod tests {
             path: "/remote/path.txt".into(),
             ctime: TimestampMillis::new(0),
             mtime: TimestampMillis::new(mtime_ms),
+            deleted_at: TimestampMillis::default(),
             size: 512,
             doc_type: DocType::Plain,
             deleted: false,
@@ -453,6 +513,7 @@ mod tests {
             path: "/remote/deleted.txt".into(),
             ctime: TimestampMillis::new(0),
             mtime: TimestampMillis(0),
+            deleted_at: TimestampMillis::default(),
             size: 0,
             doc_type: DocType::Plain,
             deleted: true,
@@ -472,6 +533,7 @@ mod tests {
             path: "doc1".into(),
             ctime: TimestampMillis::new(0),
             mtime: TimestampMillis(0),
+            deleted_at: TimestampMillis::default(),
             size: 100,
             doc_type: DocType::Plain,
             deleted: false,
@@ -506,6 +568,7 @@ mod tests {
             path: "doc1".into(),
             ctime: TimestampMillis::new(0),
             mtime: TimestampMillis(0),
+            deleted_at: TimestampMillis::default(),
             size: 100,
             doc_type: DocType::Plain,
             deleted: false,
@@ -517,6 +580,7 @@ mod tests {
             path: "doc2".into(),
             ctime: TimestampMillis(1000),
             mtime: TimestampMillis(2000),
+            deleted_at: TimestampMillis::default(),
             size: 200,
             doc_type: DocType::Plain,
             deleted: false,

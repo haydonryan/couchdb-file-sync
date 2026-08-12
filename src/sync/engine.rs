@@ -216,6 +216,7 @@ impl ApplyWorker {
             path: remote_path.to_string(),
             ctime: crate::models::TimestampMillis::new(existing_ctime),
             mtime: crate::models::TimestampMillis::new(mtime),
+            deleted_at: crate::models::TimestampMillis::default(),
             size: metadata.len(),
             doc_type: crate::models::DocType::Plain,
             deleted: false,
@@ -1145,11 +1146,12 @@ impl SyncEngine {
             let relative_path = local_path.trim_start_matches('/');
             let file_path = self.root_dir.as_path().join(relative_path);
             let stored_state = stored_states.get(&local_path);
-            if triage::should_apply_remote_delete(
-                stored_state,
-                rc.mtime().copied(),
-                file_path.exists(),
-            ) {
+            let local_mtime = file_path
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(Into::into);
+            if triage::should_apply_remote_delete(stored_state, rc.mtime().copied(), local_mtime) {
                 debug!("  Remote delete is newer than last sync, scheduling local delete");
                 remote_to_apply.push(rc.clone());
             } else if file_path.exists() || stored_state.is_some() {
