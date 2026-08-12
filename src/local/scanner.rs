@@ -72,10 +72,12 @@ impl Scanner {
     }
 
     /// Perform a full scan, reusing the stored hash for files whose stored
-    /// state has the same mtime AND size as the on-disk file and that are not
-    /// racily clean (see [`is_racily_clean`]). Unchanged trees therefore skip
-    /// the full disk read + SHA-256 for every file. New files, files with a
-    /// differing mtime or size, and racily-clean files are hashed as usual, so
+    /// state has the same mtime AND size as the on-disk file, whose mtime is
+    /// not older than the stored last sync (see [`is_racily_clean`] and the
+    /// `last_sync_at` guard in [`Self::scan_file_with_stored`]). Unchanged
+    /// trees therefore skip the full disk read + SHA-256 for every file. New
+    /// files, files with a differing mtime or size, racily-clean files, and
+    /// files whose mtime predates the stored last sync are hashed as usual, so
     /// created/modified/deleted detection semantics are unchanged.
     ///
     /// `stored_states` is shared with the blocking task through an [`Arc`] so
@@ -160,7 +162,15 @@ impl Scanner {
     }
 
     /// Scan a single file, reusing the stored hash when the stored state's
-    /// mtime AND size match the on-disk file and the file is not racily clean.
+    /// mtime AND size match the on-disk file, the file is not racily clean,
+    /// and the on-disk mtime is not older than the stored `last_sync_at`.
+    ///
+    /// The `last_sync_at` guard closes the mtime-preserving edit hole: tools
+    /// that preserve mtime (`cp -p`, `rsync -t`, `git checkout`, `touch -t`)
+    /// can rewrite a file's content while leaving an old mtime and identical
+    /// size. When the on-disk mtime is older than the stored last sync, the
+    /// mtime+size shortcut cannot prove the content is unchanged, so the file
+    /// is re-hashed rather than trusted.
     ///
     /// `stored` is the previously recorded state for this file, if any. When it
     /// is `None` (or the mtime/size shortcut does not apply) the SHA-256 hash is
@@ -218,14 +228,21 @@ impl Scanner {
 
         // Conservative mtime+size shortcut (git-style): reuse the stored hash
         // when the stored state has the same mtime AND size as the on-disk file
-        // and the file is not racily clean. Otherwise (new file, size or mtime
-        // drift, or a recently-touched racily-clean file) compute the SHA-256
-        // hash as before, so change detection stays correct.
+        // and the file is not racily clean. An additional guard requires the
+        // on-disk mtime to be at least as new as the stored last sync: a file
+        // whose mtime is older than its stored last_sync_at may have had its
+        // content rewritten by a mtime-preserving tool (cp -p, rsync -t, git
+        // checkout, touch -t), so it is re-hashed rather than trusted.
+        // Otherwise (new file, size or mtime drift, a recently-touched
+        // racily-clean file, or an mtime older than the stored last sync)
+        // compute the SHA-256 hash as before, so change detection stays
+        // correct.
         let reuse_hash = match stored {
             Some(s)
                 if s.size == size
                     && s.modified_at == modified_at
-                    && !is_racily_clean(modified_at) =>
+                    && !is_racily_clean(modified_at)
+                    && modified_at >= s.last_sync_at =>
             {
                 Some(s.hash.clone())
             }
@@ -453,12 +470,16 @@ mod tests {
         // Build the stored state from the file's actual reported metadata so
         // the mtime equality comparison is exact on any filesystem precision.
         let meta = std::fs::metadata(&file_path).unwrap();
-        let stored = FileState::new(
+        let mut stored = FileState::new(
             "keep.txt".to_string(),
             "a".repeat(64), // marker hash: only present if reused
             meta.len(),
             meta.modified().unwrap().into(),
         );
+        // The file mtime is an hour in the past; give the stored state a
+        // last_sync_at that predates it (i.e. the file was last modified after
+        // it was last synced) so the mtime+size shortcut stays eligible.
+        stored.last_sync_at = Utc::now() - Duration::from_hours(2);
 
         let state = scanner
             .scan_file_with_stored(&file_path, Some(&stored))
@@ -612,6 +633,65 @@ mod tests {
         assert_eq!(changes[0].change_type(), ChangeType::Modified);
     }
 
+    /// Regression test (#3628): a content change that preserves both the past
+    /// mtime and the same size must still be detected. Mtime-preserving tools
+    /// (`cp -p`, `rsync -t`, `git checkout`, `touch -t`) can rewrite a file
+    /// while leaving an old mtime and identical size, so when the on-disk mtime
+    /// is older than the stored `last_sync_at` the stored hash is NOT reused and
+    /// the new content is hashed.
+    #[test]
+    fn test_scan_file_rehashes_when_preserved_past_mtime_predates_last_sync() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("preserved.txt");
+
+        // Seed the file with an mtime in the past (outside the racily-clean
+        // window).
+        std::fs::write(&file_path, b"AAAA").unwrap();
+        let past_mtime = SystemTime::now() - Duration::from_hours(1);
+        set_mtime(&file_path, past_mtime);
+
+        let scanner = Scanner::new(
+            SyncDirPath::new(temp_dir.path()).unwrap(),
+            IgnoreMatcher::empty(),
+        );
+
+        let meta = std::fs::metadata(&file_path).unwrap();
+        // Stored state records a RECENT last_sync_at (now) while the file mtime
+        // is in the past, so the on-disk mtime is older than the stored
+        // last_sync_at.
+        let stored = FileState::new(
+            "preserved.txt".to_string(),
+            "a".repeat(64), // marker hash: only present if reused
+            meta.len(),
+            meta.modified().unwrap().into(),
+        );
+
+        // Overwrite with different content but the SAME size, then restore the
+        // exact same past mtime, as a mtime-preserving tool would.
+        std::fs::write(&file_path, b"BBBB").unwrap();
+        set_mtime(&file_path, past_mtime);
+
+        let state = scanner
+            .scan_file_with_stored(&file_path, Some(&stored))
+            .unwrap();
+
+        // mtime and size still match the stored state...
+        assert_eq!(state.modified_at, stored.modified_at);
+        assert_eq!(state.size, stored.size);
+        // ...but the mtime is older than the stored last_sync_at, so the hash
+        // must be recomputed and the content change detected.
+        assert_ne!(
+            state.hash, stored.hash,
+            "preserved past mtime + same size must still be re-hashed"
+        );
+        assert_eq!(state.hash, compute_file_hash(&file_path).unwrap());
+
+        let changes = scanner.detect_changes(&[state], &[stored]);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path(), "preserved.txt");
+        assert_eq!(changes[0].change_type(), ChangeType::Modified);
+    }
+
     /// `full_scan_with_stored` over an unchanged tree must reuse every stored
     /// hash (zero file re-reads) while producing the same states as `full_scan`.
     #[tokio::test]
@@ -628,9 +708,19 @@ mod tests {
         let scanner = Scanner::new(root.clone(), IgnoreMatcher::empty());
 
         // Establish the stored states (this first scan hashes everything).
-        let stored_states = Arc::new(scanner.full_scan().await.unwrap());
+        let mut stored_vec = scanner.full_scan().await.unwrap();
         let hashes_after_first = scanner.hash_computations();
         assert_eq!(hashes_after_first, 3, "first scan must hash all 3 files");
+
+        // The first scan stamps each stored state's last_sync_at with the scan
+        // time, which is newer than the files' mtimes. The hash-reuse shortcut
+        // requires the file mtime to be at least as new as the stored
+        // last_sync_at, so shift each stored last_sync_at into the past to
+        // model files last modified after they were synced.
+        for state in &mut stored_vec {
+            state.last_sync_at = Utc::now() - Duration::from_hours(2);
+        }
+        let stored_states = Arc::new(stored_vec);
 
         // A second scan against the stored states must reuse all hashes.
         let current = scanner
