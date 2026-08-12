@@ -278,6 +278,12 @@ pub struct SyncConfig {
     pub parallel: bool,
     #[serde(default = "default_max_parallel")]
     pub max_parallel: usize,
+    /// How long (seconds) a soft-delete tombstone is kept before it is pruned.
+    /// A tombstone lets other clients observe and propagate a deletion; once it
+    /// is older than this window it is considered obsolete and hard-deleted so
+    /// `get_all_files`/`get_changes` do not grow unbounded. `0` disables pruning.
+    #[serde(default = "default_tombstone_retention_secs")]
+    pub tombstone_retention_secs: u64,
 }
 
 impl Default for SyncConfig {
@@ -290,6 +296,7 @@ impl Default for SyncConfig {
             max_file_size: default_max_file_size(),
             parallel: default_parallel(),
             max_parallel: default_max_parallel(),
+            tombstone_retention_secs: default_tombstone_retention_secs(),
         }
     }
 }
@@ -391,6 +398,11 @@ const fn default_parallel() -> bool {
 
 const fn default_max_parallel() -> usize {
     4
+}
+
+/// Default soft-delete tombstone retention: 7 days.
+const fn default_tombstone_retention_secs() -> u64 {
+    7 * 24 * 60 * 60
 }
 
 #[cfg(test)]

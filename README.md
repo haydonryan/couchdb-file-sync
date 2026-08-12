@@ -133,6 +133,9 @@ paths:
 sync:
   poll_interval: 60
   debounce_ms: 500
+  # Soft-delete tombstones older than this many seconds are pruned so
+  # get_all_files/get_changes do not grow unbounded. 0 disables pruning.
+  tombstone_retention_secs: 604800
 
 notifications:
   enabled: true

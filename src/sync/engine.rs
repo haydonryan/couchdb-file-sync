@@ -26,6 +26,9 @@ pub struct SyncEngine {
     root_dir: SyncDirPath,
     /// Kept for backward compatibility; delegates to scanner.
     ignore_matcher: IgnoreMatcher,
+    /// Optional retention window for soft-delete tombstones. When set, each
+    /// non-dry-run sync cycle prunes tombstones older than this window.
+    tombstone_retention: Option<std::time::Duration>,
 }
 
 /// Report from a sync operation
@@ -533,6 +536,7 @@ impl SyncEngine {
             scanner,
             root_dir,
             ignore_matcher,
+            tombstone_retention: None,
         }
     }
 
@@ -550,7 +554,19 @@ impl SyncEngine {
             scanner,
             root_dir,
             ignore_matcher,
+            tombstone_retention: None,
         }
+    }
+
+    /// Enable pruning of soft-delete tombstones older than `retention` on each
+    /// non-dry-run sync cycle. Pass `None` (or omit) to disable pruning.
+    #[must_use]
+    pub const fn with_tombstone_retention(
+        mut self,
+        retention: Option<std::time::Duration>,
+    ) -> Self {
+        self.tombstone_retention = retention;
+        self
     }
 
     /// Cheap handle to the per-file apply state used by the bounded-concurrency
@@ -660,6 +676,18 @@ impl SyncEngine {
         // 7. Update checkpoint (skipped in dry-run)
         if !dry_run {
             self.local_db.save_checkpoint(&last_seq).await?;
+        }
+
+        // 8. Prune obsolete soft-delete tombstones (skipped in dry-run).
+        //    Best-effort: a pruning failure is logged, not fatal to the sync.
+        if !dry_run && let Some(retention) = self.tombstone_retention {
+            match self.couchdb.prune_tombstones(retention).await {
+                Ok(pruned) if pruned > 0 => {
+                    info!("Pruned {pruned} obsolete delete tombstone(s)");
+                }
+                Ok(_) => {}
+                Err(e) => warn!("Tombstone pruning failed: {e}"),
+            }
         }
 
         if dry_run {

@@ -1,4 +1,4 @@
-use crate::models::{Change, ChunkDoc, DatabaseName, FileDoc, RemotePath};
+use crate::models::{Change, ChunkDoc, DatabaseName, FileDoc, RemotePath, TimestampMillis};
 use anyhow::Result;
 use couch_rs::Client;
 use couch_rs::database::Database;
@@ -565,6 +565,10 @@ impl CouchDb {
 
         if let Some(mut doc) = self.get_file(path).await? {
             doc.deleted = true;
+            // Stamp the tombstone with the deletion time so age-based pruning
+            // (and remote-delete arbitration against last_sync_at) uses the
+            // delete time rather than the file's last modification time.
+            doc.mtime = crate::models::TimestampMillis::now();
             self.save_file(&mut doc).await?;
             debug!("Marked file as deleted in CouchDB: {}", path);
         }
@@ -868,33 +872,98 @@ impl CouchDb {
             if let Some(chunk) = self.get_chunk(chunk_id).await?
                 && let Some(rev) = chunk.rev
             {
-                let url = format!("{}/{}?rev={}", self.base_db_url, chunk_id, rev);
-                let mut request = self.http_client.delete(&url);
-                if let Some((username, password)) = &self.auth {
-                    request = request.basic_auth(username, Some(password));
-                }
-                match request.send().await {
-                    Ok(response) if response.status().is_success() => {
-                        debug!("Deleted old chunk: {}", chunk_id);
-                    }
-                    Ok(response) => {
-                        let status = response.status();
-                        let body = response.text().await.unwrap_or_default();
-                        warn!(
-                            "Failed to delete old chunk {}: {} - {}",
-                            chunk_id, status, body
-                        );
-                        anyhow::bail!("Failed to delete old chunk {chunk_id}: {status} - {body}");
-                    }
-                    Err(e) => {
-                        warn!("Failed to delete old chunk {}: {}", chunk_id, e);
-                        anyhow::bail!("Failed to delete old chunk {chunk_id}: {e}");
-                    }
-                }
+                self.delete_doc(chunk_id, &rev).await?;
             }
         }
         Ok(())
     }
+
+    /// Permanently delete a document by id and current revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `CouchDB` delete request fails.
+    async fn delete_doc(&self, id: &str, rev: &str) -> Result<()> {
+        let url = format!("{}/{id}?rev={rev}", self.base_db_url);
+        let mut request = self.http_client.delete(&url);
+        if let Some((username, password)) = &self.auth {
+            request = request.basic_auth(username, Some(password));
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                debug!("Deleted document: {}", id);
+                Ok(())
+            }
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                warn!("Failed to delete {}: {} - {}", id, status, body);
+                anyhow::bail!("Failed to delete {id}: {status} - {body}")
+            }
+            Err(e) => {
+                warn!("Failed to delete {}: {}", id, e);
+                anyhow::bail!("Failed to delete {id}: {e}")
+            }
+        }
+    }
+
+    /// Permanently remove soft-delete tombstones that have outlived the
+    /// retention window.
+    ///
+    /// A tombstone is a file document with `deleted: true` that exists so other
+    /// clients observe and propagate the deletion. Keeping them forever makes
+    /// `get_all_files`/`get_changes` grow unbounded, so once a tombstone has
+    /// been around longer than `retention` (its deletion-stamped mtime is older
+    /// than the cutoff) it is considered obsolete and hard-deleted. This is
+    /// best-effort cleanup: an individual tombstone that cannot be deleted is
+    /// logged and skipped rather than aborting the sync.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the initial document fetch fails.
+    pub async fn prune_tombstones(&self, retention: Duration) -> Result<usize> {
+        #[cfg(test)]
+        if self.test_state.is_some() {
+            self.test_write_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Ok(0);
+        }
+
+        let all_files = self.get_all_files().await?;
+        let now_ms = crate::models::TimestampMillis::now().as_u64();
+        let cutoff = crate::models::TimestampMillis::new(
+            now_ms.saturating_sub(u64::try_from(retention.as_millis()).unwrap_or(u64::MAX)),
+        );
+        let candidates = obsolete_tombstones(&all_files, cutoff);
+
+        let mut pruned = 0;
+        for doc in candidates {
+            let Some(rev) = &doc.rev else {
+                warn!("Skipping tombstone {} without a revision", doc.id);
+                continue;
+            };
+            match self.delete_doc(&doc.id, rev).await {
+                Ok(()) => {
+                    pruned += 1;
+                    debug!("Pruned obsolete tombstone: {}", doc.id);
+                }
+                Err(e) => warn!("Failed to prune tombstone {}: {e}", doc.id),
+            }
+        }
+        Ok(pruned)
+    }
+}
+
+/// Select the soft-delete tombstones that are old enough to be pruned.
+///
+/// A tombstone is obsolete when it is a file doc flagged `deleted` whose
+/// deletion-stamped mtime predates the cutoff. Chunks and live files are never
+/// candidates.
+#[must_use]
+fn obsolete_tombstones(docs: &[FileDoc], cutoff: TimestampMillis) -> Vec<&FileDoc> {
+    docs.iter()
+        .filter(|d| d.is_file() && d.deleted && d.mtime.as_u64() < cutoff.as_u64())
+        .collect()
 }
 
 /// Helper to create `CouchDB` URL from components
@@ -1393,6 +1462,219 @@ mod tests {
             result.is_ok(),
             "successful chunk delete must return Ok, got: {result:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // obsolete_tombstones
+    // -----------------------------------------------------------------------
+
+    fn tombstone(id: &str, mtime_ms: u64) -> FileDoc {
+        FileDoc {
+            id: id.to_string(),
+            rev: Some("1-abc".to_string()),
+            children: vec![],
+            path: id.to_string(),
+            ctime: TimestampMillis::new(0),
+            mtime: TimestampMillis::new(mtime_ms),
+            size: 0,
+            doc_type: crate::models::DocType::Plain,
+            deleted: true,
+        }
+    }
+
+    #[test]
+    fn obsolete_tombstones_prunes_only_old_deleted_docs() {
+        let cutoff = TimestampMillis::new(1_000);
+        let old = tombstone("notes/old.md", 500);
+        let fresh = tombstone("notes/fresh.md", 2_000);
+        let docs = vec![old, fresh];
+
+        let obsolete = obsolete_tombstones(&docs, cutoff);
+
+        assert_eq!(obsolete.len(), 1);
+        assert_eq!(obsolete[0].id, "notes/old.md");
+    }
+
+    #[test]
+    fn obsolete_tombstones_keeps_live_files_and_chunks() {
+        let cutoff = TimestampMillis::new(1_000);
+        let live = FileDoc {
+            id: "notes/live.md".to_string(),
+            rev: Some("1-abc".to_string()),
+            children: vec![],
+            path: "notes/live.md".to_string(),
+            ctime: TimestampMillis::new(0),
+            mtime: TimestampMillis::new(500),
+            size: 10,
+            doc_type: crate::models::DocType::Plain,
+            deleted: false,
+        };
+        let chunk = FileDoc {
+            id: "h:chunk1".to_string(),
+            rev: Some("1-abc".to_string()),
+            children: vec![],
+            path: "h:chunk1".to_string(),
+            ctime: TimestampMillis::new(0),
+            mtime: TimestampMillis::new(500),
+            size: 0,
+            doc_type: crate::models::DocType::Leaf,
+            deleted: true,
+        };
+        let docs = vec![live, chunk];
+
+        assert!(obsolete_tombstones(&docs, cutoff).is_empty());
+    }
+
+    #[test]
+    fn obsolete_tombstones_boundary_at_cutoff_is_not_pruned() {
+        // A tombstone whose mtime equals the cutoff is not yet obsolete.
+        let cutoff = TimestampMillis::new(1_000);
+        let at_cutoff = tombstone("notes/edge.md", 1_000);
+        assert!(obsolete_tombstones(&[at_cutoff], cutoff).is_empty());
+    }
+
+    #[tokio::test]
+    async fn prune_tombstones_deletes_only_obsolete_docs_from_couchdb() {
+        let (base_db_url, conn_count, delete_count, server, shutdown) = spawn_tombstone_couch();
+        let db = couchdb_at_ephemeral(&base_db_url);
+
+        // The fake server serves two tombstones: one old (mtime 0) and one
+        // fresh (mtime = now). Only the old one should be pruned.
+        let pruned = db.prune_tombstones(Duration::from_hours(1)).await.unwrap();
+        assert_eq!(pruned, 1, "only the obsolete tombstone should be pruned");
+
+        // Exactly one DELETE must have been issued (for the old tombstone).
+        assert_eq!(
+            delete_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one obsolete tombstone should be hard-deleted"
+        );
+
+        drop(db);
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake couch server join");
+        let used = conn_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!((1..=2).contains(&used));
+    }
+
+    // -----------------------------------------------------------------------
+    // Tombstone-serving fake CouchDB server
+    // -----------------------------------------------------------------------
+
+    /// Build a `CouchDb` whose `couch_rs` client points at the given ephemeral
+    /// fake-server base URL. Unlike `couchdb_at`, the `couch_rs` `db` (used by
+    /// `get_all_files`) is pointed at the fake server's origin rather than the
+    /// hard-coded `localhost:15984`, so `prune_tombstones`' document fetch hits
+    /// the fake server.
+    fn couchdb_at_ephemeral(base_db_url: &str) -> CouchDb {
+        let origin = base_db_url.trim_end_matches("/test_db");
+        let client = Client::new_no_auth(origin).unwrap();
+        let db = Database::new("test_db".to_string(), client.clone());
+        CouchDb {
+            client,
+            db,
+            http_client: HttpClient::new(),
+            base_db_url: base_db_url.to_string(),
+            db_name: DatabaseName::new("test_db"),
+            auth: None,
+            remote_path: RemotePath::new(String::new()),
+            timeout_seconds: 30,
+            retry_attempts: 3,
+            test_state: None,
+            test_write_calls: std::sync::atomic::AtomicUsize::new(0),
+            test_backoff: Duration::from_millis(1),
+        }
+    }
+
+    /// Spawn a fake `CouchDB` server that answers `POST /_all_docs` with a
+    /// fixed pair of tombstone documents (one old, one fresh) and counts
+    /// `DELETE` requests. Returns the base URL, a connection counter, a delete
+    /// counter, the server thread handle, and a shutdown flag.
+    #[allow(clippy::type_complexity)]
+    fn spawn_tombstone_couch() -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake couch");
+        let addr = listener.local_addr().expect("fake couch addr");
+        let base_db_url = format!("http://{addr}/test_db");
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let conn_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let delete_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shutdown_thread = shutdown.clone();
+        let conn_count_thread = conn_count.clone();
+        let delete_count_thread = delete_count.clone();
+        let now_ms = crate::models::TimestampMillis::now().as_u64();
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("fake couch runtime");
+            runtime.block_on(async move {
+                listener
+                    .set_nonblocking(true)
+                    .expect("set fake couch nonblocking");
+                let listener =
+                    tokio::net::TcpListener::from_std(listener).expect("fake couch tokio listener");
+                loop {
+                    if shutdown_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    match tokio::time::timeout(Duration::from_millis(10), listener.accept()).await {
+                        Ok(Ok((stream, _))) => {
+                            conn_count_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let delete_count_thread = delete_count_thread.clone();
+                            let service = hyper::service::service_fn(move |req| {
+                                handle_tombstone_couch_req(req, now_ms, delete_count_thread.clone())
+                            });
+                            tokio::spawn(async move {
+                                let io = hyper_util::rt::TokioIo::new(stream);
+                                let _ = hyper::server::conn::http1::Builder::new()
+                                    .serve_connection(io, service)
+                                    .await;
+                            });
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_elapsed) => {}
+                    }
+                }
+            });
+        });
+        (base_db_url, conn_count, delete_count, handle, shutdown)
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn handle_tombstone_couch_req(
+        req: hyper::Request<hyper::body::Incoming>,
+        now_ms: u64,
+        delete_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Result<hyper::Response<http_body_util::Full<hyper::body::Bytes>>, hyper::Error> {
+        let (parts, _body) = req.into_parts();
+        let mut response =
+            hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::new()));
+        match parts.method {
+            hyper::Method::POST => {
+                let body = format!(
+                    r#"{{"total_rows":2,"offset":0,"rows":[
+                        {{"id":"notes/old.md","key":null,"value":{{"rev":"1-aaa"}},"doc":{{"_id":"notes/old.md","_rev":"1-aaa","path":"notes/old.md","ctime":0,"mtime":0,"size":0,"type":"plain","deleted":true}}}},
+                        {{"id":"notes/fresh.md","key":null,"value":{{"rev":"1-bbb"}},"doc":{{"_id":"notes/fresh.md","_rev":"1-bbb","path":"notes/fresh.md","ctime":0,"mtime":{now_ms},"size":0,"type":"plain","deleted":true}}}}
+                    ]}}"#
+                );
+                *response.body_mut() = http_body_util::Full::new(body.into());
+            }
+            hyper::Method::DELETE => {
+                delete_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                *response.body_mut() =
+                    http_body_util::Full::new(hyper::body::Bytes::from_static(br#"{"ok":true}"#));
+            }
+            _ => {
+                *response.status_mut() = hyper::StatusCode::NOT_FOUND;
+            }
+        }
+        Ok(response)
     }
 
     /// Regression test for the macOS-CI flake: the fake `CouchDB` server must not

@@ -36,6 +36,11 @@ sync:
   parallel: true
   max_parallel: 4
 
+  # How long (seconds) a soft-delete tombstone is kept before it is pruned so
+  # get_all_files/get_changes do not grow unbounded. 0 disables pruning.
+  # Default: 604800 (7 days)
+  tombstone_retention_secs: 604800
+
 # Ignore patterns (alternative to .sync-ignore file)
 ignore:
   patterns:

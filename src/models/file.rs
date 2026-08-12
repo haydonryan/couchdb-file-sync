@@ -160,11 +160,15 @@ impl FileDoc {
         }
     }
 
-    /// Check if this is a file document (not a chunk)
+    /// Check if this is a file document (not a chunk).
+    ///
+    /// Classification is type-based rather than an id-prefix heuristic: a
+    /// document is a file iff its `type` is `plain`, and a chunk iff its `type`
+    /// is `leaf`. The previous `h:`-prefix check could misclassify leaf docs
+    /// whose ids do not carry the prefix.
     #[must_use]
-    pub fn is_file(&self) -> bool {
-        // Files have type "plain" and IDs that don't start with "h:"
-        matches!(self.doc_type, DocType::Plain) || !self.id.starts_with("h:")
+    pub const fn is_file(&self) -> bool {
+        matches!(self.doc_type, DocType::Plain)
     }
 
     /// Get modification time as `DateTime`
@@ -345,6 +349,42 @@ mod tests {
             deleted: false,
         };
         assert!(!doc.is_file());
+    }
+
+    #[test]
+    fn test_file_doc_is_file_leaf_type_ignores_id_prefix() {
+        // A leaf chunk whose id does not carry the old "h:" prefix must still
+        // be classified as a chunk. The type-based check no longer depends on
+        // the id-prefix heuristic, which used to misclassify such docs.
+        let doc = FileDoc {
+            id: "chunk/without/prefix".into(),
+            rev: None,
+            children: vec![],
+            path: "chunk/without/prefix".into(),
+            ctime: TimestampMillis::new(0),
+            mtime: TimestampMillis(0),
+            size: 100,
+            doc_type: DocType::Leaf,
+            deleted: false,
+        };
+        assert!(!doc.is_file());
+    }
+
+    #[test]
+    fn test_file_doc_is_file_plain_type_ignores_h_prefix() {
+        // A plain file whose id happens to start with "h:" is still a file.
+        let doc = FileDoc {
+            id: "h:not-a-chunk.txt".into(),
+            rev: None,
+            children: vec![],
+            path: "h:not-a-chunk.txt".into(),
+            ctime: TimestampMillis::new(0),
+            mtime: TimestampMillis(0),
+            size: 100,
+            doc_type: DocType::Plain,
+            deleted: false,
+        };
+        assert!(doc.is_file());
     }
 
     #[test]

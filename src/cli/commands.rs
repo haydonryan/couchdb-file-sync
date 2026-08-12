@@ -452,8 +452,11 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
     .await?;
 
     // Run sync (dry-run walks the pipeline without writing)
+    let retention = (config.sync.tombstone_retention_secs > 0)
+        .then(|| std::time::Duration::from_secs(config.sync.tombstone_retention_secs));
     let mut engine =
-        SyncEngine::with_ignore(couchdb, local_db, resolve_sync_dir(&path)?, ignore_matcher);
+        SyncEngine::with_ignore(couchdb, local_db, resolve_sync_dir(&path)?, ignore_matcher)
+            .with_tombstone_retention(retention);
     let report = if dry_run {
         engine.sync_dry_run().await?
     } else {
@@ -985,8 +988,11 @@ async fn daemon_sync(
     .await?;
 
     // Run sync
+    let retention = (config.sync.tombstone_retention_secs > 0)
+        .then(|| std::time::Duration::from_secs(config.sync.tombstone_retention_secs));
     let mut engine =
-        SyncEngine::with_ignore(couchdb, local_db, resolve_sync_dir(path)?, ignore_matcher);
+        SyncEngine::with_ignore(couchdb, local_db, resolve_sync_dir(path)?, ignore_matcher)
+            .with_tombstone_retention(retention);
     let report = engine.sync().await?;
 
     print_sync_report(&report, false);
@@ -1067,6 +1073,10 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
         local_db,
         sync_dir.clone(),
         (*ignore_matcher).clone(),
+    )
+    .with_tombstone_retention(
+        (config.sync.tombstone_retention_secs > 0)
+            .then(|| std::time::Duration::from_secs(config.sync.tombstone_retention_secs)),
     );
     let initial_since: String = if let Some(cp) = engine.get_checkpoint().await? {
         cp.last_seq
