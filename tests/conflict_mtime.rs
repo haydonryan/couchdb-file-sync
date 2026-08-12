@@ -118,21 +118,10 @@ async fn stale_remote_mtime_does_not_mask_conflict() -> Result<()> {
         assert_eq!(rep.conflicts, 0);
 
         // Step 2 — B pulls it down; this establishes B's stored state with a
-        // recent `last_sync_at` and the current revision R1.
-        //
-        // Finding #4 (bootstrap, tracked separately): the FIRST sync returns no
-        // remote changes (no checkpoint yet), so B needs a second sync to
-        // materialize the pre-existing remote file. Work around it here so this
-        // test isolates finding #1.
-        let _ = run_sync(
-            &dir_b,
-            &url,
-            &db_name,
-            user.as_deref(),
-            pass.as_deref(),
-            &remote,
-        )
-        .await?;
+        // recent `last_sync_at` and the current revision R1. The first sync
+        // bootstraps the existing in-scope remote file set (no checkpoint yet),
+        // so f.txt is materialized on B's first sync and a later incremental
+        // cycle only pulls changes since the checkpoint.
         let rep = run_sync(
             &dir_b,
             &url,
@@ -142,7 +131,10 @@ async fn stale_remote_mtime_does_not_mask_conflict() -> Result<()> {
             &remote,
         )
         .await?;
-        assert_eq!(rep.downloaded.0, 1, "B downloads f.txt on second sync");
+        assert_eq!(
+            rep.downloaded.0, 1,
+            "B downloads f.txt on first sync (bootstrap)"
+        );
         assert_eq!(fs::read_to_string(dir_b.join("f.txt"))?, "hello");
 
         // Step 3 — A edits f.txt but with a STALE/preserved mtime (simulating
