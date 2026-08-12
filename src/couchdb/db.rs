@@ -592,8 +592,15 @@ impl CouchDb {
             .collect())
     }
 
-    /// Get changes since the last checkpoint
-    /// Returns remote files within the configured remote path
+    /// Get changes since the last checkpoint.
+    ///
+    /// Returns remote files within the configured remote path. On the first
+    /// run (no checkpoint) this bootstraps the existing in-scope file set so a
+    /// fresh client materializes pre-existing remote files. On subsequent runs
+    /// it resumes the since-based `_changes` feed so only changes after the
+    /// checkpoint are returned. The returned sequence is the scope-appropriate
+    /// resume point: the feed's `last_seq` for incremental runs, or the DB
+    /// `update_seq` captured for the bootstrap run.
     ///
     /// # Errors
     ///
@@ -607,49 +614,43 @@ impl CouchDb {
             return Ok((state.changes.clone(), state.last_seq.clone()));
         }
 
-        let all_files = self.get_all_files().await?;
-        debug!(
-            "Total files in CouchDB (filtered by remote_path): {}",
-            all_files.len()
-        );
-
-        // If no checkpoint exists (first run), return empty changes
-        // The files will be handled as new files on the next sync
-        if since.is_none() {
-            debug!("No checkpoint found, returning empty changes list");
+        // First run (no checkpoint): bootstrap the existing in-scope file set so
+        // a fresh client materializes pre-existing remote files, then checkpoint
+        // the current DB sequence so later syncs are incremental.
+        let Some(since) = since else {
+            let all_files = self.get_all_files().await?;
+            debug!(
+                "Bootstrap (no checkpoint): {} existing files in scope",
+                all_files.len()
+            );
+            let changes: Vec<Change> = all_files
+                .into_iter()
+                .map(|doc| {
+                    let mtime = doc.modified_at();
+                    let rev = doc.rev.clone().unwrap_or_default();
+                    if doc.deleted {
+                        Change::remote_deleted(doc.id.clone(), Some(doc.modified_at()))
+                    } else {
+                        Change::remote_modified(doc.id, String::new(), doc.size, mtime, rev)
+                    }
+                })
+                .collect();
             let seq = self.get_update_seq().await?;
-            return Ok((Vec::new(), seq));
-        }
+            return Ok((changes, seq));
+        };
 
+        // Incremental: resume the since-based `_changes` feed so we only pull
+        // changes that occurred after the checkpoint. The feed's `last_seq` is
+        // the scope-appropriate resume point for the next cycle.
+        let (entries, seq) = self
+            .get_changes_feed(since, self.timeout_seconds.saturating_mul(1000))
+            .await?;
+        let changes: Vec<Change> = entries.into_iter().map(|entry| entry.change).collect();
         debug!(
-            "Checkpoint found: {}, returning changes",
-            since.unwrap_or_default()
+            "Returning {} changes since checkpoint {}",
+            changes.len(),
+            since
         );
-
-        // Return all files (including deleted) as potential changes (sync will compare revs)
-        let changes: Vec<Change> = all_files
-            .into_iter()
-            .map(|doc| {
-                let mtime = doc.modified_at();
-                let rev = doc.rev.clone().unwrap_or_default();
-                if doc.deleted {
-                    Change::remote_deleted(doc.id.clone(), Some(doc.modified_at()))
-                } else {
-                    crate::models::Change::remote_modified(
-                        doc.id,
-                        String::new(),
-                        doc.size,
-                        mtime,
-                        rev,
-                    )
-                }
-            })
-            .collect();
-
-        debug!("Returning {} changes", changes.len());
-
-        // Return the CouchDB update sequence so live sync can resume safely.
-        let seq = self.get_update_seq().await?;
         Ok((changes, seq))
     }
 
@@ -1462,6 +1463,258 @@ mod tests {
             result.is_ok(),
             "successful chunk delete must return Ok, got: {result:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // get_changes: since-based incremental feed + first-run bootstrap
+    // -----------------------------------------------------------------------
+
+    /// Build a live (non-deleted) `FileDoc` for the fake `_changes`/`_all_docs`
+    /// server, tagged with the given mtime so changes are distinguishable.
+    fn changes_file_doc(id: &str, mtime_ms: u64) -> FileDoc {
+        FileDoc {
+            id: id.to_string(),
+            rev: Some("1-abc".to_string()),
+            children: vec![],
+            path: id.to_string(),
+            ctime: TimestampMillis::new(0),
+            mtime: TimestampMillis::new(mtime_ms),
+            size: 1,
+            doc_type: crate::models::DocType::Plain,
+            deleted: false,
+        }
+    }
+
+    /// Build a `CouchDb` whose *both* `couch_rs` client (used by
+    /// `get_all_files`/`get_update_seq`) and reqwest client (used by
+    /// `get_changes_feed`) point at `addr`, with the given remote-path scope.
+    fn couchdb_at_full(addr: &str, remote_path: &str) -> CouchDb {
+        let client = Client::new_no_auth(addr).unwrap();
+        let db = Database::new("test_db".to_string(), client.clone());
+        CouchDb {
+            client,
+            db,
+            http_client: HttpClient::new(),
+            base_db_url: format!("{addr}/test_db"),
+            db_name: DatabaseName::new("test_db"),
+            auth: None,
+            remote_path: RemotePath::new(remote_path.to_string()),
+            timeout_seconds: 30,
+            retry_attempts: 3,
+            test_state: None,
+            test_write_calls: std::sync::atomic::AtomicUsize::new(0),
+            test_backoff: Duration::from_millis(1),
+        }
+    }
+
+    /// Spawn an in-process fake `CouchDB` server backed by a real hyper HTTP
+    /// server that serves the three endpoints `get_changes` touches:
+    ///
+    /// - `POST /test_db/_all_docs` (via `couch_rs`), returning `docs` — the
+    ///   bootstrap path for a first run with no checkpoint.
+    /// - `GET /test_db/_changes` (via reqwest), returning change rows for
+    ///   `docs` with `1`-based sequences, filtered to sequences strictly
+    ///   greater than the `since` query parameter — the incremental path.
+    /// - `GET /test_db` (via `couch_rs`), returning a `DbInfo` whose
+    ///   `update_seq` equals the number of `docs`, so bootstrap can checkpoint
+    ///   a scope-appropriate sequence.
+    ///
+    /// Returns the server base URL, the server thread handle, and a shutdown
+    /// flag.
+    fn spawn_fake_changes_couch(
+        docs: Vec<FileDoc>,
+    ) -> (
+        String,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake changes couch");
+        let addr = listener.local_addr().expect("fake changes addr");
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_thread = shutdown.clone();
+        let docs_thread = docs;
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("fake changes runtime");
+            runtime.block_on(async move {
+                listener
+                    .set_nonblocking(true)
+                    .expect("set fake changes nonblocking");
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .expect("fake changes tokio listener");
+                loop {
+                    if shutdown_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    match tokio::time::timeout(Duration::from_millis(10), listener.accept()).await {
+                        Ok(Ok((stream, _))) => {
+                            let docs = docs_thread.clone();
+                            let service = hyper::service::service_fn(move |req| {
+                                handle_fake_changes_couch_req(req, docs.clone())
+                            });
+                            tokio::spawn(async move {
+                                let io = hyper_util::rt::TokioIo::new(stream);
+                                let _ = hyper::server::conn::http1::Builder::new()
+                                    .serve_connection(io, service)
+                                    .await;
+                            });
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_) => {}
+                    }
+                }
+            });
+        });
+        (format!("http://{addr}"), handle, shutdown)
+    }
+
+    /// Serve the three `CouchDB` endpoints used by `get_changes` (see
+    /// [`spawn_fake_changes_couch`]). hyper handles HTTP/1.1 framing and
+    /// keep-alive, so reqwest and `couch_rs` reuse connections deterministically.
+    #[allow(clippy::unused_async)]
+    async fn handle_fake_changes_couch_req(
+        req: hyper::Request<hyper::body::Incoming>,
+        docs: Vec<FileDoc>,
+    ) -> Result<hyper::Response<http_body_util::Full<hyper::body::Bytes>>, hyper::Error> {
+        let (parts, _body) = req.into_parts();
+        let mut response =
+            hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::new()));
+        let method = parts.method.clone();
+        let path = parts.uri.path().to_string();
+        match (method, path.as_str()) {
+            // `couch_rs` percent-encodes the underscore in the db name
+            // (`/test%5Fdb`), while our own reqwest path does not, so match on
+            // the endpoint suffix rather than the exact path.
+            (hyper::Method::POST, p) if p.ends_with("_all_docs") => {
+                let rows: Vec<serde_json::Value> = docs
+                    .iter()
+                    .map(|d| {
+                        serde_json::json!({
+                            "id": d.id,
+                            "key": d.id,
+                            "value": { "rev": d.rev.clone().unwrap_or_default() },
+                            "doc": d,
+                        })
+                    })
+                    .collect();
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(
+                    serde_json::json!({ "total_rows": rows.len(), "offset": 0, "rows": rows })
+                        .to_string(),
+                ));
+            }
+            (hyper::Method::GET, p) if p.ends_with("_changes") => {
+                let since = parts
+                    .uri
+                    .query()
+                    .and_then(|q| {
+                        q.split('&').find_map(|kv| {
+                            let (k, v) = kv.split_once('=')?;
+                            (k == "since").then(|| v.to_string())
+                        })
+                    })
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let rows: Vec<serde_json::Value> = docs
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| (*i as u64) + 1 > since)
+                    .map(|(i, d)| {
+                        serde_json::json!({
+                            "seq": ((i as u64) + 1).to_string(),
+                            "id": d.id,
+                            "changes": [{ "rev": d.rev.clone().unwrap_or_default() }],
+                            "deleted": d.deleted,
+                            "doc": d,
+                        })
+                    })
+                    .collect();
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(
+                    serde_json::json!({
+                        "results": rows,
+                        "last_seq": docs.len().to_string(),
+                    })
+                    .to_string(),
+                ));
+            }
+            (hyper::Method::GET, p) if p.ends_with("test_db") || p.ends_with("test%5Fdb") => {
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(
+                    serde_json::json!({
+                        "cluster": { "q": 1, "n": 1, "w": 1, "r": 1 },
+                        "compact_running": false,
+                        "db_name": "test_db",
+                        "disk_format_version": 8,
+                        "doc_count": docs.len(),
+                        "doc_del_count": 0,
+                        "instance_start_time": "0",
+                        "purge_seq": "0",
+                        "sizes": { "file": 0, "external": 0, "active": 0 },
+                        "update_seq": docs.len().to_string(),
+                        "props": {},
+                    })
+                    .to_string(),
+                ));
+            }
+            _ => {
+                *response.status_mut() = hyper::StatusCode::NOT_FOUND;
+            }
+        }
+        Ok(response)
+    }
+
+    #[tokio::test]
+    async fn get_changes_returns_only_changes_since_checkpoint() {
+        // Three in-scope docs on the feed, sequenced 1..=3. A checkpoint at
+        // sequence 2 must yield only the change at sequence 3.
+        let docs = vec![
+            changes_file_doc("notes/a.md", 1000),
+            changes_file_doc("notes/b.md", 2000),
+            changes_file_doc("notes/c.md", 3000),
+        ];
+        let (addr, server, shutdown) = spawn_fake_changes_couch(docs);
+        let db = couchdb_at_full(&addr, "notes/");
+
+        let (changes, seq) = db
+            .get_changes(Some("2"))
+            .await
+            .expect("get_changes should succeed");
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake changes couch join");
+
+        let paths: Vec<&str> = changes.iter().map(Change::path).collect();
+        assert_eq!(
+            paths,
+            vec!["notes/c.md"],
+            "only changes after the checkpoint"
+        );
+        assert_eq!(seq, "3", "returned seq is the feed last_seq");
+    }
+
+    #[tokio::test]
+    async fn get_changes_first_run_bootstraps_existing_files() {
+        // No checkpoint: get_changes must materialize the existing in-scope
+        // file set rather than returning empty.
+        let docs = vec![
+            changes_file_doc("notes/a.md", 1000),
+            changes_file_doc("notes/b.md", 2000),
+        ];
+        let (addr, server, shutdown) = spawn_fake_changes_couch(docs);
+        let db = couchdb_at_full(&addr, "notes/");
+
+        let (changes, seq) = db
+            .get_changes(None)
+            .await
+            .expect("get_changes should succeed");
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake changes couch join");
+
+        let mut paths: Vec<&str> = changes.iter().map(Change::path).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, vec!["notes/a.md", "notes/b.md"]);
+        assert_eq!(seq, "2", "bootstrap checkpoints the DB update_seq");
     }
 
     // -----------------------------------------------------------------------
