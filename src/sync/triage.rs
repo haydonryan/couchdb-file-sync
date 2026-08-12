@@ -154,17 +154,37 @@ pub fn triage_changes<S: std::hash::BuildHasher>(
         // Check if the remote side also changed for this path, performing a
         // single remote_map lookup and reusing the borrow for needs_comparison.
         match remote_map.get(remote_path.as_str()) {
-            Some(rc) if remote_is_newer(rc.mtime().copied(), stored_state) => {
-                // Both sides changed — the caller must compare content hashes
-                result.needs_comparison.push(TriageDecision {
-                    path: lc.path().to_string(),
-                    outcome: TriageOutcome::NeedsComparison,
-                    local_change: Some(lc.clone()),
-                    remote_change: Some((*rc).clone()),
-                });
+            Some(rc) => {
+                // Both sides changed for this path. Decide whether the remote
+                // actually differs from what we last stored using the
+                // authoritative CouchDB revision, so a stale/preserved remote
+                // mtime can no longer mask a real remote edit as "unchanged".
+                // Fall back to the mtime heuristic only when no remote
+                // revision is available.
+                let remote_side_changed = rc.rev().map_or_else(
+                    || remote_is_newer(rc.mtime().copied(), stored_state),
+                    |remote_rev| {
+                        remote_revision_changed(
+                            Some(remote_rev),
+                            stored_state.and_then(|s| s.couch_rev.as_deref()),
+                        )
+                    },
+                );
+                if remote_side_changed {
+                    // Both sides changed — the caller must compare content hashes
+                    result.needs_comparison.push(TriageDecision {
+                        path: lc.path().to_string(),
+                        outcome: TriageOutcome::NeedsComparison,
+                        local_change: Some(lc.clone()),
+                        remote_change: Some((*rc).clone()),
+                    });
+                } else {
+                    // Remote unchanged → upload local change
+                    result.uploads.push(lc.clone());
+                }
             }
-            // Remote unchanged or absent → upload local change
-            _ => result.uploads.push(lc.clone()),
+            // Remote absent → upload local change
+            None => result.uploads.push(lc.clone()),
         }
     }
 
@@ -522,6 +542,55 @@ mod tests {
     }
 
     // ── triage_changes: downloads when remote not in local ──────────
+
+    #[test]
+    fn stale_mtime_concurrent_edit_needs_comparison() {
+        // Finding #1: a remote edit carrying a stale mtime (cp -p, rsync -t,
+        // git checkout, touch -t) must still be surfaced as a concurrent
+        // change via the authoritative CouchDB revision, not silently
+        // overwritten by a local upload.
+        let last_sync = utc("2026-07-28 10:00:00");
+        let remote = vec![remote_change(
+            "f.txt",
+            ChangeType::Modified,
+            Some(last_sync - Duration::hours(1)), // stale mtime BEFORE last sync
+            Some("2-def"),                        // ...but the revision advanced
+        )];
+        let mut states = HashMap::new();
+        states.insert("f.txt".to_string(), make_state("f.txt", last_sync));
+
+        let local = vec![local_change("f.txt", ChangeType::Modified)];
+        let result = triage_changes(&local, &remote, &states, "");
+
+        assert_eq!(result.needs_comparison.len(), 1);
+        assert_eq!(result.needs_comparison[0].path, "f.txt");
+        assert_eq!(
+            result.needs_comparison[0].outcome,
+            TriageOutcome::NeedsComparison
+        );
+        assert!(result.uploads.is_empty());
+    }
+
+    #[test]
+    fn same_revision_remote_uploads_even_with_stale_mtime() {
+        // Guard: when the remote revision is unchanged from what we stored, a
+        // stale mtime must not turn it into a false conflict — we still upload.
+        let last_sync = utc("2026-07-28 10:00:00");
+        let remote = vec![remote_change(
+            "f.txt",
+            ChangeType::Modified,
+            Some(last_sync - Duration::hours(1)), // stale mtime
+            Some("1-abc"),                        // same revision
+        )];
+        let mut states = HashMap::new();
+        states.insert("f.txt".to_string(), make_state("f.txt", last_sync));
+
+        let local = vec![local_change("f.txt", ChangeType::Modified)];
+        let result = triage_changes(&local, &remote, &states, "");
+
+        assert_eq!(result.uploads.len(), 1);
+        assert!(result.needs_comparison.is_empty());
+    }
 
     #[test]
     fn remote_new_file_downloads_when_not_tracked() {

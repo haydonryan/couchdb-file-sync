@@ -198,7 +198,9 @@ async fn stale_remote_mtime_does_not_mask_conflict() -> Result<()> {
             3,
         )
         .await?;
-        let content = couch.get_file_content(&format!("{remote}f.txt")).await?;
+        let content = couch
+            .get_file_content(&couch.get_remote_path("f.txt"))
+            .await?;
         assert_eq!(
             String::from_utf8_lossy(&content),
             "hello-A-v2",
