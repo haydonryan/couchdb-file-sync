@@ -2525,6 +2525,91 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn first_sync_downloads_pre_existing_remote_files() {
+        // A fresh client with no checkpoint must materialize the pre-existing
+        // remote file set on its first sync instead of pulling nothing (the
+        // historical bug where get_changes returned empty on run #1 and remote
+        // files only appeared on sync #2).
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+
+        // Three remote files already exist in scope before this client starts.
+        let remote_prefix = "prefix/";
+        let mut changes = Vec::new();
+        let mut metadata = std::collections::HashMap::new();
+        let mut contents = std::collections::HashMap::new();
+        for (name, size, content) in [
+            ("a.txt", 5usize, b"aaaaa".to_vec()),
+            ("sub/b.txt", 5, b"bbbbb".to_vec()),
+            ("c.md", 5, b"ccccc".to_vec()),
+        ] {
+            let remote = format!("{remote_prefix}{name}");
+            changes.push(Change::remote_created(
+                remote.clone(),
+                format!("rhash-{name}"),
+                size as u64,
+                Utc::now(),
+                format!("1-{name}"),
+            ));
+            let mut doc = FileDoc::new(remote.clone(), String::new(), size as u64);
+            doc.rev = Some(format!("1-{name}"));
+            doc.path = remote.clone();
+            metadata.insert(remote.clone(), doc);
+            contents.insert(remote.clone(), content);
+        }
+
+        let canned = CannedCouch {
+            changes,
+            last_seq: "3".to_string(),
+            metadata,
+            contents,
+            ..CannedCouch::default()
+        };
+        // Empty in-memory state DB: no checkpoint, no file states (first sync).
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch(remote_prefix, canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let report = engine.sync().await.expect("first sync should succeed");
+
+        // Every pre-existing remote file is downloaded and materialized locally.
+        assert_eq!(report.downloaded.0, 3, "all pre-existing files downloaded");
+        assert_eq!(report.uploaded.0, 0);
+        assert_eq!(report.conflicts, 0);
+        assert!(report.errors.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(root.as_path().join("a.txt")).unwrap(),
+            "aaaaa",
+            "pre-existing a.txt must be materialized on first sync"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.as_path().join("sub/b.txt")).unwrap(),
+            "bbbbb",
+            "pre-existing nested b.txt must be materialized on first sync"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.as_path().join("c.md")).unwrap(),
+            "ccccc",
+            "pre-existing c.md must be materialized on first sync"
+        );
+
+        // The bootstrap run checkpoints the DB sequence so the next sync is
+        // incremental rather than re-fetching the whole remote set.
+        let cp = engine
+            .get_checkpoint()
+            .await
+            .expect("checkpoint read should succeed")
+            .expect("first sync must save a checkpoint");
+        assert_eq!(
+            cp.last_seq, "3",
+            "first sync must checkpoint the remote seq"
+        );
+    }
+
     // ── Bounded-concurrency batch apply (#3006) ──────────────────────────
 
     #[tokio::test]

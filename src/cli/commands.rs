@@ -1078,6 +1078,21 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
         (config.sync.tombstone_retention_secs > 0)
             .then(|| std::time::Duration::from_secs(config.sync.tombstone_retention_secs)),
     );
+
+    // Run one full sync cycle before listening so pre-existing remote files
+    // are materialized locally. The live changes feed otherwise starts from
+    // "now"/the checkpoint and a fresh daemon would never fetch remote files
+    // that already exist in the database before it started.
+    let bootstrap_report = engine.sync().await?;
+    if bootstrap_report.downloaded.0 > 0 || bootstrap_report.uploaded.0 > 0 {
+        info!(
+            "Live bootstrap sync: {} uploaded, {} downloaded, {} conflicts",
+            bootstrap_report.uploaded.0, bootstrap_report.downloaded.0, bootstrap_report.conflicts
+        );
+    } else {
+        info!("Live bootstrap sync: already in sync");
+    }
+
     let initial_since: String = if let Some(cp) = engine.get_checkpoint().await? {
         cp.last_seq
     } else {
