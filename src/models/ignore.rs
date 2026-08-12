@@ -123,6 +123,13 @@ impl IgnoreMatcher {
         ignored
     }
 
+    /// Returns true if any pattern (positive or negation) matches the path.
+    fn has_matching_pattern(&self, path: &str) -> bool {
+        self.patterns
+            .iter()
+            .any(|entry| entry.matcher.is_match(path))
+    }
+
     /// Check if a file should be ignored
     #[must_use]
     pub fn should_ignore(&self, path: &Path) -> bool {
@@ -136,17 +143,27 @@ impl IgnoreMatcher {
             return true;
         }
 
-        // Ignore any file or directory that starts with '.'
-        for component in path.components() {
-            if let std::path::Component::Normal(name) = component
-                && let Some(name_str) = name.to_str()
-                && name_str.starts_with('.')
-            {
+        // Default rule: ignore any path with a dot-prefixed component.
+        let dotfile = path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(name)
+                    if name.to_str().is_some_and(|s| s.starts_with('.'))
+            )
+        });
+
+        let pattern_ignored = self.is_ignored(&path_str, path.is_dir());
+
+        if dotfile {
+            // An explicit pattern takes precedence over the default dotfile
+            // rule, so a negation (e.g. `!.env`) can re-include a dotfile.
+            // When no pattern matches the dotfile, keep the default ignore.
+            if !self.has_matching_pattern(&path_str) {
                 return true;
             }
         }
 
-        self.is_ignored(&path_str, path.is_dir())
+        pattern_ignored
     }
 
     /// Returns true if no patterns are defined
@@ -199,5 +216,30 @@ mod tests {
         assert!(matcher.should_ignore(Path::new(".dotdir/file.txt")));
         assert!(!matcher.should_ignore(Path::new("visible")));
         assert!(!matcher.should_ignore(Path::new("folder/visible.txt")));
+    }
+
+    #[test]
+    fn test_negation_reincludes_dotfile() {
+        // A negation pattern re-includes a dotfile the default rule ignores.
+        let matcher = IgnoreMatcher::from_content("!.env");
+        assert!(!matcher.should_ignore(Path::new(".env")));
+        // Unrelated dotfiles are still ignored by default.
+        assert!(matcher.should_ignore(Path::new(".other")));
+        // Non-dotfiles remain unaffected.
+        assert!(!matcher.should_ignore(Path::new("visible.txt")));
+    }
+
+    #[test]
+    fn test_negation_reincludes_nested_dotfile() {
+        let matcher = IgnoreMatcher::from_content("!config/.env");
+        assert!(!matcher.should_ignore(Path::new("config/.env")));
+        assert!(matcher.should_ignore(Path::new("config/.other")));
+    }
+
+    #[test]
+    fn test_negation_does_not_override_explicit_ignore() {
+        // A positive pattern still wins over the dotfile default re-include.
+        let matcher = IgnoreMatcher::from_content("!.env\n.env");
+        assert!(matcher.should_ignore(Path::new(".env")));
     }
 }
