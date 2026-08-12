@@ -324,7 +324,7 @@ impl CouchDb {
 
             if doc.deleted {
                 entries.push(ChangeFeedEntry {
-                    change: Change::remote_deleted(doc.id.clone(), Some(doc.modified_at())),
+                    change: Change::remote_deleted(doc.id.clone(), Some(doc.delete_time())),
                     seq: seq_to_string(&row.seq),
                 });
                 continue;
@@ -565,10 +565,14 @@ impl CouchDb {
 
         if let Some(mut doc) = self.get_file(path).await? {
             doc.deleted = true;
-            // Stamp the tombstone with the deletion time so age-based pruning
-            // (and remote-delete arbitration against last_sync_at) uses the
-            // delete time rather than the file's last modification time.
-            doc.mtime = crate::models::TimestampMillis::now();
+            // Stamp the tombstone with an authoritative deletion timestamp so
+            // age-based pruning and remote-delete arbitration use the *delete*
+            // time rather than the deleted file's possibly-preserved stale
+            // mtime. The mtime is stamped too for older/external clients that
+            // only understand it.
+            let now = crate::models::TimestampMillis::now();
+            doc.deleted_at = now;
+            doc.mtime = now;
             self.save_file(&mut doc).await?;
             debug!("Marked file as deleted in CouchDB: {}", path);
         }
@@ -629,7 +633,7 @@ impl CouchDb {
                     let mtime = doc.modified_at();
                     let rev = doc.rev.clone().unwrap_or_default();
                     if doc.deleted {
-                        Change::remote_deleted(doc.id.clone(), Some(doc.modified_at()))
+                        Change::remote_deleted(doc.id.clone(), Some(doc.delete_time()))
                     } else {
                         Change::remote_modified(doc.id, String::new(), doc.size, mtime, rev)
                     }
@@ -914,8 +918,8 @@ impl CouchDb {
     /// A tombstone is a file document with `deleted: true` that exists so other
     /// clients observe and propagate the deletion. Keeping them forever makes
     /// `get_all_files`/`get_changes` grow unbounded, so once a tombstone has
-    /// been around longer than `retention` (its deletion-stamped mtime is older
-    /// than the cutoff) it is considered obsolete and hard-deleted. This is
+    /// been around longer than `retention` (its authoritative delete time is
+    /// older than the cutoff) it is considered obsolete and hard-deleted. This is
     /// best-effort cleanup: an individual tombstone that cannot be deleted is
     /// logged and skipped rather than aborting the sync.
     ///
@@ -963,7 +967,12 @@ impl CouchDb {
 #[must_use]
 fn obsolete_tombstones(docs: &[FileDoc], cutoff: TimestampMillis) -> Vec<&FileDoc> {
     docs.iter()
-        .filter(|d| d.is_file() && d.deleted && d.mtime.as_u64() < cutoff.as_u64())
+        .filter(|d| {
+            d.is_file()
+                && d.deleted
+                && u64::try_from(d.delete_time().timestamp_millis()).unwrap_or(u64::MAX)
+                    < cutoff.as_u64()
+        })
         .collect()
 }
 
@@ -1479,6 +1488,7 @@ mod tests {
             path: id.to_string(),
             ctime: TimestampMillis::new(0),
             mtime: TimestampMillis::new(mtime_ms),
+            deleted_at: TimestampMillis::default(),
             size: 1,
             doc_type: crate::models::DocType::Plain,
             deleted: false,
@@ -1693,6 +1703,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_changes_tombstone_uses_authoritative_delete_time_not_stale_mtime() {
+        // A soft-delete tombstone preserves the deleted file's own (old) mtime
+        // but stamps an authoritative deletion time. The remote-delete change
+        // must carry that deletion time so a stale preserved mtime cannot
+        // suppress propagation of a genuinely-newer delete.
+        let mut tombstone = changes_file_doc("notes/deleted.md", 1000); // stale file mtime
+        tombstone.deleted = true;
+        tombstone.deleted_at = TimestampMillis::new(9000); // authoritative delete time
+        let docs = vec![tombstone];
+        let (addr, server, shutdown) = spawn_fake_changes_couch(docs);
+        let db = couchdb_at_full(&addr, "notes/");
+
+        let (changes, _seq) = db
+            .get_changes(None)
+            .await
+            .expect("get_changes should succeed");
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake changes couch join");
+
+        let delete = changes
+            .iter()
+            .find(|c| {
+                matches!(c, crate::models::Change::RemoteDeleted { path, .. } if path == "notes/deleted.md")
+            })
+            .expect("tombstone must surface as a remote delete");
+        assert_eq!(
+            delete.mtime().map(chrono::DateTime::timestamp_millis),
+            Some(9000),
+            "remote delete must carry the authoritative deletion time, not the stale file mtime"
+        );
+    }
+
+    #[tokio::test]
     async fn get_changes_first_run_bootstraps_existing_files() {
         // No checkpoint: get_changes must materialize the existing in-scope
         // file set rather than returning empty.
@@ -1729,6 +1773,7 @@ mod tests {
             path: id.to_string(),
             ctime: TimestampMillis::new(0),
             mtime: TimestampMillis::new(mtime_ms),
+            deleted_at: TimestampMillis::default(),
             size: 0,
             doc_type: crate::models::DocType::Plain,
             deleted: true,
@@ -1758,6 +1803,7 @@ mod tests {
             path: "notes/live.md".to_string(),
             ctime: TimestampMillis::new(0),
             mtime: TimestampMillis::new(500),
+            deleted_at: TimestampMillis::default(),
             size: 10,
             doc_type: crate::models::DocType::Plain,
             deleted: false,
@@ -1769,6 +1815,7 @@ mod tests {
             path: "h:chunk1".to_string(),
             ctime: TimestampMillis::new(0),
             mtime: TimestampMillis::new(500),
+            deleted_at: TimestampMillis::default(),
             size: 0,
             doc_type: crate::models::DocType::Leaf,
             deleted: true,

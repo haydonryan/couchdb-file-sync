@@ -67,15 +67,39 @@ pub fn is_polluted_state_path(path: &str, remote_prefix: &str) -> bool {
 }
 
 /// Determine whether a remote delete should be applied locally.
+///
+/// * `stored_state` — last tracked local state (its `last_sync_at` and
+///   `modified_at` record the last sync).
+/// * `remote_delete_time` — the tombstone's authoritative deletion time (see
+///   [`crate::models::FileDoc::delete_time`]), not the deleted file's own
+///   mtime, which may be stale/preserved.
+/// * `local_mtime` — the current on-disk local file mtime, when it exists.
+///
+/// Returns `true` (apply the delete locally) when the file is tracked, has not
+/// been edited locally since the last sync, and the remote deletion is newer
+/// than the last sync — regardless of the deleted file's own mtime.
 #[must_use]
 pub fn should_apply_remote_delete(
     stored_state: Option<&FileState>,
-    remote_mtime: Option<DateTime<Utc>>,
-    _file_exists: bool,
+    remote_delete_time: Option<DateTime<Utc>>,
+    local_mtime: Option<DateTime<Utc>>,
 ) -> bool {
-    stored_state.is_some_and(|state| {
-        remote_mtime.is_none_or(|remote_mtime| remote_mtime > state.last_sync_at)
-    })
+    let Some(state) = stored_state else {
+        // Untracked local file: never delete it on the strength of a remote
+        // tombstone alone.
+        return false;
+    };
+    // Protect a locally-edited file: if the on-disk mtime differs from the
+    // last-synced mtime, the file changed locally since the last sync and the
+    // local edit wins over the remote delete.
+    if let Some(local_mtime) = local_mtime
+        && local_mtime != state.modified_at
+    {
+        return false;
+    }
+    // Otherwise apply the delete when the remote deletion is newer than the
+    // last sync.
+    remote_delete_time.is_none_or(|t| t > state.last_sync_at)
 }
 
 /// Check whether the remote has changed compared to a stored local state.
@@ -252,7 +276,12 @@ pub fn triage_changes<S: std::hash::BuildHasher>(
             // Remote delete — check if it should be applied locally
             let relative_path = local_path.trim_start_matches('/');
             let file_path = std::path::Path::new(relative_path);
-            if should_apply_remote_delete(stored_state, rc.mtime().copied(), file_path.exists()) {
+            let local_mtime = file_path
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(Into::into);
+            if should_apply_remote_delete(stored_state, rc.mtime().copied(), local_mtime) {
                 result.remote_deletes.push(rc.clone());
             } else {
                 result.skipped.push(TriageDecision {
@@ -432,33 +461,73 @@ mod tests {
     // ── should_apply_remote_delete ──────────────────────────────────
 
     #[test]
-    fn stale_remote_delete_does_not_remove_tracked_local_file() {
+    fn remote_delete_predating_last_sync_is_not_applied() {
+        // The tombstone's authoritative delete time predates our last sync, so
+        // we already synced after the deletion and must not remove the file.
         let last_sync = utc("2026-03-23 17:12:33");
         let remote_delete = last_sync - Duration::days(6);
+        let state = make_state("f", last_sync);
 
         assert!(!should_apply_remote_delete(
-            Some(&make_state("f", last_sync)),
+            Some(&state),
             Some(remote_delete),
-            true,
+            Some(state.modified_at), // local file unchanged since last sync
         ));
     }
 
     #[test]
-    fn newer_remote_delete_removes_tracked_local_file() {
+    fn remote_delete_with_stale_file_mtime_still_propagates() {
+        // The deleted remote file's own mtime may be arbitrarily old (cp -p,
+        // rsync -t, touch -t preserve mtime), but the tombstone carries the
+        // authoritative deletion time. A delete newer than the last sync must
+        // propagate regardless of the preserved file mtime.
         let last_sync = utc("2026-03-23 17:12:33");
         let remote_delete = last_sync + Duration::seconds(1);
+        let state = make_state("f", last_sync);
 
         assert!(should_apply_remote_delete(
-            Some(&make_state("f", last_sync)),
+            Some(&state),
             Some(remote_delete),
-            true,
+            Some(state.modified_at), // local file unchanged since last sync
         ));
     }
 
     #[test]
-    fn untracked_existing_local_file_is_not_deleted() {
+    fn locally_edited_file_is_protected_from_remote_delete() {
+        // The remote delete is newer than the last sync, but the local file was
+        // edited since the last sync (on-disk mtime differs from stored), so the
+        // local edit wins and the delete is not applied.
+        let last_sync = utc("2026-03-23 17:12:33");
+        let remote_delete = last_sync + Duration::seconds(1);
+        let state = make_state("f", last_sync);
+        let edited_local = state.modified_at + Duration::hours(1);
+
+        assert!(!should_apply_remote_delete(
+            Some(&state),
+            Some(remote_delete),
+            Some(edited_local),
+        ));
+    }
+
+    #[test]
+    fn untracked_local_file_is_not_deleted_by_remote_tombstone() {
         let remote_delete = utc("2026-03-23 17:12:33");
-        assert!(!should_apply_remote_delete(None, Some(remote_delete), true));
+        assert!(!should_apply_remote_delete(None, Some(remote_delete), None));
+    }
+
+    #[test]
+    fn missing_local_file_with_new_remote_delete_is_applied() {
+        // No local file on disk (nothing to protect) and the delete is newer
+        // than the last sync → apply it (a no-op locally, but recorded).
+        let last_sync = utc("2026-03-23 17:12:33");
+        let remote_delete = last_sync + Duration::seconds(1);
+        let state = make_state("f", last_sync);
+
+        assert!(should_apply_remote_delete(
+            Some(&state),
+            Some(remote_delete),
+            None,
+        ));
     }
 
     // ── remote_is_newer ─────────────────────────────────────────────
