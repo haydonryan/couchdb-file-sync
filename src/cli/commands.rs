@@ -5,9 +5,10 @@ use crate::matrix::MatrixNotifier;
 use crate::models::{
     Change, ChangeType, DatabaseName, IgnoreMatcher, RemotePath, ResolutionStrategy, SyncDirPath,
 };
-use crate::sync::{SyncEngine, SyncReport};
+use crate::sync::{SyncEngine, SyncReport, triage};
 use crate::telegram::TelegramNotifier;
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use reqwest::StatusCode;
 use similar::{ChangeTag, TextDiff};
@@ -1290,34 +1291,19 @@ async fn handle_remote_change(
             let local_mtime_val = local_meta
                 .and_then(|meta| meta.modified().ok())
                 .unwrap_or_else(SystemTime::now);
-            let remote_mtime = change.mtime().map(|dt| {
-                UNIX_EPOCH
-                    + Duration::from_millis(u64::try_from(dt.timestamp_millis()).unwrap_or(0))
-            });
+            let local_mtime = DateTime::<Utc>::from(local_mtime_val);
 
-            let apply_remote = remote_mtime.is_none_or(|remote| {
-                if local_exists {
-                    let local_ms = local_mtime_val
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis();
-                    let remote_ms = remote
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis();
-                    let local_ms = i64::try_from(local_ms).unwrap_or(i64::MAX);
-                    let remote_ms = i64::try_from(remote_ms).unwrap_or(i64::MAX);
-                    let diff = local_ms - remote_ms;
-                    let tolerance_ms = 1000;
-                    if diff.abs() <= tolerance_ms {
-                        false
-                    } else {
-                        diff < 0
-                    }
-                } else {
-                    true
-                }
-            });
+            // Arbitrate using the authoritative CouchDB revision (remote side)
+            // and the stored local sync state (same-machine mtime, immune to
+            // cross-host clock skew) rather than comparing local vs remote
+            // mtimes with a 1s tolerance.
+            let state = engine.get_file_state(&local_rel).await?;
+            let apply_remote = triage::live_should_apply_remote(
+                change.rev(),
+                state.as_ref(),
+                local_exists,
+                local_mtime,
+            );
 
             if apply_remote {
                 touched.mark(&local_rel, SystemTime::now());

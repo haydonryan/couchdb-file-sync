@@ -103,6 +103,55 @@ pub fn remote_revision_changed(remote_rev: Option<&str>, stored_rev: Option<&str
     }
 }
 
+/// Decide, in live mode, whether an incoming remote change should be applied
+/// to the local filesystem (`true`) or the local change should be uploaded
+/// instead (`false`) to arbitrate a concurrent edit.
+///
+/// The remote side is authoritative: the `CouchDB` revision, not the remote
+/// mtime, tells whether the remote changed since our last sync. A
+/// stale/preserved remote mtime (`cp -p`, `rsync -t`, `touch -t`) can no
+/// longer mask a genuine remote edit as "older than local". The local side
+/// compares the on-disk mtime against the stored sync-time mtime — a
+/// same-machine comparison immune to cross-host clock skew.
+///
+/// * `remote_rev` — revision of the incoming remote change
+/// * `stored_state` — last tracked local state (its `couch_rev` and
+///   `modified_at` record the last sync)
+/// * `local_exists` — whether the local file exists on disk
+/// * `local_mtime` — the current on-disk local mtime
+///
+/// Returns `true` (download the remote change) when there is nothing local to
+/// preserve or the local file is unchanged since the last sync. Returns
+/// `false` (upload the local change) when the local file changed since the
+/// last sync and must be arbitrated against the remote edit.
+#[must_use]
+pub fn live_should_apply_remote(
+    remote_rev: Option<&str>,
+    stored_state: Option<&FileState>,
+    local_exists: bool,
+    local_mtime: DateTime<Utc>,
+) -> bool {
+    if !local_exists {
+        // Nothing local to preserve — the remote change is authoritative.
+        return true;
+    }
+    let Some(state) = stored_state else {
+        // An existing local file with no sync record cannot be proven
+        // unchanged; preserve it by uploading rather than overwriting.
+        return false;
+    };
+    if !remote_revision_changed(remote_rev, state.couch_rev.as_deref()) {
+        // Remote revision still matches what we last stored — our own echo
+        // (or an unchanged remote). Nothing new to download.
+        return false;
+    }
+    // Remote changed since our last sync. If the local file is unchanged since
+    // that sync, the remote edit is the only change → download. If the local
+    // file also changed → both sides changed → upload to arbitrate (surfacing
+    // the conflict on the remote).
+    local_mtime == state.modified_at
+}
+
 /// Triage local and remote changes to determine what actions are needed.
 ///
 /// This is a pure function with no I/O or `CouchDB` dependencies. The caller is
@@ -471,6 +520,90 @@ mod tests {
     #[test]
     fn revision_not_changed_when_both_missing() {
         assert!(!remote_revision_changed(None, None));
+    }
+
+    // ── live_should_apply_remote ────────────────────────────────────
+
+    #[test]
+    fn live_remote_change_with_stale_mtime_downloads_when_local_unchanged() {
+        // The remote edit advances the CouchDB revision, but its mtime is
+        // stale/older than the local mtime — e.g. preserved via cp -p,
+        // rsync -t, git checkout, or touch -t. The old mtime heuristic would
+        // treat local as newer and wrongly upload, clobbering the remote edit.
+        // Revision-based arbitration downloads because the local file is
+        // unchanged since the last sync.
+        let last_sync = utc("2026-07-28 10:00:00");
+        let state = make_state("f.txt", last_sync);
+        // Local mtime is identical to the stored sync-time mtime (same machine,
+        // immune to clock skew).
+        let local_mtime = state.modified_at;
+
+        assert!(live_should_apply_remote(
+            Some("2-def"), // remote rev advanced past stored "1-abc"
+            Some(&state),
+            true,
+            local_mtime,
+        ));
+    }
+
+    #[test]
+    fn live_remote_change_uploads_when_local_changed_since_sync() {
+        // Both sides changed: remote rev advanced AND the local file was edited
+        // since the last sync → upload local to arbitrate the concurrent edit.
+        let last_sync = utc("2026-07-28 10:00:00");
+        let state = make_state("f.txt", last_sync);
+        let local_mtime = state.modified_at + Duration::seconds(5);
+
+        assert!(!live_should_apply_remote(
+            Some("2-def"),
+            Some(&state),
+            true,
+            local_mtime,
+        ));
+    }
+
+    #[test]
+    fn live_remote_change_downloads_when_local_file_absent() {
+        // No local file to preserve — the remote change is authoritative.
+        let last_sync = utc("2026-07-28 10:00:00");
+        let state = make_state("f.txt", last_sync);
+
+        assert!(live_should_apply_remote(
+            Some("2-def"),
+            Some(&state),
+            false,
+            state.modified_at,
+        ));
+    }
+
+    #[test]
+    fn live_remote_echo_with_matching_rev_does_not_download() {
+        // Remote revision still equals the stored revision — our own echo —
+        // so there is nothing new to download (the live handler also skips
+        // these up front).
+        let last_sync = utc("2026-07-28 10:00:00");
+        let state = make_state("f.txt", last_sync);
+
+        assert!(!live_should_apply_remote(
+            Some("1-abc"),
+            Some(&state),
+            true,
+            state.modified_at,
+        ));
+    }
+
+    #[test]
+    fn live_remote_change_preserves_untracked_local_file() {
+        // No stored state for an existing local file: it cannot be proven
+        // unchanged, so it is preserved by uploading rather than overwritten.
+        let last_sync = utc("2026-07-28 10:00:00");
+
+        assert!(!live_should_apply_remote(
+            Some("2-def"),
+            None,
+            true,
+            last_sync
+        ));
     }
 
     // ── triage_changes: local deletes ───────────────────────────────
