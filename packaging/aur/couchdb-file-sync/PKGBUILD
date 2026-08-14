@@ -1,0 +1,30 @@
+# Maintainer: Nina Těšková <nina.marie.teskova@gmail.com>
+
+pkgname=couchdb-file-sync
+pkgver=0.5.0
+pkgrel=1
+pkgdesc="Filesystem-to-CouchDB sync engine with bidirectional sync and conflict detection"
+arch=('x86_64' 'aarch64')
+url="https://github.com/haydonryan/couchdb-file-sync"
+license=('MIT')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo' 'rust')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/haydonryan/couchdb-file-sync/archive/refs/tags/v$pkgver.tar.gz" "LICENSE")
+sha256sums=('e8b1dde95f1eded3f363a3986463552c7375419bcdb6c3bef694b1235b3e341f' '042988a94400f2d3a33ad2b063d5c74ef8be60f128d019a70902c5d61085a1e5')
+
+build() {
+  cd "$pkgname-$pkgver"
+  # Bundled native libs (aws-lc-sys, sqlite3) fail to link when the build
+  # environment enables LTO in CFLAGS/LDFLAGS (-flto=auto): their C objects
+  # are not LTO-compatible with the Rust link. Strip LTO flags for cargo.
+  export CFLAGS="$(printf '%s\n' "$CFLAGS" | sed 's/ *-flto\(=[^ ]*\)\?//g')"
+  export CXXFLAGS="$(printf '%s\n' "$CXXFLAGS" | sed 's/ *-flto\(=[^ ]*\)\?//g')"
+  export LDFLAGS="$(printf '%s\n' "$LDFLAGS" | sed 's/ *-flto\(=[^ ]*\)\?//g')"
+  cargo build --release
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/couchdb-file-sync "$pkgdir/usr/bin/couchdb-file-sync"
+  install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

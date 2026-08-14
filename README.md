@@ -40,6 +40,25 @@ To install it for the current user and create a user-level systemd service:
 
 This installs the binary to `~/.local/bin/couchdb-file-sync`, writes the config file to `~/.config/couchdb-file-sync/couchdb-file-sync.yaml` if it does not already exist, and enables `~/.config/systemd/user/couchdb-file-sync.service`.
 
+### Arch Linux (AUR)
+
+Two AUR packages are maintained under `packaging/aur/`:
+
+- **`couchdb-file-sync`** — builds from source with `cargo build --release`.
+- **`couchdb-file-sync-bin`** — installs the prebuilt release binary (faster).
+
+Install either with an AUR helper:
+
+```bash
+# From source
+yay -S couchdb-file-sync
+
+# Or the prebuilt binary
+yay -S couchdb-file-sync-bin
+```
+
+Both packages install `couchdb-file-sync` to `/usr/bin`.
+
 ## Development
 
 Enable the repo's pre-commit hook to run formatting, clippy, and tests before each commit:

@@ -1,0 +1,21 @@
+# Maintainer: Nina Těšková <nina.marie.teskova@gmail.com>
+
+pkgname=couchdb-file-sync-bin
+pkgver=0.5.0
+pkgrel=1
+pkgdesc="Filesystem-to-CouchDB sync engine with bidirectional sync and conflict detection (prebuilt binary)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/haydonryan/couchdb-file-sync"
+license=('MIT')
+depends=('gcc-libs' 'glibc')
+source=("LICENSE")
+source_x86_64=("$pkgname-$pkgver-x86_64.tar.gz::https://github.com/haydonryan/couchdb-file-sync/releases/download/v$pkgver/couchdb-file-sync-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("$pkgname-$pkgver-aarch64.tar.gz::https://github.com/haydonryan/couchdb-file-sync/releases/download/v$pkgver/couchdb-file-sync-aarch64-unknown-linux-gnu.tar.gz")
+sha256sums=('042988a94400f2d3a33ad2b063d5c74ef8be60f128d019a70902c5d61085a1e5')
+sha256sums_x86_64=('c18bd93ac632d97eea4c88546be314e50cbf1f9f35af06c4d06fc85a76de95b6')
+sha256sums_aarch64=('f5adde399ae68dba9b6824653d5a90812bc1822cebdac9ffcd502f807320f1ae')
+
+package() {
+  install -Dm755 couchdb-file-sync "$pkgdir/usr/bin/couchdb-file-sync"
+  install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
