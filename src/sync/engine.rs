@@ -960,6 +960,16 @@ impl SyncEngine {
 
         let remote_prefix = self.couchdb.remote_prefix();
 
+        // Index remote changes by remote path once so conflict detection is
+        // linear in the number of changes instead of quadratic (a `.find()`
+        // per local change). `or_insert` keeps the first change for a given
+        // path, matching the previous `.find()` which returned the first
+        // match; the whole index is order-independent across local changes.
+        let mut remote_by_path: HashMap<&str, &Change> = HashMap::new();
+        for rc in remote_changes {
+            remote_by_path.entry(rc.path()).or_insert(rc);
+        }
+
         debug!(
             "========== ANALYZING {} LOCAL CHANGES ==========",
             local_changes.len()
@@ -983,7 +993,7 @@ impl SyncEngine {
             }
 
             // Extra debug for remote change detection
-            if let Some(rc) = remote_changes.iter().find(|rc| rc.path() == remote_path) {
+            if let Some(rc) = remote_by_path.get(remote_path.as_str()) {
                 if let Some(remote_mtime) = rc.mtime() {
                     if let Some(state) = stored_states.get(lc.path()) {
                         if *remote_mtime > state.last_sync_at {
@@ -1809,6 +1819,120 @@ mod tests {
             0,
             "dry run must not write to CouchDB"
         );
+    }
+
+    #[tokio::test]
+    async fn detect_conflicts_is_order_independent_on_mixed_change_set() {
+        // Regression for the quadratic conflict scan: detect_conflicts used to
+        // run a `.find()` over every remote change for each local change. The
+        // refactor builds a HashMap<&str, &Change> index once instead. This
+        // test drives a mixed local/remote change set (a local-only upload, a
+        // remote-only download, and a both-sides content-differing conflict)
+        // and asserts the same triage result regardless of slice ordering.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+
+        // A local file changed on both sides: its stored rev is stale, so the
+        // advanced remote rev marks the remote as changed, and its on-disk
+        // content differs from the remote content -> conflict.
+        std::fs::write(root.as_path().join("b.txt"), b"local-content").unwrap();
+        let local = test_local_db();
+        seed_file_state(&local, "b.txt", "stalehash", 13);
+        let mut stored = local.get_file_state("b.txt").unwrap().unwrap();
+        stored.couch_rev = Some(CouchRev::new("1-abc").unwrap());
+        stored.last_sync_at = Utc::now() - Duration::days(1);
+        local.save_file_state(&stored).unwrap();
+
+        let remote_path = "prefix/b.txt";
+        let mut remote_doc = FileDoc::new(remote_path.to_string(), String::new(), 14);
+        remote_doc.rev = Some("2-def".to_string());
+        remote_doc.mtime = TimestampMillis::now();
+        remote_doc.path = remote_path.to_string();
+        let canned = CannedCouch {
+            metadata: std::collections::HashMap::from([(
+                remote_path.to_string(),
+                remote_doc.clone(),
+            )]),
+            contents: std::collections::HashMap::from([(
+                remote_path.to_string(),
+                b"remote-content".to_vec(),
+            )]),
+            ..CannedCouch::default()
+        };
+        let engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let remote_modified = Change::remote_modified(
+            remote_path.to_string(),
+            "remotehash".to_string(),
+            14,
+            Utc::now(),
+            "2-def".to_string(),
+        );
+
+        let sort_paths = |paths: Vec<String>| -> Vec<String> {
+            let mut v = paths;
+            v.sort();
+            v
+        };
+
+        // Same logical change set presented in two different slice orderings.
+        for (local_order, remote_order) in [
+            (vec!["b.txt", "a.txt"], vec!["prefix/c.txt", "prefix/b.txt"]),
+            (vec!["a.txt", "b.txt"], vec!["prefix/b.txt", "prefix/c.txt"]),
+        ] {
+            let local_changes = local_order
+                .iter()
+                .map(|p| {
+                    if *p == "b.txt" {
+                        Change::local_modified(p.to_string(), "localhash".to_string(), 13)
+                    } else {
+                        Change::local_created(p.to_string(), "ahash".to_string(), 3)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let remote_changes = remote_order
+                .iter()
+                .map(|p| {
+                    if *p == "prefix/b.txt" {
+                        remote_modified.clone()
+                    } else {
+                        Change::remote_created(
+                            p.to_string(),
+                            "chash".to_string(),
+                            5,
+                            Utc::now(),
+                            "3-gh".to_string(),
+                        )
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let (uploads, downloads, conflicts) = engine
+                .detect_conflicts(&local_changes, &remote_changes, true)
+                .await
+                .expect("detect_conflicts should succeed");
+
+            assert_eq!(
+                sort_paths(uploads.iter().map(|c| c.path().to_string()).collect()),
+                vec!["a.txt"],
+                "local-only change uploads regardless of ordering"
+            );
+            assert_eq!(
+                sort_paths(downloads.iter().map(|c| c.path().to_string()).collect()),
+                vec!["prefix/c.txt"],
+                "remote-only change downloads regardless of ordering"
+            );
+            assert_eq!(
+                sort_paths(conflicts.iter().map(|c| c.path.clone()).collect()),
+                vec!["b.txt"],
+                "both-sides differing change conflicts regardless of ordering"
+            );
+        }
     }
 
     #[tokio::test]
