@@ -59,6 +59,31 @@ yay -S couchdb-file-sync-bin
 
 Both packages install `couchdb-file-sync` to `/usr/bin`.
 
+### Nix
+
+The flake exposes two packages, both installing the same `couchdb-file-sync`
+executable:
+
+- **`app-bin`** — the prebuilt release binary (fast path, no compilation). This
+  is the default package.
+- **`app-src`** — built from source via the committed `Cargo.lock` (no network
+  access at build time).
+
+```bash
+# Run the prebuilt release binary (fast path, default)
+nix run .#app-bin -- --version
+
+# Run a build-from-source binary
+nix run .#app-src -- --version
+
+# Build either package into ./result/bin/couchdb-file-sync
+nix build .#app-bin
+nix build .#app-src
+```
+
+A focused `nix develop` shell (Rust toolchain only — every native dependency is
+bundled) is provided as well.
+
 ## Development
 
 Enable the repo's pre-commit hook to run formatting, clippy, and tests before each commit:
