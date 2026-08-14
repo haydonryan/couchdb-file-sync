@@ -22,7 +22,7 @@ couch_rs = "0.13"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_norway = "0.9.42"
-base64 = "0.22"
+base64 = "0.23"
 
 # CLI
 clap = { version = "4.6", features = ["derive", "env"] }
@@ -72,7 +72,7 @@ tempfile = "3.27"
 tokio-test = "0.4"
 filetime = "0.2"
 hyper = { version = "1.11", features = ["server", "http1"] }
-http-body-util = "0.1.4"
+http-body-util = "0.1.5"
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 parking_lot = "0.12"
 
