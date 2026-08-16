@@ -2,6 +2,7 @@ use crate::models::{Change, FileState, IgnoreMatcher, SyncDirPath};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
@@ -195,9 +196,9 @@ impl Scanner {
         // path through a symlinked root, as in #2941) do we canonicalize and
         // re-derive the residual path with the canonical-with-lexical fallback
         // below.
-        let (resolved_path, relative_path) =
+        let (resolved_path, relative_path): (Cow<'_, Path>, Cow<'_, Path>) =
             if let Ok(rel) = path.strip_prefix(self.root_dir.as_path()) {
-                (path.to_path_buf(), rel.to_path_buf())
+                (Cow::Borrowed(path), Cow::Borrowed(rel))
             } else {
                 // SyncDirPath::new() canonicalizes the scan root at
                 // construction. On macOS, temp/sync roots under /var/folders
@@ -214,10 +215,9 @@ impl Scanner {
                     Ok(canonical) if canonical.starts_with(self.root_dir.as_path()) => canonical,
                     _ => path.to_path_buf(),
                 };
-                let relative = resolved
-                    .strip_prefix(self.root_dir.as_path())?
-                    .to_path_buf();
-                (resolved, relative)
+                let relative = resolved.strip_prefix(self.root_dir.as_path())?;
+                let relative_buf = relative.to_path_buf();
+                (Cow::Owned(resolved), Cow::Owned(relative_buf))
             };
         let path_str = relative_path.to_string_lossy().to_string();
 
@@ -258,7 +258,7 @@ impl Scanner {
             // Compute the hash from the same resolved path as the
             // relative-path derivation so hashing and residual derivation
             // stay consistent.
-            compute_file_hash(&resolved_path)?
+            compute_file_hash(resolved_path.as_ref())?
         };
 
         Ok(FileState {
@@ -375,10 +375,11 @@ impl Scanner {
 /// # Errors
 ///
 /// Returns an error if the file cannot be opened or read.
+#[allow(clippy::large_stack_arrays)]
 pub fn compute_file_hash(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 8192];
+    let mut buffer = [0u8; 64 * 1024];
     loop {
         let bytes_read = file.read(&mut buffer)?;
         if bytes_read == 0 {

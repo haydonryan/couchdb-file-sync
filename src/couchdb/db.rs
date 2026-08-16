@@ -772,7 +772,7 @@ impl CouchDb {
         }
 
         // Fetch each chunk and combine the data
-        let mut content = Vec::new();
+        let mut content = Vec::with_capacity(usize::try_from(doc.size).unwrap_or(0));
         for chunk_id in &doc.children {
             let Some(chunk) = self.get_chunk(chunk_id).await? else {
                 // A missing chunk is a partial/corrupt download: fail it rather

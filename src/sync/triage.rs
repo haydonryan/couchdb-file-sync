@@ -63,7 +63,10 @@ pub fn remote_path_to_local_path(remote_path: &str, remote_prefix: &str) -> Stri
 pub fn is_polluted_state_path(path: &str, remote_prefix: &str) -> bool {
     let remote_prefix = remote_prefix.trim_end_matches('/');
     !remote_prefix.is_empty()
-        && (path == remote_prefix || path.starts_with(&format!("{remote_prefix}/")))
+        && (path == remote_prefix
+            || path
+                .strip_prefix(remote_prefix)
+                .is_some_and(|r| r.starts_with('/')))
 }
 
 /// Determine whether a remote delete should be applied locally.
