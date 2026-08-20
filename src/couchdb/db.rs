@@ -835,7 +835,7 @@ impl CouchDb {
     /// # Errors
     ///
     /// Returns an error if a chunk cannot be saved to `CouchDB`.
-    pub async fn upload_file_content(&self, content: &[u8]) -> Result<Vec<String>> {
+    pub async fn upload_file_content(&self, content: Vec<u8>) -> Result<Vec<String>> {
         #[cfg(test)]
         if self.test_state.is_some() {
             self.test_write_calls
@@ -847,7 +847,7 @@ impl CouchDb {
         let chunk = ChunkDoc {
             id: chunk_id.clone(),
             rev: None,
-            data: content.to_vec(),
+            data: content,
             doc_type: crate::models::DocType::Leaf,
         };
 
@@ -2260,7 +2260,7 @@ mod tests {
         ];
 
         let chunk_ids = db
-            .upload_file_content(&original)
+            .upload_file_content(original.clone())
             .await
             .expect("upload content");
         assert_eq!(
