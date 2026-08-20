@@ -190,9 +190,17 @@ impl ApplyWorker {
         debug!("[UPLOAD] mtime: {} ms", mtime);
 
         let content = tokio::fs::read(&file_path).await?;
-        debug!("[UPLOAD] Read {} bytes from disk", content.len());
+        let content_len = content.len();
+        debug!("[UPLOAD] Read {} bytes from disk", content_len);
 
-        let new_chunk_ids = self.couchdb.upload_file_content(&content).await?;
+        // Hash the in-memory content buffer before moving it into the chunk,
+        // so the persisted hash still matches the transferred bytes. Since
+        // `content` is exactly the bytes pushed to CouchDB, this keeps both
+        // the persisted `FileDoc.hash` and the saved FileState in agreement
+        // with the transferred bytes even under a mid-sync modification.
+        let hash = compute_bytes_hash(&content);
+
+        let new_chunk_ids = self.couchdb.upload_file_content(content).await?;
         debug!(
             "[UPLOAD] Uploaded content, got {} chunks",
             new_chunk_ids.len()
@@ -208,13 +216,6 @@ impl ApplyWorker {
                 debug!("[UPLOAD] No existing doc, creating new");
                 (None, mtime, Vec::new())
             };
-
-        // Hash the in-memory content buffer we just uploaded instead of
-        // re-reading the file from disk. Since `content` is exactly the bytes
-        // pushed to CouchDB, this keeps both the persisted `FileDoc.hash` and
-        // the saved FileState in agreement with the transferred bytes even
-        // under a mid-sync modification.
-        let hash = compute_bytes_hash(&content);
 
         let mut doc = crate::models::FileDoc {
             id: remote_path.to_string(),
@@ -249,7 +250,7 @@ impl ApplyWorker {
         self.local_db.save_file_state(&state).await?;
         debug!("[UPLOAD] Updated local state with rev: {:?}", doc.rev);
 
-        Ok((content.len(), doc.rev))
+        Ok((content_len, doc.rev))
     }
 
     async fn download_remote_file(
