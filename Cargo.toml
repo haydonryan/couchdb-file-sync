@@ -32,7 +32,7 @@ dialoguer = "0.12"
 similar = "3.2"
 
 # Configuration
-config = "0.15"
+config = { version = "0.15", default-features = false, features = ["yaml"] }
 
 # File watching
 notify-debouncer-full = "0.7"
