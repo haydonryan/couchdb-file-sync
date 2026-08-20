@@ -210,9 +210,9 @@ impl LocalDb {
                 &state.path,
                 &state.hash,
                 u64_to_i64(state.size)?,
-                state.modified_at.to_rfc3339(),
+                &state.modified_at,
                 &state.couch_rev,
-                state.last_sync_at.to_rfc3339(),
+                &state.last_sync_at,
             ],
         )?;
 
@@ -302,7 +302,7 @@ impl LocalDb {
                 &change.path(),
                 format!("{:?}", change.change_type()),
                 format!("{:?}", change.source()),
-                Utc::now().to_rfc3339(),
+                Utc::now(),
                 change.hash().as_ref(),
                 opt_u64_to_i64(change.size())?,
             ],
@@ -418,12 +418,12 @@ impl LocalDb {
                 &conflict.path,
                 &conflict.local_state.hash,
                 i64::try_from(conflict.local_state.size).unwrap_or(i64::MAX),
-                conflict.local_state.modified_at.to_rfc3339(),
+                &conflict.local_state.modified_at,
                 &conflict.remote_state.hash,
                 i64::try_from(conflict.remote_state.size).unwrap_or(i64::MAX),
-                conflict.remote_state.modified_at.to_rfc3339(),
+                &conflict.remote_state.modified_at,
                 &conflict.remote_state.couch_rev,
-                conflict.detected_at.to_rfc3339(),
+                &conflict.detected_at,
                 conflict.is_notified(),
             ],
         )?;
@@ -601,7 +601,7 @@ impl LocalDb {
         self.conn.execute(
             "INSERT OR REPLACE INTO sync_checkpoint (id, last_seq, last_sync_at)
              VALUES (1, ?, ?)",
-            params![seq, Utc::now().to_rfc3339()],
+            params![seq, Utc::now()],
         )?;
         Ok(())
     }
@@ -721,6 +721,34 @@ mod tests {
             .get_file_state("/nonexistent")
             .expect("get_file_state failed");
         assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn test_file_state_datetime_round_trip() {
+        let db = test_db();
+        // Fixed timestamps with nanosecond precision to catch any precision
+        // loss in the direct DateTime<Utc> SQLite binding (rusqlite's chrono
+        // ToSql formats %f fractional seconds and FromSql parses them back).
+        let modified_at =
+            chrono::DateTime::from_timestamp(1_700_000_000, 123_456_789).expect("valid ts");
+        let last_sync_at =
+            chrono::DateTime::from_timestamp(1_700_000_100, 987_654_321).expect("valid ts");
+
+        let mut state = FileState::new(
+            "/roundtrip.txt".to_string(),
+            "roundtrip-hash".to_string(),
+            4096,
+            modified_at,
+        );
+        state.last_sync_at = last_sync_at;
+        db.save_file_state(&state).expect("save_file_state failed");
+
+        let loaded = db
+            .get_file_state("/roundtrip.txt")
+            .expect("get_file_state failed")
+            .expect("state present");
+        assert_eq!(loaded.modified_at, modified_at);
+        assert_eq!(loaded.last_sync_at, last_sync_at);
     }
 
     #[test]
