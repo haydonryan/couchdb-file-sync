@@ -23,7 +23,13 @@ run *args:
     cargo run --bin couchdb-file-sync -- {{args}}
 
 test:
-    cargo test --workspace
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v cargo-nextest >/dev/null 2>&1; then
+      cargo nextest run --workspace --no-fail-fast
+    else
+      cargo test --workspace
+    fi
 
 pre-commit:
     #!/usr/bin/env bash
