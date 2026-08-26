@@ -932,16 +932,61 @@ impl SyncEngine {
     /// In dry-run mode the identical-content "silent sync" branch skips the
     /// state-DB save; conflict detection still runs and conflicts are returned
     /// as if they would be recorded.
-    #[allow(clippy::too_many_lines)]
     async fn detect_conflicts(
         &self,
         local_changes: &[Change],
         remote_changes: &[Change],
         dry_run: bool,
     ) -> Result<(Vec<Change>, Vec<Change>, Vec<Conflict>)> {
-        // Build a complete map of stored states in one I/O batch: load the
-        // states for the deduped union of local and remote change paths with a
-        // single batch query instead of one per-path `get_file_state` call.
+        let stored_states = self
+            .load_stored_states(local_changes, remote_changes)
+            .await?;
+        let remote_prefix = self.couchdb.remote_prefix();
+        let remote_by_path = Self::index_remote_changes(remote_changes);
+
+        self.debug_local_changes(local_changes, &stored_states, &remote_by_path);
+
+        // ── Run the pure triage function ──────────────────────────────────
+        let triage_result =
+            triage::triage_changes(local_changes, remote_changes, &stored_states, remote_prefix);
+
+        // Collect results
+        let local_to_upload = triage_result.uploads;
+        let mut remote_to_apply = triage_result.downloads;
+        let mut conflicts: Vec<Conflict> = Vec::new();
+
+        // ── Handle needs_comparison pairs (requires I/O) ──────────────────
+        self.resolve_needs_comparison(&triage_result.needs_comparison, dry_run, &mut conflicts)
+            .await?;
+
+        // ── Handle remote deletes ─────────────────────────────────────────
+        self.handle_remote_deletes(
+            &triage_result.remote_deletes,
+            &stored_states,
+            &mut remote_to_apply,
+        );
+
+        // ── Debug skipped items ───────────────────────────────────────────
+        for decision in &triage_result.skipped {
+            debug!("  [SKIP] {} - already in sync", decision.path);
+        }
+
+        debug!("========== ANALYSIS COMPLETE ==========");
+        debug!("  Uploads queued: {}", local_to_upload.len());
+        debug!("  Downloads queued: {}", remote_to_apply.len());
+        debug!("  Conflicts found: {}", conflicts.len());
+
+        Ok((local_to_upload, remote_to_apply, conflicts))
+    }
+
+    /// Load the stored states for the deduped union of local and remote change
+    /// paths with a single batch query instead of one per-path
+    /// `get_file_state` call.
+    async fn load_stored_states(
+        &self,
+        local_changes: &[Change],
+        remote_changes: &[Change],
+    ) -> Result<HashMap<String, FileState>> {
         let mut paths_to_lookup: HashSet<String> = HashSet::new();
         for lc in local_changes {
             paths_to_lookup.insert(lc.path().to_string());
@@ -949,28 +994,35 @@ impl SyncEngine {
         for rc in remote_changes {
             paths_to_lookup.insert(self.couchdb.get_local_path(rc.path()));
         }
-        let stored_states = self
-            .local_db
+        self.local_db
             .get_file_states(
                 &paths_to_lookup
                     .iter()
                     .map(String::as_str)
                     .collect::<Vec<_>>(),
             )
-            .await?;
+            .await
+    }
 
-        let remote_prefix = self.couchdb.remote_prefix();
-
-        // Index remote changes by remote path once so conflict detection is
-        // linear in the number of changes instead of quadratic (a `.find()`
-        // per local change). `or_insert` keeps the first change for a given
-        // path, matching the previous `.find()` which returned the first
-        // match; the whole index is order-independent across local changes.
+    /// Index remote changes by remote path once so conflict detection is linear
+    /// in the number of changes instead of quadratic (a `.find()` per local
+    /// change). `or_insert` keeps the first change for a given path, matching
+    /// the previous `.find()` which returned the first match; the whole index
+    /// is order-independent across local changes.
+    fn index_remote_changes(remote_changes: &[Change]) -> HashMap<&str, &Change> {
         let mut remote_by_path: HashMap<&str, &Change> = HashMap::new();
         for rc in remote_changes {
             remote_by_path.entry(rc.path()).or_insert(rc);
         }
+        remote_by_path
+    }
 
+    fn debug_local_changes(
+        &self,
+        local_changes: &[Change],
+        stored_states: &HashMap<String, FileState>,
+        remote_by_path: &HashMap<&str, &Change>,
+    ) {
         debug!(
             "========== ANALYZING {} LOCAL CHANGES ==========",
             local_changes.len()
@@ -1056,18 +1108,15 @@ impl SyncEngine {
                 debug!("  {} - file not on remote yet", lc.path());
             }
         }
+    }
 
-        // ── Run the pure triage function ──────────────────────────────────
-        let triage_result =
-            triage::triage_changes(local_changes, remote_changes, &stored_states, remote_prefix);
-
-        // Collect results
-        let local_to_upload = triage_result.uploads;
-        let mut remote_to_apply = triage_result.downloads;
-        let mut conflicts: Vec<Conflict> = Vec::new();
-
-        // ── Handle needs_comparison pairs (requires I/O) ──────────────────
-        for decision in &triage_result.needs_comparison {
+    async fn resolve_needs_comparison(
+        &self,
+        decisions: &[triage::TriageDecision],
+        dry_run: bool,
+        conflicts: &mut Vec<Conflict>,
+    ) -> Result<()> {
+        for decision in decisions {
             let Some(lc) = &decision.local_change else {
                 continue;
             };
@@ -1168,8 +1217,16 @@ impl SyncEngine {
             }
         }
 
-        // ── Handle remote deletes ─────────────────────────────────────────
-        for rc in &triage_result.remote_deletes {
+        Ok(())
+    }
+
+    fn handle_remote_deletes(
+        &self,
+        remote_deletes: &[Change],
+        stored_states: &HashMap<String, FileState>,
+        remote_to_apply: &mut Vec<Change>,
+    ) {
+        for rc in remote_deletes {
             let local_path = self.couchdb.get_local_path(rc.path());
             let relative_path = local_path.trim_start_matches('/');
             let file_path = self.root_dir.as_path().join(relative_path);
@@ -1188,18 +1245,6 @@ impl SyncEngine {
                 debug!("  Remote deleted, no local file/state, skipping");
             }
         }
-
-        // ── Debug skipped items ───────────────────────────────────────────
-        for decision in &triage_result.skipped {
-            debug!("  [SKIP] {} - already in sync", decision.path);
-        }
-
-        debug!("========== ANALYSIS COMPLETE ==========");
-        debug!("  Uploads queued: {}", local_to_upload.len());
-        debug!("  Downloads queued: {}", remote_to_apply.len());
-        debug!("  Conflicts found: {}", conflicts.len());
-
-        Ok((local_to_upload, remote_to_apply, conflicts))
     }
 
     /// Get local file state    /// Get local file state
@@ -3000,5 +3045,113 @@ mod tests {
             (2..=APPLY_CONCURRENCY_LIMIT).contains(&max),
             "download batch max concurrency {max}, expected 2..={APPLY_CONCURRENCY_LIMIT}"
         );
+    }
+
+    #[test]
+    fn index_remote_changes_keeps_first_change_per_path() {
+        let first = Change::remote_created(
+            "prefix/a.txt".to_string(),
+            "hash1".to_string(),
+            1,
+            Utc::now(),
+            "1-a".to_string(),
+        );
+        let duplicate = Change::remote_created(
+            "prefix/a.txt".to_string(),
+            "hash2".to_string(),
+            2,
+            Utc::now(),
+            "2-b".to_string(),
+        );
+        let other = Change::remote_created(
+            "prefix/b.txt".to_string(),
+            "hash3".to_string(),
+            3,
+            Utc::now(),
+            "3-c".to_string(),
+        );
+
+        let changes = [first, duplicate, other];
+        let index = SyncEngine::index_remote_changes(&changes);
+
+        assert_eq!(index.len(), 2);
+        assert_eq!(index["prefix/a.txt"].path(), "prefix/a.txt");
+        // The first change for a duplicated remote path wins (matches the old
+        // `.find()` which returned the first match).
+        assert_eq!(index["prefix/a.txt"].size(), Some(1));
+        assert_eq!(index["prefix/b.txt"].size(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn load_stored_states_queries_union_of_local_and_remote_paths() {
+        let local = test_local_db();
+        seed_file_state(&local, "a.txt", "hasha", 1);
+        seed_file_state(&local, "b.txt", "hashb", 2);
+
+        let engine = SyncEngine::new(
+            test_couchdb(),
+            local,
+            test_root("/tmp/test-load-stored-states"),
+        );
+
+        // A local-only change path plus a remote-only change whose path maps to
+        // a second local file under the configured prefix.
+        let local_changes = vec![Change::local_created(
+            "a.txt".to_string(),
+            "hasha".to_string(),
+            1,
+        )];
+        let remote_changes = vec![Change::remote_created(
+            "test-prefix/b.txt".to_string(),
+            "hashb".to_string(),
+            2,
+            Utc::now(),
+            "1-r".to_string(),
+        )];
+
+        let states = engine
+            .load_stored_states(&local_changes, &remote_changes)
+            .await
+            .expect("load stored states should succeed");
+
+        assert_eq!(states.len(), 2);
+        assert!(states.contains_key("a.txt"));
+        assert!(states.contains_key("b.txt"));
+    }
+
+    #[tokio::test]
+    async fn handle_remote_deletes_schedules_fresh_delete_and_skips_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        // Tracked file that no longer exists locally. A remote delete newer
+        // than the last sync should be scheduled; an older one must not.
+        let local = test_local_db();
+        seed_file_state(&local, "fresh.txt", "h1", 1);
+        let stored_states = local
+            .get_file_state("fresh.txt")
+            .unwrap()
+            .map(|s| (s.path.clone(), s))
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let engine = SyncEngine::new(test_couchdb(), local, root);
+
+        let fresh_delete = Change::remote_deleted(
+            "test-prefix/fresh.txt".to_string(),
+            Some(Utc::now() + Duration::hours(1)),
+        );
+        let mut to_apply = Vec::new();
+        engine.handle_remote_deletes(&[fresh_delete], &stored_states, &mut to_apply);
+
+        assert_eq!(to_apply.len(), 1, "newer remote delete is scheduled");
+        assert_eq!(to_apply[0].path(), "test-prefix/fresh.txt");
+
+        let stale_delete = Change::remote_deleted(
+            "test-prefix/fresh.txt".to_string(),
+            Some(Utc::now() - Duration::days(2)),
+        );
+        let mut to_apply = Vec::new();
+        engine.handle_remote_deletes(&[stale_delete], &stored_states, &mut to_apply);
+
+        assert!(to_apply.is_empty(), "stale remote delete is skipped");
     }
 }
