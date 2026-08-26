@@ -1046,107 +1046,13 @@ impl TouchTracker {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
     info!("Starting live sync in: {}", path.display());
 
-    let ignore_matcher = Arc::new(load_ignore_patterns(&path));
-
-    let db_path = state_db_path(&path);
-    let local_db = LocalDb::open(&db_path)?;
-
-    let couchdb = CouchDb::new(
-        &config.couchdb.url,
-        config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
-        config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
-        &DatabaseName::new(&config.couchdb.database),
-        &RemotePath::new(&config.couchdb.remote_path),
-        config.couchdb.timeout_seconds,
-        config.couchdb.retry_attempts,
-    )
-    .await?;
-
-    let sync_dir = resolve_sync_dir(&path)?;
-
-    let mut engine = SyncEngine::with_ignore(
-        couchdb,
-        local_db,
-        sync_dir.clone(),
-        (*ignore_matcher).clone(),
-    )
-    .with_tombstone_retention(
-        (config.sync.tombstone_retention_secs > 0)
-            .then(|| std::time::Duration::from_secs(config.sync.tombstone_retention_secs)),
-    );
-
-    // Run one full sync cycle before listening so pre-existing remote files
-    // are materialized locally. The live changes feed otherwise starts from
-    // "now"/the checkpoint and a fresh daemon would never fetch remote files
-    // that already exist in the database before it started.
-    let bootstrap_report = engine.sync().await?;
-    if bootstrap_report.downloaded.0 > 0 || bootstrap_report.uploaded.0 > 0 {
-        info!(
-            "Live bootstrap sync: {} uploaded, {} downloaded, {} conflicts",
-            bootstrap_report.uploaded.0, bootstrap_report.downloaded.0, bootstrap_report.conflicts
-        );
-    } else {
-        info!("Live bootstrap sync: already in sync");
-    }
-
-    let initial_since: String = if let Some(cp) = engine.get_checkpoint().await? {
-        cp.last_seq
-    } else {
-        info!("No checkpoint found, starting changes feed from 'now'");
-        "now".to_string()
-    };
-
-    let (local_tx, mut local_rx) = mpsc::channel::<Change>(256);
-    let (remote_tx, mut remote_rx) = mpsc::channel::<ChangeFeedEntry>(256);
-
-    let watcher_root = sync_dir;
-    let watcher_ignore = ignore_matcher.clone();
-    let debounce_ms = config.sync.debounce_ms;
-    let watcher_config = config.clone();
-    tokio::spawn(async move {
-        if let Err(e) =
-            run_local_watcher(watcher_root.clone(), watcher_ignore, debounce_ms, local_tx).await
-        {
-            error!("Local watcher error: {}", e);
-            notify_sync_error_telegram(
-                &watcher_config,
-                Some(&watcher_root),
-                &format!("Local watcher error: {e}"),
-            )
-            .await;
-            notify_sync_error_matrix(
-                &watcher_config,
-                Some(&watcher_root),
-                &format!("Local watcher error: {e}"),
-            )
-            .await;
-        }
-    });
-
-    let remote_config = config.clone();
-    let remote_config_notify = config.clone();
-    let remote_root = path.clone();
-    tokio::spawn(async move {
-        if let Err(e) = run_remote_changes(remote_config, initial_since, remote_tx).await {
-            error!("Remote changes feed error: {}", e);
-            notify_sync_error_telegram(
-                &remote_config_notify,
-                Some(&remote_root),
-                &format!("Remote changes feed error: {e}"),
-            )
-            .await;
-            notify_sync_error_matrix(
-                &remote_config_notify,
-                Some(&remote_root),
-                &format!("Remote changes feed error: {e}"),
-            )
-            .await;
-        }
-    });
+    let (ignore_matcher, mut engine) = build_live_sync_engine(&path, &config).await?;
+    let initial_since = bootstrap_live_sync(&mut engine).await?;
+    let (mut local_rx, mut remote_rx) =
+        spawn_live_change_sources(config.clone(), &path, ignore_matcher.clone(), initial_since)?;
 
     let mut touched = TouchTracker::new();
 
@@ -1188,6 +1094,119 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
             }
         }
     }
+}
+
+async fn build_live_sync_engine(
+    path: &Path,
+    config: &AppConfig,
+) -> Result<(Arc<IgnoreMatcher>, SyncEngine)> {
+    let ignore_matcher = Arc::new(load_ignore_patterns(path));
+
+    let db_path = state_db_path(path);
+    let local_db = LocalDb::open(&db_path)?;
+
+    let couchdb = CouchDb::new(
+        &config.couchdb.url,
+        config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
+        config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
+        &DatabaseName::new(&config.couchdb.database),
+        &RemotePath::new(&config.couchdb.remote_path),
+        config.couchdb.timeout_seconds,
+        config.couchdb.retry_attempts,
+    )
+    .await?;
+
+    let sync_dir = resolve_sync_dir(path)?;
+
+    let engine = SyncEngine::with_ignore(couchdb, local_db, sync_dir, (*ignore_matcher).clone())
+        .with_tombstone_retention(
+            (config.sync.tombstone_retention_secs > 0)
+                .then(|| std::time::Duration::from_secs(config.sync.tombstone_retention_secs)),
+        );
+
+    Ok((ignore_matcher, engine))
+}
+
+async fn bootstrap_live_sync(engine: &mut SyncEngine) -> Result<String> {
+    // Run one full sync cycle before listening so pre-existing remote files
+    // are materialized locally. The live changes feed otherwise starts from
+    // "now"/the checkpoint and a fresh daemon would never fetch remote files
+    // that already exist in the database before it started.
+    let bootstrap_report = engine.sync().await?;
+    if bootstrap_report.downloaded.0 > 0 || bootstrap_report.uploaded.0 > 0 {
+        info!(
+            "Live bootstrap sync: {} uploaded, {} downloaded, {} conflicts",
+            bootstrap_report.uploaded.0, bootstrap_report.downloaded.0, bootstrap_report.conflicts
+        );
+    } else {
+        info!("Live bootstrap sync: already in sync");
+    }
+
+    let initial_since: String = if let Some(cp) = engine.get_checkpoint().await? {
+        cp.last_seq
+    } else {
+        info!("No checkpoint found, starting changes feed from 'now'");
+        "now".to_string()
+    };
+
+    Ok(initial_since)
+}
+
+fn spawn_live_change_sources(
+    config: AppConfig,
+    path: &Path,
+    ignore_matcher: Arc<IgnoreMatcher>,
+    initial_since: String,
+) -> Result<(mpsc::Receiver<Change>, mpsc::Receiver<ChangeFeedEntry>)> {
+    let (local_tx, local_rx) = mpsc::channel::<Change>(256);
+    let (remote_tx, remote_rx) = mpsc::channel::<ChangeFeedEntry>(256);
+
+    let watcher_root = resolve_sync_dir(path)?;
+    let watcher_ignore = ignore_matcher;
+    let debounce_ms = config.sync.debounce_ms;
+    let watcher_config = config.clone();
+    tokio::spawn(async move {
+        if let Err(e) =
+            run_local_watcher(watcher_root.clone(), watcher_ignore, debounce_ms, local_tx).await
+        {
+            error!("Local watcher error: {}", e);
+            notify_sync_error_telegram(
+                &watcher_config,
+                Some(&watcher_root),
+                &format!("Local watcher error: {e}"),
+            )
+            .await;
+            notify_sync_error_matrix(
+                &watcher_config,
+                Some(&watcher_root),
+                &format!("Local watcher error: {e}"),
+            )
+            .await;
+        }
+    });
+
+    let remote_config = config;
+    let remote_config_notify = remote_config.clone();
+    let remote_root = path.to_path_buf();
+    tokio::spawn(async move {
+        if let Err(e) = run_remote_changes(remote_config, initial_since, remote_tx).await {
+            error!("Remote changes feed error: {}", e);
+            notify_sync_error_telegram(
+                &remote_config_notify,
+                Some(&remote_root),
+                &format!("Remote changes feed error: {e}"),
+            )
+            .await;
+            notify_sync_error_matrix(
+                &remote_config_notify,
+                Some(&remote_root),
+                &format!("Remote changes feed error: {e}"),
+            )
+            .await;
+        }
+    });
+
+    Ok((local_rx, remote_rx))
 }
 
 async fn run_local_watcher(

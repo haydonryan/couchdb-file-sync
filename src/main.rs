@@ -126,8 +126,11 @@ enum Commands {
 }
 
 #[tokio::main]
-#[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
+    run().await
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.verbose > 0 {
@@ -139,8 +142,27 @@ async fn main() -> Result<()> {
         }
     }
 
+    let config = load_config(&cli);
+
+    let enable_file_logging = matches!(
+        &cli.command,
+        Commands::Sync { .. }
+            | Commands::RebuildRemote { .. }
+            | Commands::RebuildLocal { .. }
+            | Commands::Daemon { .. }
+    );
+
+    // Initialize logging
+    let daemon_mode = matches!(&cli.command, Commands::Daemon { .. });
+    init_logging(cli.verbose, &config, enable_file_logging, daemon_mode);
+
+    // Execute command
+    dispatch_command(cli.command, config).await
+}
+
+fn load_config(cli: &Cli) -> AppConfig {
     // Load configuration
-    let mut config = match AppConfig::load(cli.config) {
+    let mut config = match AppConfig::load(cli.config.clone()) {
         Ok(c) => c,
         Err(e) => {
             if cli.verbose > 0 {
@@ -151,7 +173,13 @@ async fn main() -> Result<()> {
     };
 
     // Override config with CLI arguments
-    if let Some(url) = cli.db_url {
+    apply_cli_overrides(&mut config, cli);
+
+    config
+}
+
+fn apply_cli_overrides(config: &mut AppConfig, cli: &Cli) {
+    if let Some(url) = cli.db_url.clone() {
         config.couchdb.url = url;
     }
     if let (Some(username), Some(password)) = (cli.db_user.as_ref(), cli.db_pass.as_ref()) {
@@ -170,165 +198,29 @@ async fn main() -> Result<()> {
             password: pass.clone(),
         });
     }
-    if let Some(name) = cli.db_name {
+    if let Some(name) = cli.db_name.clone() {
         config.couchdb.database = name;
     }
+}
 
-    let enable_file_logging = matches!(
-        &cli.command,
-        Commands::Sync { .. }
-            | Commands::RebuildRemote { .. }
-            | Commands::RebuildLocal { .. }
-            | Commands::Daemon { .. }
-    );
-
-    // Initialize logging
-    let daemon_mode = matches!(&cli.command, Commands::Daemon { .. });
-    init_logging(cli.verbose, &config, enable_file_logging, daemon_mode);
-
-    // Execute command
-    match cli.command {
+async fn dispatch_command(command: Commands, config: AppConfig) -> Result<()> {
+    match command {
         Commands::Init {
             path,
             db_url,
             db_name,
-        } => {
-            let cli_path = path.is_some();
-            let paths = resolve_paths(path, &config);
-            for sync_path in paths {
-                let path_configured = if cli_path {
-                    config.paths.iter().any(|p| p.local == sync_path.local)
-                } else {
-                    true
-                };
-                if cli_path && !path_configured {
-                    println!(
-                        "Warning: {} is not listed in your config paths.",
-                        sync_path.local.display()
-                    );
-                }
-                cli::init(
-                    &sync_path.local,
-                    db_url.clone(),
-                    db_name.clone(),
-                    path_configured,
-                )?;
-            }
-        }
-        Commands::Sync { path, dry_run } => {
-            let paths = resolve_paths(path, &config);
-            if paths.is_empty() {
-                anyhow::bail!(
-                    "No sync paths configured. Specify a path or add paths to couchdb-file-sync.yaml"
-                );
-            }
-            for sync_path in paths {
-                let mut path_config = config.clone();
-                path_config.couchdb.remote_path = sync_path.remote;
-                info!(
-                    "Syncing: {} -> {}",
-                    sync_path.local.display(),
-                    path_config.couchdb.remote_path
-                );
-                cli::sync(sync_path.local, path_config, dry_run).await?;
-            }
-        }
-        Commands::RebuildRemote { path } => {
-            let paths = resolve_paths(path, &config);
-            if paths.is_empty() {
-                anyhow::bail!(
-                    "No sync paths configured. Specify a path or add paths to couchdb-file-sync.yaml"
-                );
-            }
-            for sync_path in paths {
-                let mut path_config = config.clone();
-                path_config.couchdb.remote_path = sync_path.remote;
-                info!(
-                    "Rebuilding remote: {} -> {}",
-                    sync_path.local.display(),
-                    path_config.couchdb.remote_path
-                );
-                cli::rebuild_remote(sync_path.local, path_config).await?;
-            }
-        }
-        Commands::RebuildLocal { path } => {
-            let paths = resolve_paths(path, &config);
-            if paths.is_empty() {
-                anyhow::bail!(
-                    "No sync paths configured. Specify a path or add paths to couchdb-file-sync.yaml"
-                );
-            }
-            for sync_path in paths {
-                let mut path_config = config.clone();
-                path_config.couchdb.remote_path = sync_path.remote;
-                info!(
-                    "Rebuilding local: {} <- {}",
-                    sync_path.local.display(),
-                    path_config.couchdb.remote_path
-                );
-                cli::rebuild_local(sync_path.local, path_config).await?;
-            }
-        }
+        } => run_init(path, db_url.as_ref(), db_name.as_ref(), &config)?,
+        Commands::Sync { path, dry_run } => run_sync(path, dry_run, &config).await?,
+        Commands::RebuildRemote { path } => run_rebuild_remote(path, &config).await?,
+        Commands::RebuildLocal { path } => run_rebuild_local(path, &config).await?,
         Commands::Daemon {
             path,
             interval,
             live,
-        } => {
-            let paths = resolve_paths(path, &config);
-            if paths.is_empty() {
-                anyhow::bail!(
-                    "No sync paths configured. Specify a path or add paths to couchdb-file-sync.yaml"
-                );
-            }
-            cli::daemon(paths, config, interval, live).await?;
-        }
-        Commands::Conflicts { path, json } => {
-            let paths = resolve_paths(path, &config);
-            if paths.is_empty() {
-                anyhow::bail!(
-                    "No sync paths configured. Specify a path or add paths to couchdb-file-sync.yaml"
-                );
-            }
-            let multi = paths.len() > 1;
-            for sync_path in &paths {
-                if multi {
-                    println!("\n=== {} ===", sync_path.local.display());
-                }
-                cli::conflicts(&sync_path.local, json)?;
-            }
-        }
-        Commands::Resolve { path } => {
-            let paths = resolve_paths(path, &config);
-            if paths.is_empty() {
-                anyhow::bail!(
-                    "No sync paths configured. Specify a path or add paths to couchdb-file-sync.yaml"
-                );
-            }
-            let multi = paths.len() > 1;
-            for sync_path in &paths {
-                let mut path_config = config.clone();
-                path_config.couchdb.remote_path = sync_path.remote.clone();
-                if multi {
-                    println!("\n=== {} ===", sync_path.local.display());
-                }
-                cli::resolve(sync_path.local.clone(), path_config).await?;
-            }
-        }
-        Commands::Status { path, json } => {
-            let paths = resolve_paths(path, &config);
-            if paths.is_empty() {
-                anyhow::bail!(
-                    "No sync paths configured. Specify a path or add paths to couchdb-file-sync.yaml"
-                );
-            }
-            let multi = paths.len() > 1;
-            for sync_path in &paths {
-                if multi {
-                    println!("\n=== {} ===", sync_path.local.display());
-                }
-                cli::status(&sync_path.local, json, &config)?;
-            }
-        }
+        } => run_daemon(path, interval, live, config).await?,
+        Commands::Conflicts { path, json } => run_conflicts(path, json, &config)?,
+        Commands::Resolve { path } => run_resolve(path, &config).await?,
+        Commands::Status { path, json } => run_status(path, json, &config)?,
         Commands::Install => {
             cli::install_user_service()?;
         }
@@ -336,7 +228,139 @@ async fn main() -> Result<()> {
             cli::uninstall_user_service()?;
         }
     }
+    Ok(())
+}
 
+fn resolve_paths_or_bail(path: Option<PathBuf>, config: &AppConfig) -> Result<Vec<SyncPath>> {
+    let paths = resolve_paths(path, config);
+    if paths.is_empty() {
+        anyhow::bail!(
+            "No sync paths configured. Specify a path or add paths to couchdb-file-sync.yaml"
+        );
+    }
+    Ok(paths)
+}
+
+fn run_init(
+    path: Option<PathBuf>,
+    db_url: Option<&String>,
+    db_name: Option<&String>,
+    config: &AppConfig,
+) -> Result<()> {
+    let cli_path = path.is_some();
+    let paths = resolve_paths(path, config);
+    for sync_path in paths {
+        let path_configured = if cli_path {
+            config.paths.iter().any(|p| p.local == sync_path.local)
+        } else {
+            true
+        };
+        if cli_path && !path_configured {
+            println!(
+                "Warning: {} is not listed in your config paths.",
+                sync_path.local.display()
+            );
+        }
+        cli::init(
+            &sync_path.local,
+            db_url.cloned(),
+            db_name.cloned(),
+            path_configured,
+        )?;
+    }
+    Ok(())
+}
+
+async fn run_sync(path: Option<PathBuf>, dry_run: bool, config: &AppConfig) -> Result<()> {
+    let paths = resolve_paths_or_bail(path, config)?;
+    for sync_path in paths {
+        let mut path_config = config.clone();
+        path_config.couchdb.remote_path = sync_path.remote;
+        info!(
+            "Syncing: {} -> {}",
+            sync_path.local.display(),
+            path_config.couchdb.remote_path
+        );
+        cli::sync(sync_path.local, path_config, dry_run).await?;
+    }
+    Ok(())
+}
+
+async fn run_rebuild_remote(path: Option<PathBuf>, config: &AppConfig) -> Result<()> {
+    let paths = resolve_paths_or_bail(path, config)?;
+    for sync_path in paths {
+        let mut path_config = config.clone();
+        path_config.couchdb.remote_path = sync_path.remote;
+        info!(
+            "Rebuilding remote: {} -> {}",
+            sync_path.local.display(),
+            path_config.couchdb.remote_path
+        );
+        cli::rebuild_remote(sync_path.local, path_config).await?;
+    }
+    Ok(())
+}
+
+async fn run_rebuild_local(path: Option<PathBuf>, config: &AppConfig) -> Result<()> {
+    let paths = resolve_paths_or_bail(path, config)?;
+    for sync_path in paths {
+        let mut path_config = config.clone();
+        path_config.couchdb.remote_path = sync_path.remote;
+        info!(
+            "Rebuilding local: {} <- {}",
+            sync_path.local.display(),
+            path_config.couchdb.remote_path
+        );
+        cli::rebuild_local(sync_path.local, path_config).await?;
+    }
+    Ok(())
+}
+
+async fn run_daemon(
+    path: Option<PathBuf>,
+    interval: u64,
+    live: bool,
+    config: AppConfig,
+) -> Result<()> {
+    let paths = resolve_paths_or_bail(path, &config)?;
+    cli::daemon(paths, config, interval, live).await
+}
+
+fn run_conflicts(path: Option<PathBuf>, json: bool, config: &AppConfig) -> Result<()> {
+    let paths = resolve_paths_or_bail(path, config)?;
+    let multi = paths.len() > 1;
+    for sync_path in &paths {
+        if multi {
+            println!("\n=== {} ===", sync_path.local.display());
+        }
+        cli::conflicts(&sync_path.local, json)?;
+    }
+    Ok(())
+}
+
+async fn run_resolve(path: Option<PathBuf>, config: &AppConfig) -> Result<()> {
+    let paths = resolve_paths_or_bail(path, config)?;
+    let multi = paths.len() > 1;
+    for sync_path in &paths {
+        let mut path_config = config.clone();
+        path_config.couchdb.remote_path = sync_path.remote.clone();
+        if multi {
+            println!("\n=== {} ===", sync_path.local.display());
+        }
+        cli::resolve(sync_path.local.clone(), path_config).await?;
+    }
+    Ok(())
+}
+
+fn run_status(path: Option<PathBuf>, json: bool, config: &AppConfig) -> Result<()> {
+    let paths = resolve_paths_or_bail(path, config)?;
+    let multi = paths.len() > 1;
+    for sync_path in &paths {
+        if multi {
+            println!("\n=== {} ===", sync_path.local.display());
+        }
+        cli::status(&sync_path.local, json, config)?;
+    }
     Ok(())
 }
 
@@ -472,7 +496,8 @@ fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daem
 mod tests {
     use super::{Cli, Commands, init_logging};
     use super::{
-        default_user_config_file_if_exists, paths_match, resolve_paths, resolved_config_path,
+        apply_cli_overrides, default_user_config_file_if_exists, paths_match, resolve_paths,
+        resolved_config_path,
     };
     use clap::Parser;
     use couchdb_file_sync::config::{AppConfig, SyncPath};
@@ -1151,5 +1176,43 @@ mod tests {
     fn cli_rejects_unknown_flag() {
         let result = Cli::try_parse_from(["couchdb-file-sync", "status", "--unknown-flag"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn apply_cli_overrides_sets_url_db_name_and_auth() {
+        let cli = Cli::try_parse_from([
+            "couchdb-file-sync",
+            "--db-url",
+            "http://localhost:5984/",
+            "--db-user",
+            "alice",
+            "--db-pass",
+            "secret",
+            "--db-name",
+            "mydb",
+            "status",
+        ])
+        .unwrap();
+
+        let mut config = AppConfig::default();
+        apply_cli_overrides(&mut config, &cli);
+
+        assert_eq!(config.couchdb.url, "http://localhost:5984/");
+        assert_eq!(config.couchdb.database, "mydb");
+        let auth = config.couchdb.auth.as_ref().expect("auth overridden");
+        assert_eq!(auth.username, "alice");
+        assert_eq!(auth.password, "secret");
+    }
+
+    #[test]
+    fn apply_cli_overrides_leaves_config_untouched_when_no_flags() {
+        let cli = Cli::try_parse_from(["couchdb-file-sync", "status"]).unwrap();
+        let mut config = AppConfig::default();
+        config.couchdb.url = "original".to_string();
+
+        apply_cli_overrides(&mut config, &cli);
+
+        assert_eq!(config.couchdb.url, "original");
+        assert!(config.couchdb.auth.is_none());
     }
 }
