@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use argy::FromArgs;
 use std::path::PathBuf;
 use tracing::info;
 
@@ -7,123 +7,161 @@ use couchdb_file_sync::cli;
 use couchdb_file_sync::config::{AppConfig, SyncPath, default_log_file, default_user_config_file};
 use couchdb_file_sync::logging::AppLogWriter;
 
-#[derive(Parser, Debug)]
-#[command(name = "couchdb-file-sync")]
-#[command(about = "Filesystem-to-CouchDB sync engine")]
-#[command(version)]
+#[derive(FromArgs, Debug)]
+/// filesystem-to-CouchDB sync engine
 struct Cli {
-    /// Path to configuration file
-    #[arg(short, long, global = true)]
+    /// path to configuration file
+    #[argy(option, short = 'c', global)]
     config: Option<PathBuf>,
 
-    /// Enable verbose logging
-    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    /// enable verbose logging
+    #[argy(switch, short = 'v', global)]
     verbose: u8,
 
     /// `CouchDB` URL
-    #[arg(long, global = true, env = "COUCHDB_FILE_SYNC_DB_URL")]
+    #[argy(option, global, env = "COUCHDB_FILE_SYNC_DB_URL")]
     db_url: Option<String>,
 
     /// `CouchDB` username
-    #[arg(long, global = true, env = "COUCHDB_FILE_SYNC_DB_USERNAME")]
+    #[argy(option, global, env = "COUCHDB_FILE_SYNC_DB_USERNAME")]
     db_user: Option<String>,
 
     /// `CouchDB` password
-    #[arg(long, global = true, env = "COUCHDB_FILE_SYNC_DB_PASSWORD")]
+    #[argy(option, global, env = "COUCHDB_FILE_SYNC_DB_PASSWORD")]
     db_pass: Option<String>,
 
     /// `CouchDB` database name
-    #[arg(long, global = true, env = "COUCHDB_FILE_SYNC_DB_NAME")]
+    #[argy(option, global, env = "COUCHDB_FILE_SYNC_DB_NAME")]
     db_name: Option<String>,
 
-    #[command(subcommand)]
+    #[argy(subcommand)]
     command: Commands,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(FromArgs, Debug)]
+#[argy(subcommand)]
 enum Commands {
-    /// Initialize a new sync directory
-    Init {
-        /// Directory to initialize (uses paths from config if not specified)
-        path: Option<PathBuf>,
-
-        /// `CouchDB` URL
-        #[arg(long)]
-        db_url: Option<String>,
-
-        /// `CouchDB` database name
-        #[arg(long)]
-        db_name: Option<String>,
-    },
-
-    /// Run a one-time sync
-    Sync {
-        /// Directory to sync (uses paths from config if not specified)
-        path: Option<PathBuf>,
-
-        /// Dry run (don't make changes)
-        #[arg(long)]
-        dry_run: bool,
-    },
-
-    /// Rebuild the remote scope from the local filesystem
-    RebuildRemote {
-        /// Directory to sync (uses paths from config if not specified)
-        path: Option<PathBuf>,
-    },
-
-    /// Rebuild the local filesystem from the remote scope
-    RebuildLocal {
-        /// Directory to sync (uses paths from config if not specified)
-        path: Option<PathBuf>,
-    },
-
-    /// Run continuous sync daemon
-    Daemon {
-        /// Directory to sync (uses paths from config if not specified)
-        path: Option<PathBuf>,
-
-        /// Poll interval in seconds
-        #[arg(short, long, default_value = "60")]
-        interval: u64,
-
-        /// Use live sync (filesystem watcher + `CouchDB` changes feed)
-        #[arg(long)]
-        live: bool,
-    },
-
-    /// List conflicts
-    Conflicts {
-        /// Directory to check (uses paths from config if not specified)
-        path: Option<PathBuf>,
-
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Resolve conflicts interactively
-    Resolve {
-        /// Working directory (uses paths from config if not specified)
-        path: Option<PathBuf>,
-    },
-
-    /// Show sync status
-    Status {
-        /// Directory to check (uses paths from config if not specified)
-        path: Option<PathBuf>,
-
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Install the binary and set up a user-level systemd service
-    Install,
-
-    /// Remove the user-level systemd service and installed binary
-    Uninstall,
+    Init(InitCommand),
+    Sync(SyncCommand),
+    RebuildRemote(RebuildRemoteCommand),
+    RebuildLocal(RebuildLocalCommand),
+    Daemon(DaemonCommand),
+    Conflicts(ConflictsCommand),
+    Resolve(ResolveCommand),
+    Status(StatusCommand),
+    Install(InstallCommand),
+    Uninstall(UninstallCommand),
 }
+
+#[derive(FromArgs, Debug)]
+#[argy(subcommand, name = "init")]
+/// initialize a new sync directory
+struct InitCommand {
+    /// directory to initialize (uses paths from config if not specified)
+    #[argy(positional)]
+    path: Option<PathBuf>,
+
+    /// `CouchDB` URL
+    #[argy(option)]
+    db_url: Option<String>,
+
+    /// `CouchDB` database name
+    #[argy(option)]
+    db_name: Option<String>,
+}
+
+#[derive(FromArgs, Debug)]
+#[argy(subcommand, name = "sync")]
+/// run a one-time sync
+struct SyncCommand {
+    /// directory to sync (uses paths from config if not specified)
+    #[argy(positional)]
+    path: Option<PathBuf>,
+
+    /// dry run (don't make changes)
+    #[argy(switch)]
+    dry_run: bool,
+}
+
+#[derive(FromArgs, Debug)]
+#[argy(subcommand, name = "rebuild-remote")]
+/// rebuild the remote scope from the local filesystem
+struct RebuildRemoteCommand {
+    /// directory to sync (uses paths from config if not specified)
+    #[argy(positional)]
+    path: Option<PathBuf>,
+}
+
+#[derive(FromArgs, Debug)]
+#[argy(subcommand, name = "rebuild-local")]
+/// rebuild the local filesystem from the remote scope
+struct RebuildLocalCommand {
+    /// directory to sync (uses paths from config if not specified)
+    #[argy(positional)]
+    path: Option<PathBuf>,
+}
+
+#[derive(FromArgs, Debug)]
+#[argy(subcommand, name = "daemon")]
+/// run continuous sync daemon
+struct DaemonCommand {
+    /// directory to sync (uses paths from config if not specified)
+    #[argy(positional)]
+    path: Option<PathBuf>,
+
+    /// poll interval in seconds
+    #[argy(option, short = 'i', default = "60")]
+    interval: u64,
+
+    /// use live sync (filesystem watcher + `CouchDB` changes feed)
+    #[argy(switch)]
+    live: bool,
+}
+
+#[derive(FromArgs, Debug)]
+#[argy(subcommand, name = "conflicts")]
+/// list conflicts
+struct ConflictsCommand {
+    /// directory to check (uses paths from config if not specified)
+    #[argy(positional)]
+    path: Option<PathBuf>,
+
+    /// output as JSON
+    #[argy(switch)]
+    json: bool,
+}
+
+#[derive(FromArgs, Debug)]
+#[argy(subcommand, name = "resolve")]
+/// resolve conflicts interactively
+struct ResolveCommand {
+    /// working directory (uses paths from config if not specified)
+    #[argy(positional)]
+    path: Option<PathBuf>,
+}
+
+#[derive(FromArgs, Debug)]
+#[argy(subcommand, name = "status")]
+/// show sync status
+struct StatusCommand {
+    /// directory to check (uses paths from config if not specified)
+    #[argy(positional)]
+    path: Option<PathBuf>,
+
+    /// output as JSON
+    #[argy(switch)]
+    json: bool,
+}
+
+#[derive(FromArgs, Debug)]
+#[argy(subcommand, name = "install")]
+/// install the binary and set up a user-level systemd service
+struct InstallCommand {}
+
+#[derive(FromArgs, Debug)]
+#[argy(subcommand, name = "uninstall")]
+/// remove the user-level systemd service and installed binary
+struct UninstallCommand {}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -131,7 +169,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let cli: Cli = argy::from_env();
 
     if cli.verbose > 0 {
         match resolved_config_path(cli.config.clone()) {
@@ -146,14 +184,14 @@ async fn run() -> Result<()> {
 
     let enable_file_logging = matches!(
         &cli.command,
-        Commands::Sync { .. }
-            | Commands::RebuildRemote { .. }
-            | Commands::RebuildLocal { .. }
-            | Commands::Daemon { .. }
+        Commands::Sync(_)
+            | Commands::RebuildRemote(_)
+            | Commands::RebuildLocal(_)
+            | Commands::Daemon(_)
     );
 
     // Initialize logging
-    let daemon_mode = matches!(&cli.command, Commands::Daemon { .. });
+    let daemon_mode = matches!(&cli.command, Commands::Daemon(_));
     init_logging(cli.verbose, &config, enable_file_logging, daemon_mode);
 
     // Execute command
@@ -205,26 +243,20 @@ fn apply_cli_overrides(config: &mut AppConfig, cli: &Cli) {
 
 async fn dispatch_command(command: Commands, config: AppConfig) -> Result<()> {
     match command {
-        Commands::Init {
-            path,
-            db_url,
-            db_name,
-        } => run_init(path, db_url.as_ref(), db_name.as_ref(), &config)?,
-        Commands::Sync { path, dry_run } => run_sync(path, dry_run, &config).await?,
-        Commands::RebuildRemote { path } => run_rebuild_remote(path, &config).await?,
-        Commands::RebuildLocal { path } => run_rebuild_local(path, &config).await?,
-        Commands::Daemon {
-            path,
-            interval,
-            live,
-        } => run_daemon(path, interval, live, config).await?,
-        Commands::Conflicts { path, json } => run_conflicts(path, json, &config)?,
-        Commands::Resolve { path } => run_resolve(path, &config).await?,
-        Commands::Status { path, json } => run_status(path, json, &config)?,
-        Commands::Install => {
+        Commands::Init(cmd) => {
+            run_init(cmd.path, cmd.db_url.as_ref(), cmd.db_name.as_ref(), &config)?;
+        }
+        Commands::Sync(cmd) => run_sync(cmd.path, cmd.dry_run, &config).await?,
+        Commands::RebuildRemote(cmd) => run_rebuild_remote(cmd.path, &config).await?,
+        Commands::RebuildLocal(cmd) => run_rebuild_local(cmd.path, &config).await?,
+        Commands::Daemon(cmd) => run_daemon(cmd.path, cmd.interval, cmd.live, config).await?,
+        Commands::Conflicts(cmd) => run_conflicts(cmd.path, cmd.json, &config)?,
+        Commands::Resolve(cmd) => run_resolve(cmd.path, &config).await?,
+        Commands::Status(cmd) => run_status(cmd.path, cmd.json, &config)?,
+        Commands::Install(_) => {
             cli::install_user_service()?;
         }
-        Commands::Uninstall => {
+        Commands::Uninstall(_) => {
             cli::uninstall_user_service()?;
         }
     }
@@ -499,7 +531,7 @@ mod tests {
         apply_cli_overrides, default_user_config_file_if_exists, paths_match, resolve_paths,
         resolved_config_path,
     };
-    use clap::Parser;
+    use argy::FromArgs;
     use couchdb_file_sync::config::{AppConfig, SyncPath};
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -794,336 +826,279 @@ mod tests {
 
     #[test]
     fn cli_parses_rebuild_remote_subcommand() {
-        let cli =
-            Cli::try_parse_from(["couchdb-file-sync", "rebuild-remote", "/tmp/docs"]).unwrap();
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["rebuild-remote", "/tmp/docs"]).unwrap();
 
-        assert!(matches!(
-            cli.command,
-            Commands::RebuildRemote {
-                path: Some(ref path)
-            } if path == &PathBuf::from("/tmp/docs")
-        ));
+        assert!(matches!(cli.command, Commands::RebuildRemote(ref cmd)
+            if cmd.path == Some(PathBuf::from("/tmp/docs"))));
     }
 
     #[test]
     fn cli_parses_rebuild_local_subcommand() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "rebuild-local", "/tmp/docs"]).unwrap();
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["rebuild-local", "/tmp/docs"]).unwrap();
 
-        assert!(matches!(
-            cli.command,
-            Commands::RebuildLocal {
-                path: Some(ref path)
-            } if path == &PathBuf::from("/tmp/docs")
-        ));
+        assert!(matches!(cli.command, Commands::RebuildLocal(ref cmd)
+            if cmd.path == Some(PathBuf::from("/tmp/docs"))));
     }
 
     // --- Init subcommand ---
 
     #[test]
     fn cli_parses_init_no_args() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "init"]).unwrap();
-        assert!(matches!(cli.command, Commands::Init { path: None, .. }));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["init"]).unwrap();
+        assert!(matches!(cli.command, Commands::Init(ref cmd) if cmd.path.is_none()));
     }
 
     #[test]
     fn cli_parses_init_with_path() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "init", "/my/path"]).unwrap();
-        assert!(matches!(cli.command, Commands::Init {
-            path: Some(ref p), ..
-        } if p == &PathBuf::from("/my/path")));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["init", "/my/path"]).unwrap();
+        assert!(matches!(cli.command, Commands::Init(ref cmd)
+            if cmd.path == Some(PathBuf::from("/my/path"))));
     }
-
     #[test]
     fn cli_parses_init_with_path_db_url_db_name() {
-        let cli = Cli::try_parse_from([
-            "couchdb-file-sync",
-            "init",
-            "/my/path",
-            "--db-url",
-            "https://couch.example.com:6984",
-            "--db-name",
-            "my_database",
-        ])
+        // `--db-url`/`--db-name` after `init` are top-level global options,
+        // so argy routes them to the Cli rather than the InitCommand.
+        let cli = Cli::from_args(
+            &["couchdb-file-sync"],
+            &[
+                "init",
+                "/my/path",
+                "--db-url",
+                "https://couch.example.com:6984",
+                "--db-name",
+                "my_database",
+            ],
+        )
         .unwrap();
-        assert!(matches!(cli.command, Commands::Init {
-            path: Some(ref p),
-            ref db_url,
-            ref db_name,
-        } if p == &PathBuf::from("/my/path")
-            && db_url.as_deref() == Some("https://couch.example.com:6984")
-            && db_name.as_deref() == Some("my_database")));
+        assert!(matches!(cli.command, Commands::Init(ref cmd)
+            if cmd.path == Some(PathBuf::from("/my/path"))));
+        assert_eq!(
+            cli.db_url.as_deref(),
+            Some("https://couch.example.com:6984")
+        );
+        assert_eq!(cli.db_name.as_deref(), Some("my_database"));
     }
 
     #[test]
     fn cli_parses_init_with_only_db_url() {
-        let cli = Cli::try_parse_from([
-            "couchdb-file-sync",
-            "init",
-            "--db-url",
-            "https://couch.example.com:6984",
-        ])
+        // `--db-url` after `init` is a top-level global option, so argy
+        // routes it to the Cli rather than the InitCommand.
+        let cli = Cli::from_args(
+            &["couchdb-file-sync"],
+            &["init", "--db-url", "https://couch.example.com:6984"],
+        )
         .unwrap();
-        assert!(matches!(cli.command, Commands::Init {
-            path: None,
-            ref db_url,
-            ..
-        } if db_url.as_deref() == Some("https://couch.example.com:6984")));
+        assert!(matches!(cli.command, Commands::Init(ref cmd) if cmd.path.is_none()));
+        assert_eq!(
+            cli.db_url.as_deref(),
+            Some("https://couch.example.com:6984")
+        );
     }
 
     // --- Sync subcommand ---
 
     #[test]
     fn cli_parses_sync_no_args() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "sync"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Sync {
-                path: None,
-                dry_run: false,
-            }
-        ));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["sync"]).unwrap();
+        assert!(matches!(cli.command, Commands::Sync(ref cmd)
+            if cmd.path.is_none() && !cmd.dry_run));
     }
 
     #[test]
     fn cli_parses_sync_with_path() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "sync", "/data/docs"]).unwrap();
-        assert!(matches!(cli.command, Commands::Sync {
-            path: Some(ref p), ..
-        } if p == &PathBuf::from("/data/docs")));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["sync", "/data/docs"]).unwrap();
+        assert!(matches!(cli.command, Commands::Sync(ref cmd)
+            if cmd.path == Some(PathBuf::from("/data/docs"))));
     }
 
     #[test]
     fn cli_parses_sync_with_dry_run() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "sync", "--dry-run"]).unwrap();
-        assert!(matches!(cli.command, Commands::Sync { dry_run: true, .. }));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["sync", "--dry-run"]).unwrap();
+        assert!(matches!(cli.command, Commands::Sync(ref cmd) if cmd.dry_run));
     }
 
     #[test]
     fn cli_parses_sync_with_path_and_dry_run() {
         let cli =
-            Cli::try_parse_from(["couchdb-file-sync", "sync", "/data/docs", "--dry-run"]).unwrap();
-        assert!(matches!(cli.command, Commands::Sync {
-            path: Some(ref p),
-            dry_run: true,
-        } if p == &PathBuf::from("/data/docs")));
+            Cli::from_args(&["couchdb-file-sync"], &["sync", "/data/docs", "--dry-run"]).unwrap();
+        assert!(matches!(cli.command, Commands::Sync(ref cmd)
+            if cmd.path == Some(PathBuf::from("/data/docs")) && cmd.dry_run));
     }
 
     // --- Daemon subcommand ---
 
     #[test]
     fn cli_parses_daemon_no_args() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "daemon"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Daemon {
-                path: None,
-                interval: 60,
-                live: false,
-            }
-        ));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["daemon"]).unwrap();
+        assert!(matches!(cli.command, Commands::Daemon(ref cmd)
+            if cmd.path.is_none() && cmd.interval == 60 && !cmd.live));
     }
 
     #[test]
     fn cli_parses_daemon_with_interval() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "daemon", "--interval", "30"]).unwrap();
-        assert!(matches!(cli.command, Commands::Daemon { interval: 30, .. }));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["daemon", "--interval", "30"]).unwrap();
+        assert!(matches!(cli.command, Commands::Daemon(ref cmd) if cmd.interval == 30));
     }
 
     #[test]
     fn cli_parses_daemon_with_live_flag() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "daemon", "--live"]).unwrap();
-        assert!(matches!(cli.command, Commands::Daemon { live: true, .. }));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["daemon", "--live"]).unwrap();
+        assert!(matches!(cli.command, Commands::Daemon(ref cmd) if cmd.live));
     }
 
     #[test]
     fn cli_parses_daemon_with_path_interval_live() {
-        let cli = Cli::try_parse_from([
-            "couchdb-file-sync",
-            "daemon",
-            "/my/path",
-            "--interval",
-            "120",
-            "--live",
-        ])
+        let cli = Cli::from_args(
+            &["couchdb-file-sync"],
+            &["daemon", "/my/path", "--interval", "120", "--live"],
+        )
         .unwrap();
-        assert!(matches!(cli.command, Commands::Daemon {
-            path: Some(ref p),
-            interval: 120,
-            live: true,
-        } if p == &PathBuf::from("/my/path")));
+        assert!(matches!(cli.command, Commands::Daemon(ref cmd)
+            if cmd.path == Some(PathBuf::from("/my/path")) && cmd.interval == 120 && cmd.live));
     }
 
     #[test]
     fn cli_parses_daemon_with_short_interval() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "daemon", "-i", "15"]).unwrap();
-        assert!(matches!(cli.command, Commands::Daemon { interval: 15, .. }));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["daemon", "-i", "15"]).unwrap();
+        assert!(matches!(cli.command, Commands::Daemon(ref cmd) if cmd.interval == 15));
     }
 
     // --- Conflicts subcommand ---
 
     #[test]
     fn cli_parses_conflicts_no_args() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "conflicts"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Conflicts {
-                path: None,
-                json: false,
-            }
-        ));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["conflicts"]).unwrap();
+        assert!(matches!(cli.command, Commands::Conflicts(ref cmd)
+            if cmd.path.is_none() && !cmd.json));
     }
 
     #[test]
     fn cli_parses_conflicts_with_json() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "conflicts", "--json"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Conflicts { json: true, .. }
-        ));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["conflicts", "--json"]).unwrap();
+        assert!(matches!(cli.command, Commands::Conflicts(ref cmd) if cmd.json));
     }
 
     #[test]
     fn cli_parses_conflicts_with_path() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "conflicts", "/data"]).unwrap();
-        assert!(matches!(cli.command, Commands::Conflicts {
-            path: Some(ref p), ..
-        } if p == &PathBuf::from("/data")));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["conflicts", "/data"]).unwrap();
+        assert!(matches!(cli.command, Commands::Conflicts(ref cmd)
+            if cmd.path == Some(PathBuf::from("/data"))));
     }
 
     #[test]
     fn cli_parses_conflicts_with_path_and_json() {
         let cli =
-            Cli::try_parse_from(["couchdb-file-sync", "conflicts", "/data", "--json"]).unwrap();
-        assert!(matches!(cli.command, Commands::Conflicts {
-            path: Some(ref p),
-            json: true,
-        } if p == &PathBuf::from("/data")));
+            Cli::from_args(&["couchdb-file-sync"], &["conflicts", "/data", "--json"]).unwrap();
+        assert!(matches!(cli.command, Commands::Conflicts(ref cmd)
+            if cmd.path == Some(PathBuf::from("/data")) && cmd.json));
     }
 
     // --- Resolve subcommand ---
 
     #[test]
     fn cli_parses_resolve_no_args() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "resolve"]).unwrap();
-        assert!(matches!(cli.command, Commands::Resolve { path: None }));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["resolve"]).unwrap();
+        assert!(matches!(cli.command, Commands::Resolve(ref cmd) if cmd.path.is_none()));
     }
 
     #[test]
     fn cli_parses_resolve_with_path() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "resolve", "/data"]).unwrap();
-        assert!(matches!(cli.command, Commands::Resolve {
-            path: Some(ref p),
-        } if p == &PathBuf::from("/data")));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["resolve", "/data"]).unwrap();
+        assert!(matches!(cli.command, Commands::Resolve(ref cmd)
+            if cmd.path == Some(PathBuf::from("/data"))));
     }
 
     // --- Status subcommand ---
 
     #[test]
     fn cli_parses_status_no_args() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "status"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Status {
-                path: None,
-                json: false,
-            }
-        ));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["status"]).unwrap();
+        assert!(matches!(cli.command, Commands::Status(ref cmd)
+            if cmd.path.is_none() && !cmd.json));
     }
 
     #[test]
     fn cli_parses_status_with_json() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "status", "--json"]).unwrap();
-        assert!(matches!(cli.command, Commands::Status { json: true, .. }));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["status", "--json"]).unwrap();
+        assert!(matches!(cli.command, Commands::Status(ref cmd) if cmd.json));
     }
 
     #[test]
     fn cli_parses_status_with_path() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "status", "/data"]).unwrap();
-        assert!(matches!(cli.command, Commands::Status {
-            path: Some(ref p), ..
-        } if p == &PathBuf::from("/data")));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["status", "/data"]).unwrap();
+        assert!(matches!(cli.command, Commands::Status(ref cmd)
+            if cmd.path == Some(PathBuf::from("/data"))));
     }
 
     #[test]
     fn cli_parses_status_with_path_and_json() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "status", "/data", "--json"]).unwrap();
-        assert!(matches!(cli.command, Commands::Status {
-            path: Some(ref p),
-            json: true,
-        } if p == &PathBuf::from("/data")));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["status", "/data", "--json"]).unwrap();
+        assert!(matches!(cli.command, Commands::Status(ref cmd)
+            if cmd.path == Some(PathBuf::from("/data")) && cmd.json));
     }
 
     // --- RebuildRemote subcommand ---
 
     #[test]
     fn cli_parses_rebuild_remote_no_args() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "rebuild-remote"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::RebuildRemote { path: None }
-        ));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["rebuild-remote"]).unwrap();
+        assert!(matches!(cli.command, Commands::RebuildRemote(ref cmd) if cmd.path.is_none()));
     }
 
     // --- RebuildLocal subcommand ---
 
     #[test]
     fn cli_parses_rebuild_local_no_args() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "rebuild-local"]).unwrap();
-        assert!(matches!(cli.command, Commands::RebuildLocal { path: None }));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["rebuild-local"]).unwrap();
+        assert!(matches!(cli.command, Commands::RebuildLocal(ref cmd) if cmd.path.is_none()));
     }
 
     // --- Install subcommand ---
 
     #[test]
     fn cli_parses_install() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "install"]).unwrap();
-        assert!(matches!(cli.command, Commands::Install));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["install"]).unwrap();
+        assert!(matches!(cli.command, Commands::Install(_)));
     }
 
     // --- Uninstall subcommand ---
 
     #[test]
     fn cli_parses_uninstall() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "uninstall"]).unwrap();
-        assert!(matches!(cli.command, Commands::Uninstall));
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["uninstall"]).unwrap();
+        assert!(matches!(cli.command, Commands::Uninstall(_)));
     }
 
     // --- Global args ---
 
     #[test]
     fn cli_parses_global_verbose_count() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "-v", "status"]).unwrap();
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["-v", "status"]).unwrap();
         assert_eq!(cli.verbose, 1);
 
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "-vv", "status"]).unwrap();
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["-vv", "status"]).unwrap();
         assert_eq!(cli.verbose, 2);
 
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "-vvv", "status"]).unwrap();
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["-vvv", "status"]).unwrap();
         assert_eq!(cli.verbose, 3);
     }
 
     #[test]
     fn cli_parses_global_db_url() {
-        let cli = Cli::try_parse_from([
-            "couchdb-file-sync",
-            "--db-url",
-            "https://example.com:5984",
-            "status",
-        ])
+        let cli = Cli::from_args(
+            &["couchdb-file-sync"],
+            &["--db-url", "https://example.com:5984", "status"],
+        )
         .unwrap();
         assert_eq!(cli.db_url.as_deref(), Some("https://example.com:5984"));
     }
 
     #[test]
     fn cli_parses_global_db_user_and_db_pass() {
-        let cli = Cli::try_parse_from([
-            "couchdb-file-sync",
-            "--db-user",
-            "admin",
-            "--db-pass",
-            "secret",
-            "status",
-        ])
+        let cli = Cli::from_args(
+            &["couchdb-file-sync"],
+            &["--db-user", "admin", "--db-pass", "secret", "status"],
+        )
         .unwrap();
         assert_eq!(cli.db_user.as_deref(), Some("admin"));
         assert_eq!(cli.db_pass.as_deref(), Some("secret"));
@@ -1132,18 +1107,16 @@ mod tests {
     #[test]
     fn cli_parses_global_db_name() {
         let cli =
-            Cli::try_parse_from(["couchdb-file-sync", "--db-name", "my_db", "status"]).unwrap();
+            Cli::from_args(&["couchdb-file-sync"], &["--db-name", "my_db", "status"]).unwrap();
         assert_eq!(cli.db_name.as_deref(), Some("my_db"));
     }
 
     #[test]
     fn cli_parses_global_config_path() {
-        let cli = Cli::try_parse_from([
-            "couchdb-file-sync",
-            "--config",
-            "/path/to/config.yaml",
-            "status",
-        ])
+        let cli = Cli::from_args(
+            &["couchdb-file-sync"],
+            &["--config", "/path/to/config.yaml", "status"],
+        )
         .unwrap();
         assert_eq!(
             cli.config.as_deref(),
@@ -1153,45 +1126,56 @@ mod tests {
 
     #[test]
     fn cli_parses_global_verbose_with_subcommand() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "-vv", "sync", "--dry-run"]).unwrap();
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["-vv", "sync", "--dry-run"]).unwrap();
         assert_eq!(cli.verbose, 2);
-        assert!(matches!(cli.command, Commands::Sync { dry_run: true, .. }));
+        assert!(matches!(cli.command, Commands::Sync(ref cmd) if cmd.dry_run));
     }
-
     #[test]
-    fn cli_parses_long_verbose_with_subcommand() {
-        let cli =
-            Cli::try_parse_from(["couchdb-file-sync", "--verbose", "daemon", "--live"]).unwrap();
-        assert_eq!(cli.verbose, 1);
-        assert!(matches!(cli.command, Commands::Daemon { live: true, .. }));
+    fn cli_reads_db_env_vars_when_not_provided_on_cli() {
+        // argy sources `env`-declared options from the environment when the
+        // CLI value is absent.
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("COUCHDB_FILE_SYNC_DB_URL", "https://env.example.com:5984");
+            std::env::set_var("COUCHDB_FILE_SYNC_DB_NAME", "envdb");
+        }
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["status"]).unwrap();
+        unsafe {
+            std::env::remove_var("COUCHDB_FILE_SYNC_DB_URL");
+            std::env::remove_var("COUCHDB_FILE_SYNC_DB_NAME");
+        }
+        assert_eq!(cli.db_url.as_deref(), Some("https://env.example.com:5984"));
+        assert_eq!(cli.db_name.as_deref(), Some("envdb"));
     }
 
     #[test]
     fn cli_rejects_invalid_subcommand() {
-        let result = Cli::try_parse_from(["couchdb-file-sync", "invalid-cmd"]);
+        let result = Cli::from_args(&["couchdb-file-sync"], &["invalid-cmd"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn cli_rejects_unknown_flag() {
-        let result = Cli::try_parse_from(["couchdb-file-sync", "status", "--unknown-flag"]);
+        let result = Cli::from_args(&["couchdb-file-sync"], &["status", "--unknown-flag"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn apply_cli_overrides_sets_url_db_name_and_auth() {
-        let cli = Cli::try_parse_from([
-            "couchdb-file-sync",
-            "--db-url",
-            "http://localhost:5984/",
-            "--db-user",
-            "alice",
-            "--db-pass",
-            "secret",
-            "--db-name",
-            "mydb",
-            "status",
-        ])
+        let cli = Cli::from_args(
+            &["couchdb-file-sync"],
+            &[
+                "--db-url",
+                "http://localhost:5984/",
+                "--db-user",
+                "alice",
+                "--db-pass",
+                "secret",
+                "--db-name",
+                "mydb",
+                "status",
+            ],
+        )
         .unwrap();
 
         let mut config = AppConfig::default();
@@ -1206,7 +1190,7 @@ mod tests {
 
     #[test]
     fn apply_cli_overrides_leaves_config_untouched_when_no_flags() {
-        let cli = Cli::try_parse_from(["couchdb-file-sync", "status"]).unwrap();
+        let cli = Cli::from_args(&["couchdb-file-sync"], &["status"]).unwrap();
         let mut config = AppConfig::default();
         config.couchdb.url = "original".to_string();
 
