@@ -35,6 +35,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 [[package]]
 name = "argy"
 version = "0.1.19"
+source = "git+https://github.com/argy-rs/argy.git?rev=c87ece1118d601f5f54f460e99b668e1fd3e0b9d#c87ece1118d601f5f54f460e99b668e1fd3e0b9d"
 dependencies = [
  "argy_derive",
  "argy_shared",
@@ -43,6 +44,7 @@ dependencies = [
 [[package]]
 name = "argy_derive"
 version = "0.1.19"
+source = "git+https://github.com/argy-rs/argy.git?rev=c87ece1118d601f5f54f460e99b668e1fd3e0b9d#c87ece1118d601f5f54f460e99b668e1fd3e0b9d"
 dependencies = [
  "argy_shared",
  "proc-macro2",
@@ -53,6 +55,7 @@ dependencies = [
 [[package]]
 name = "argy_shared"
 version = "0.1.19"
+source = "git+https://github.com/argy-rs/argy.git?rev=c87ece1118d601f5f54f460e99b668e1fd3e0b9d#c87ece1118d601f5f54f460e99b668e1fd3e0b9d"
 dependencies = [
  "serde",
 ]
