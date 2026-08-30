@@ -1,4 +1,4 @@
-use crate::models::{Change, ChangeSource, ChangeType, Checkpoint, Conflict, CouchRev, FileState};
+use crate::models::{Checkpoint, Conflict, CouchRev, FileState};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
@@ -67,18 +67,6 @@ impl LocalDb {
                 last_sync_at TEXT NOT NULL
             );
 
-            -- Change queue for pending operations
-            CREATE TABLE IF NOT EXISTS change_queue (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                path TEXT NOT NULL,
-                change_type TEXT NOT NULL,
-                source TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                hash TEXT,
-                size INTEGER,
-                processed BOOLEAN DEFAULT FALSE
-            );
-
             -- Conflicts table
             CREATE TABLE IF NOT EXISTS conflicts (
                 path TEXT PRIMARY KEY,
@@ -101,8 +89,6 @@ impl LocalDb {
             );
 
             -- Indexes
-            CREATE INDEX IF NOT EXISTS idx_changes_path ON change_queue(path);
-            CREATE INDEX IF NOT EXISTS idx_changes_processed ON change_queue(processed);
             CREATE INDEX IF NOT EXISTS idx_conflicts_notified ON conflicts(notified);
             ",
         )?;
@@ -283,119 +269,6 @@ impl LocalDb {
     /// Returns an error if the delete statement cannot be executed.
     pub fn clear_file_states(&self) -> Result<usize> {
         let count = self.conn.execute("DELETE FROM file_states", [])?;
-        Ok(count)
-    }
-
-    // === Change Queue Operations ===
-
-    /// Add change to queue
-    /// Queue a change for later processing.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the change cannot be inserted into the queue.
-    pub fn queue_change(&self, change: &Change) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO change_queue (path, change_type, source, timestamp, hash, size)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            params![
-                &change.path(),
-                format!("{:?}", change.change_type()),
-                format!("{:?}", change.source()),
-                Utc::now(),
-                change.hash().as_ref(),
-                opt_u64_to_i64(change.size())?,
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Get unprocessed changes
-    /// Get all pending (unprocessed) changes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the query against the local database fails.
-    pub fn get_pending_changes(&self) -> Result<Vec<Change>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT path, change_type, source, timestamp, hash, size
-             FROM change_queue WHERE processed = FALSE ORDER BY timestamp",
-        )?;
-
-        let changes = stmt
-            .query_map([], |row| {
-                let change_type_str: String = row.get(1)?;
-                let source_str: String = row.get(2)?;
-
-                let size: Option<i64> = row.get(5)?;
-                let path: String = row.get(0)?;
-                let change_type = parse_change_type(&change_type_str);
-                let source = parse_change_source(&source_str);
-                let hash: Option<String> = row.get(4)?;
-                let size: Option<u64> = size.map(i64_to_u64).transpose()?;
-
-                Ok(match (change_type, source) {
-                    (ChangeType::Created, ChangeSource::Local) => {
-                        let hash = hash.unwrap_or_default();
-                        let size = size.unwrap_or(0);
-                        Change::local_created(path, hash, size)
-                    }
-                    (ChangeType::Modified, ChangeSource::Local) => {
-                        let hash = hash.unwrap_or_default();
-                        let size = size.unwrap_or(0);
-                        Change::local_modified(path, hash, size)
-                    }
-                    (ChangeType::Deleted, ChangeSource::Local) => Change::local_deleted(path),
-                    (ChangeType::Created, ChangeSource::Remote) => {
-                        let hash = hash.unwrap_or_default();
-                        let size = size.unwrap_or(0);
-                        Change::remote_created(path, hash, size, Utc::now(), String::new())
-                    }
-                    (ChangeType::Modified, ChangeSource::Remote) => {
-                        let hash = hash.unwrap_or_default();
-                        let size = size.unwrap_or(0);
-                        Change::remote_modified(path, hash, size, Utc::now(), String::new())
-                    }
-                    (ChangeType::Deleted, ChangeSource::Remote) => {
-                        Change::remote_deleted(path, None)
-                    }
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(changes)
-    }
-
-    /// Mark changes as processed
-    /// Mark the given paths' queued changes as processed.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the update statement cannot be executed.
-    pub fn mark_changes_processed(&self, paths: &[String]) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-
-        for path in paths {
-            self.conn.execute(
-                "UPDATE change_queue SET processed = TRUE WHERE path = ?",
-                params![path],
-            )?;
-        }
-
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Clear processed changes
-    /// Remove processed changes from the queue.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the delete statement cannot be executed.
-    pub fn clear_processed_changes(&self) -> Result<usize> {
-        let count = self
-            .conn
-            .execute("DELETE FROM change_queue WHERE processed = TRUE", [])?;
         Ok(count)
     }
 
@@ -625,34 +498,14 @@ impl LocalDb {
     /// Returns an error if any of the reset operations fail.
     pub fn reset_sync_state(&self) -> Result<()> {
         self.clear_file_states()?;
-        self.conn.execute("DELETE FROM change_queue", [])?;
         self.clear_conflicts()?;
         self.clear_checkpoint()?;
         Ok(())
     }
 }
 
-fn parse_change_type(s: &str) -> ChangeType {
-    match s {
-        "Created" => ChangeType::Created,
-        "Deleted" => ChangeType::Deleted,
-        _ => ChangeType::Modified,
-    }
-}
-
-fn parse_change_source(s: &str) -> crate::models::ChangeSource {
-    match s {
-        "Remote" => crate::models::ChangeSource::Remote,
-        _ => crate::models::ChangeSource::Local,
-    }
-}
-
 fn u64_to_i64(value: u64) -> Result<i64> {
     Ok(i64::try_from(value)?)
-}
-
-fn opt_u64_to_i64(value: Option<u64>) -> Result<Option<i64>> {
-    value.map(u64_to_i64).transpose()
 }
 
 fn i64_to_u64(value: i64) -> rusqlite::Result<u64> {
@@ -666,7 +519,7 @@ fn i64_to_u64(value: i64) -> rusqlite::Result<u64> {
 mod tests {
     use super::*;
 
-    use crate::models::{Change, ChangeSource, ChangeType, Conflict};
+    use crate::models::Conflict;
     use chrono::Utc;
 
     // ── helpers ──────────────────────────────────────────────────────────
@@ -677,10 +530,6 @@ mod tests {
 
     fn make_file_state(path: &str) -> FileState {
         FileState::new(path.to_string(), "abc123".to_string(), 1024, Utc::now())
-    }
-
-    fn make_change(path: &str) -> Change {
-        Change::local_created(path.to_string(), "def456".to_string(), 2048)
     }
 
     fn make_conflict(path: &str) -> Conflict {
@@ -845,106 +694,6 @@ mod tests {
         assert!(states.is_empty());
     }
 
-    // ── change_queue operations ──────────────────────────────────────────
-
-    #[test]
-    fn test_queue_and_get_pending_changes() {
-        let db = test_db();
-        let change = make_change("/test/file.txt");
-        db.queue_change(&change).expect("queue_change");
-
-        let pending = db.get_pending_changes().expect("get_pending_changes");
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].path(), "/test/file.txt");
-        assert_eq!(pending[0].change_type(), ChangeType::Created);
-        assert_eq!(pending[0].source(), ChangeSource::Local);
-    }
-
-    #[test]
-    fn test_get_pending_changes_empty() {
-        let db = test_db();
-        let pending = db.get_pending_changes().expect("get_pending_changes");
-        assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn test_get_pending_changes_ordered_by_timestamp() {
-        let db = test_db();
-
-        let c1 = make_change("/first");
-        let c2 = make_change("/second");
-        let c3 = make_change("/third");
-
-        db.queue_change(&c3).expect("queue c3");
-        db.queue_change(&c1).expect("queue c1");
-        db.queue_change(&c2).expect("queue c2");
-
-        let pending = db.get_pending_changes().expect("get_pending_changes");
-        assert_eq!(pending.len(), 3);
-        assert_eq!(pending[0].path(), "/third");
-        assert_eq!(pending[1].path(), "/first");
-        assert_eq!(pending[2].path(), "/second");
-    }
-
-    #[test]
-    fn test_mark_changes_processed() {
-        let db = test_db();
-        db.queue_change(&make_change("/a.txt")).expect("queue a");
-        db.queue_change(&make_change("/b.txt")).expect("queue b");
-
-        db.mark_changes_processed(&["/a.txt".to_string()])
-            .expect("mark_changes_processed");
-
-        let pending = db.get_pending_changes().expect("get_pending_changes");
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].path(), "/b.txt");
-    }
-
-    #[test]
-    fn test_mark_changes_processed_all() {
-        let db = test_db();
-        db.queue_change(&make_change("/a.txt")).expect("queue a");
-        db.queue_change(&make_change("/b.txt")).expect("queue b");
-
-        db.mark_changes_processed(&["/a.txt".to_string(), "/b.txt".to_string()])
-            .expect("mark_changes_processed");
-
-        let pending = db.get_pending_changes().expect("get_pending_changes");
-        assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn test_clear_processed_changes() {
-        let db = test_db();
-        db.queue_change(&make_change("/a.txt")).expect("queue a");
-        db.queue_change(&make_change("/b.txt")).expect("queue b");
-
-        db.mark_changes_processed(&["/a.txt".to_string()])
-            .expect("mark");
-        let cleared = db
-            .clear_processed_changes()
-            .expect("clear_processed_changes");
-        assert_eq!(cleared, 1);
-
-        let pending = db.get_pending_changes().expect("get_pending_changes");
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].path(), "/b.txt");
-    }
-
-    #[test]
-    fn test_clear_processed_changes_noop_when_none_processed() {
-        let db = test_db();
-        db.queue_change(&make_change("/a.txt")).expect("queue a");
-
-        let cleared = db
-            .clear_processed_changes()
-            .expect("clear_processed_changes");
-        assert_eq!(cleared, 0);
-
-        let pending = db.get_pending_changes().expect("get_pending_changes");
-        assert_eq!(pending.len(), 1);
-    }
-
     // ── conflict operations ──────────────────────────────────────────────
 
     #[test]
@@ -1105,8 +854,6 @@ mod tests {
         // Insert data across all tables
         db.save_file_state(&make_file_state("/a.txt"))
             .expect("save file state");
-        db.queue_change(&make_change("/a.txt"))
-            .expect("queue change");
         db.store_conflict(&make_conflict("/a.txt"))
             .expect("store conflict");
         db.save_checkpoint("seq-1").expect("save checkpoint");
@@ -1116,11 +863,6 @@ mod tests {
 
         // Verify everything is gone
         assert!(db.get_all_file_states().expect("file states").is_empty());
-        assert!(
-            db.get_pending_changes()
-                .expect("pending changes")
-                .is_empty()
-        );
         assert!(db.get_conflicts().expect("conflicts").is_empty());
         assert!(db.get_checkpoint().expect("checkpoint").is_none());
     }
@@ -1146,31 +888,5 @@ mod tests {
         let db = test_db();
         let result = db.mark_conflict_notified("/nonexistent");
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_queue_change_with_all_change_types() {
-        let db = test_db();
-        let path = "/test/file.txt";
-        let hash = "hash".to_string();
-        let now = Utc::now();
-
-        let created = Change::local_created(path.to_string(), hash.clone(), 100u64);
-        let modified =
-            Change::remote_modified(path.to_string(), hash, 100u64, now, "1-rev".to_string());
-        let deleted = Change::local_deleted(path.to_string());
-
-        db.queue_change(&created).expect("queue created");
-        db.queue_change(&modified).expect("queue modified");
-        db.queue_change(&deleted).expect("queue deleted");
-
-        let pending = db.get_pending_changes().expect("get_pending_changes");
-        assert_eq!(pending.len(), 3);
-        assert_eq!(pending[0].change_type(), ChangeType::Created);
-        assert_eq!(pending[1].change_type(), ChangeType::Modified);
-        assert_eq!(pending[2].change_type(), ChangeType::Deleted);
-        assert_eq!(pending[0].source(), ChangeSource::Local);
-        assert_eq!(pending[1].source(), ChangeSource::Remote);
-        assert_eq!(pending[2].source(), ChangeSource::Local);
     }
 }

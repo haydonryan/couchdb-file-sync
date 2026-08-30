@@ -204,6 +204,7 @@ pub fn triage_changes<S: std::hash::BuildHasher>(
     remote_changes: &[Change],
     stored_states: &HashMap<String, FileState, S>,
     remote_prefix: &str,
+    root_dir: &std::path::Path,
 ) -> TriageResult {
     // Build lookup maps
     let local_map: HashMap<&str, &Change> = local_changes.iter().map(|c| (c.path(), c)).collect();
@@ -276,9 +277,12 @@ pub fn triage_changes<S: std::hash::BuildHasher>(
         let stored_state = stored_states.get(&local_path);
 
         if rc.change_type() == ChangeType::Deleted {
-            // Remote delete — check if it should be applied locally
+            // Remote delete — check if it should be applied locally. The
+            // existence/mtime check must resolve against the sync root, not the
+            // process CWD (which differs whenever the daemon is launched from
+            // elsewhere), otherwise the wrong tree is inspected.
             let relative_path = local_path.trim_start_matches('/');
-            let file_path = std::path::Path::new(relative_path);
+            let file_path = root_dir.join(relative_path);
             let local_mtime = file_path
                 .metadata()
                 .ok()
@@ -300,9 +304,10 @@ pub fn triage_changes<S: std::hash::BuildHasher>(
         // Remote change not in local changes — check if it should be downloaded
         let should_download = stored_state.map_or_else(
             || {
-                // No local state — check if file exists on disk
+                // No local state — check if file exists on disk (resolved
+                // against the sync root, not the process CWD).
                 let relative_path = local_path.trim_start_matches('/');
-                let file_path = std::path::Path::new(relative_path);
+                let file_path = root_dir.join(relative_path);
                 if file_path.exists() {
                     // File exists but not tracked — skip
                     false
@@ -388,6 +393,7 @@ mod tests {
     use crate::models::file::CouchRev;
 
     use chrono::{Duration, NaiveDateTime, Utc};
+    use tempfile::TempDir;
 
     // ── Helper helpers ──────────────────────────────────────────────
 
@@ -683,7 +689,7 @@ mod tests {
     #[test]
     fn local_delete_always_uploads() {
         let local = vec![local_change("f.txt", ChangeType::Deleted)];
-        let result = triage_changes(&local, &[], &HashMap::new(), "");
+        let result = triage_changes(&local, &[], &HashMap::new(), "", std::path::Path::new(""));
 
         assert_eq!(result.uploads.len(), 1);
         assert_eq!(result.uploads[0].path(), "f.txt");
@@ -696,7 +702,7 @@ mod tests {
     #[test]
     fn local_created_uploads_when_no_remote() {
         let local = vec![local_change("f.txt", ChangeType::Created)];
-        let result = triage_changes(&local, &[], &HashMap::new(), "");
+        let result = triage_changes(&local, &[], &HashMap::new(), "", std::path::Path::new(""));
 
         assert_eq!(result.uploads.len(), 1);
         assert_eq!(result.uploads[0].path(), "f.txt");
@@ -715,7 +721,7 @@ mod tests {
         states.insert("f.txt".to_string(), make_state("f.txt", last_sync));
 
         let local = vec![local_change("f.txt", ChangeType::Modified)];
-        let result = triage_changes(&local, &remote, &states, "");
+        let result = triage_changes(&local, &remote, &states, "", std::path::Path::new(""));
 
         assert_eq!(result.uploads.len(), 1);
     }
@@ -735,7 +741,7 @@ mod tests {
         states.insert("f.txt".to_string(), make_state("f.txt", last_sync));
 
         let local = vec![local_change("f.txt", ChangeType::Modified)];
-        let result = triage_changes(&local, &remote, &states, "");
+        let result = triage_changes(&local, &remote, &states, "", std::path::Path::new(""));
 
         assert_eq!(result.needs_comparison.len(), 1);
         assert_eq!(result.needs_comparison[0].path, "f.txt");
@@ -765,7 +771,7 @@ mod tests {
         states.insert("f.txt".to_string(), make_state("f.txt", last_sync));
 
         let local = vec![local_change("f.txt", ChangeType::Modified)];
-        let result = triage_changes(&local, &remote, &states, "");
+        let result = triage_changes(&local, &remote, &states, "", std::path::Path::new(""));
 
         assert_eq!(result.needs_comparison.len(), 1);
         assert_eq!(result.needs_comparison[0].path, "f.txt");
@@ -791,7 +797,7 @@ mod tests {
         states.insert("f.txt".to_string(), make_state("f.txt", last_sync));
 
         let local = vec![local_change("f.txt", ChangeType::Modified)];
-        let result = triage_changes(&local, &remote, &states, "");
+        let result = triage_changes(&local, &remote, &states, "", std::path::Path::new(""));
 
         assert_eq!(result.uploads.len(), 1);
         assert!(result.needs_comparison.is_empty());
@@ -805,10 +811,38 @@ mod tests {
             Some(utc("2026-07-28 12:00:00")),
             Some("1-abc"),
         )];
-        let result = triage_changes(&[], &remote, &HashMap::new(), "remote/");
+        let result = triage_changes(
+            &[],
+            &remote,
+            &HashMap::new(),
+            "remote/",
+            std::path::Path::new(""),
+        );
 
         assert_eq!(result.downloads.len(), 1);
         assert_eq!(result.downloads[0].path(), "remote/f.txt");
+    }
+
+    #[test]
+    fn remote_new_file_skipped_when_local_copy_exists_in_root_dir() {
+        // The existence check must resolve against the sync root (root_dir),
+        // not the process CWD, so a remote file whose local counterpart exists
+        // under the root is not downloaded/overwritten.
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::write(temp_dir.path().join("f.txt"), b"local copy").unwrap();
+
+        let remote = vec![remote_change(
+            "f.txt",
+            ChangeType::Created,
+            Some(utc("2026-07-28 12:00:00")),
+            Some("1-abc"),
+        )];
+        let result = triage_changes(&[], &remote, &HashMap::new(), "", temp_dir.path());
+
+        assert!(
+            result.downloads.is_empty(),
+            "existing local file must not be downloaded"
+        );
     }
 
     #[test]
@@ -824,7 +858,7 @@ mod tests {
         state.couch_rev = Some(CouchRev::new("1-abc").unwrap());
         states.insert("f.txt".to_string(), state);
 
-        let result = triage_changes(&[], &remote, &states, "");
+        let result = triage_changes(&[], &remote, &states, "", std::path::Path::new(""));
 
         assert_eq!(result.downloads.len(), 1);
     }
@@ -842,7 +876,7 @@ mod tests {
         state.couch_rev = Some(CouchRev::new("1-abc").unwrap());
         states.insert("f.txt".to_string(), state);
 
-        let result = triage_changes(&[], &remote, &states, "");
+        let result = triage_changes(&[], &remote, &states, "", std::path::Path::new(""));
 
         assert_eq!(result.downloads.len(), 0);
         assert_eq!(result.skipped.len(), 1);
@@ -864,7 +898,7 @@ mod tests {
             make_state("f.txt", utc("2026-07-28 10:00:00")),
         );
 
-        let result = triage_changes(&[], &remote, &states, "");
+        let result = triage_changes(&[], &remote, &states, "", std::path::Path::new(""));
 
         assert_eq!(result.remote_deletes.len(), 1);
     }
@@ -883,7 +917,7 @@ mod tests {
             make_state("f.txt", utc("2026-07-28 10:00:00")),
         );
 
-        let result = triage_changes(&[], &remote, &states, "");
+        let result = triage_changes(&[], &remote, &states, "", std::path::Path::new(""));
 
         assert_eq!(result.remote_deletes.len(), 0);
         assert_eq!(result.skipped.len(), 1);
@@ -919,7 +953,13 @@ mod tests {
             make_state("doc.txt", utc("2026-07-28 10:00:00")),
         );
 
-        let result = triage_changes(&local, &remote, &states, "prefix/");
+        let result = triage_changes(
+            &local,
+            &remote,
+            &states,
+            "prefix/",
+            std::path::Path::new(""),
+        );
 
         // Remote mtime is before last sync → upload local
         assert_eq!(result.uploads.len(), 1);
@@ -1052,7 +1092,7 @@ mod tests {
             make_state("remote_delete.txt", last_sync),
         );
 
-        let result = triage_changes(&local, &remote, &states, "");
+        let result = triage_changes(&local, &remote, &states, "", std::path::Path::new(""));
 
         // Local delete queued for upload
         assert_eq!(result.uploads.len(), 2);

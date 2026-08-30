@@ -355,6 +355,7 @@ dependencies = [
  "hyper-util",
  "notify-debouncer-full",
  "parking_lot",
+ "percent-encoding",
  "rand",
  "reqwest",
  "rusqlite",

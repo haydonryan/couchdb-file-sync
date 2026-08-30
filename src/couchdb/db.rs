@@ -2,6 +2,7 @@ use crate::models::{Change, ChunkDoc, DatabaseName, FileDoc, RemotePath, Timesta
 use anyhow::Result;
 use couch_rs::Client;
 use couch_rs::database::Database;
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use serde_json::Value;
@@ -13,6 +14,25 @@ use tracing::{debug, warn};
 /// Only used in non-test builds; tests use a fixed tiny delay (`test_backoff`).
 #[cfg(not(test))]
 const RETRY_BASE_BACKOFF_MS: u64 = 250;
+
+/// Characters allowed unencoded when percent-encoding a `CouchDB` document id.
+///
+/// A file document id is a filesystem path, so `/` is preserved as a path
+/// separator while every other reserved/unsafe character (space, `#`, `?`,
+/// `%`, `&`, `+`, `=` …) is percent-encoded. Without this, ids containing such
+/// characters would be truncated or mangled when interpolated into a URL.
+const FILE_ID_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'/')
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// True if `id` is a chunk document id (generated as `h:<hex><hex>`).
+#[must_use]
+fn is_chunk_id(id: &str) -> bool {
+    id.starts_with("h:")
+}
 
 /// `CouchDB` client wrapper
 pub struct CouchDb {
@@ -307,6 +327,13 @@ impl CouchDb {
             }
 
             if row.deleted.unwrap_or(false) {
+                // Hard-deleted rows carry no body, so `doc.is_file()` cannot be
+                // consulted here. Chunk documents (ids like `h:...`) are
+                // hard-deleted whenever a file is overwritten; they must not
+                // surface as file deletions in the change stream.
+                if is_chunk_id(&row.id) {
+                    continue;
+                }
                 entries.push(ChangeFeedEntry {
                     change: Change::remote_deleted(row.id, None),
                     seq: seq_to_string(&row.seq),
@@ -885,7 +912,12 @@ impl CouchDb {
     ///
     /// Returns an error if the `CouchDB` delete request fails.
     async fn delete_doc(&self, id: &str, rev: &str) -> Result<()> {
-        let url = format!("{}/{id}?rev={rev}", self.base_db_url);
+        // The id is a filesystem path that may contain URL-reserved characters
+        // (space, `#`, `?`, `%`, ...). Percent-encode it (preserving `/`
+        // separators) so the DELETE targets the correct document instead of
+        // being truncated or mangled by the URL parser.
+        let encoded_id = utf8_percent_encode(id, FILE_ID_ENCODE_SET);
+        let url = format!("{}/{encoded_id}?rev={rev}", self.base_db_url);
         let mut request = self.http_client.delete(&url);
         if let Some((username, password)) = &self.auth {
             request = request.basic_auth(username, Some(password));

@@ -337,6 +337,20 @@ impl Scanner {
         // Detect deleted files
         for stored in stored_states {
             if !current_map.contains_key(&stored.path) {
+                // A stored path absent from the scan could mean it was truly
+                // deleted, OR that it still exists on disk but failed to scan
+                // (permission error, transient I/O error, or a race with a
+                // concurrent delete/rename). Reporting a delete for a file that
+                // is still present would destroy its remote copy, so only treat
+                // it as deleted when it is genuinely gone from the filesystem.
+                let full_path = self.root_dir.as_path().join(&stored.path);
+                if full_path.exists() {
+                    debug!(
+                        "File {} exists on disk but could not be scanned; not reporting a delete",
+                        stored.path
+                    );
+                    continue;
+                }
                 changes.push(Change::local_deleted(stored.path.clone()));
             }
         }
@@ -1129,6 +1143,34 @@ mod tests {
         assert_eq!(changes[0].path(), "gone.txt");
         assert_eq!(changes[0].change_type(), ChangeType::Deleted);
         assert_eq!(changes[0].source(), ChangeSource::Local);
+    }
+
+    #[test]
+    fn test_detect_changes_present_but_unscanned_file_is_not_deleted() {
+        // A stored file absent from the current scan could mean it exists on
+        // disk but failed to scan (permission/I-O error). It must not be
+        // reported as a delete, or its remote copy would be destroyed.
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::write(temp_dir.path().join("unreadable.txt"), b"data").unwrap();
+        let scanner = Scanner::new(
+            SyncDirPath::new(temp_dir.path()).unwrap(),
+            IgnoreMatcher::empty(),
+        );
+
+        let stored = vec![FileState::new(
+            "unreadable.txt".to_string(),
+            "hash".to_string(),
+            4,
+            Utc::now(),
+        )];
+        // The file is missing from `current` (as when its scan errored).
+        let current: Vec<FileState> = vec![];
+
+        let changes = scanner.detect_changes(&current, &stored);
+        assert!(
+            changes.is_empty(),
+            "present-but-unscanned file must not be reported deleted"
+        );
     }
 
     #[test]

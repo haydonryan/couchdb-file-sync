@@ -692,9 +692,20 @@ impl SyncEngine {
         );
         apply_download_batch(self.apply_worker(), remote_to_apply, dry_run, &mut report).await?;
 
-        // 7. Update checkpoint (skipped in dry-run)
-        if !dry_run {
+        // 7. Update checkpoint (skipped in dry-run).
+        //    Advance the remote change-feed checkpoint only when every queued
+        //    change was applied without error. A failed download leaves the
+        //    local file absent/stale (the local scanner cannot re-detect it),
+        //    so advancing past it would permanently drop the change; uploads
+        //    also self-heal via the next local scan, so retrying the whole
+        //    batch after any failure is always safe and idempotent.
+        if !dry_run && report.errors.is_empty() {
             self.local_db.save_checkpoint(&last_seq).await?;
+        } else if !dry_run {
+            warn!(
+                "Not advancing sync checkpoint: {} change(s) failed to apply and will be retried",
+                report.errors.len()
+            );
         }
 
         // 8. Prune obsolete soft-delete tombstones (skipped in dry-run).
@@ -947,8 +958,13 @@ impl SyncEngine {
         self.debug_local_changes(local_changes, &stored_states, &remote_by_path);
 
         // ── Run the pure triage function ──────────────────────────────────
-        let triage_result =
-            triage::triage_changes(local_changes, remote_changes, &stored_states, remote_prefix);
+        let triage_result = triage::triage_changes(
+            local_changes,
+            remote_changes,
+            &stored_states,
+            remote_prefix,
+            self.root_dir.as_path(),
+        );
 
         // Collect results
         let local_to_upload = triage_result.uploads;
