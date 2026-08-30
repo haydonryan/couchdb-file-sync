@@ -2136,6 +2136,60 @@ mod tests {
         assert_eq!(final_state.hash, hash);
     }
 
+    #[tokio::test]
+    async fn failed_download_does_not_advance_checkpoint() {
+        // A failed content download must not advance the remote change-feed
+        // checkpoint, or the change would be silently dropped and never retried.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+
+        let local = test_local_db();
+        local.save_checkpoint("100-before").unwrap();
+
+        let remote_path = "prefix/doc.txt";
+        let mut remote_doc = FileDoc::new(remote_path.to_string(), String::new(), 12);
+        remote_doc.rev = Some("2-def".to_string());
+        remote_doc.mtime = TimestampMillis::now();
+        remote_doc.path = remote_path.to_string();
+
+        let canned = CannedCouch {
+            changes: vec![Change::remote_modified(
+                remote_path.to_string(),
+                "remotehash".to_string(),
+                12,
+                Utc::now(),
+                "2-def".to_string(),
+            )],
+            last_seq: "200-after".to_string(),
+            metadata: std::collections::HashMap::from([(remote_path.to_string(), remote_doc)]),
+            content_errors: std::collections::HashSet::from([remote_path.to_string()]),
+            ..CannedCouch::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let report = engine
+            .sync()
+            .await
+            .expect("sync with a failed download must not abort");
+
+        assert!(
+            !report.errors.is_empty(),
+            "the simulated content-download failure must be collected into report.errors"
+        );
+
+        let cp = engine.get_checkpoint().await.unwrap();
+        assert_eq!(
+            cp.map(|c| c.last_seq),
+            Some("100-before".to_string()),
+            "checkpoint must not advance past a failed download"
+        );
+    }
+
     // ── Unchanged-tree scan reuses stored hashes (#3005) ──────────────────
 
     #[tokio::test]
