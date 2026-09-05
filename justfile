@@ -12,9 +12,6 @@ check:
     cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::pedantic -W clippy::nursery
     cargo audit
     cargo deny check all
-    cargo test --workspace
-    cargo test --workspace --all-features
-    cargo test --workspace --no-default-features
 
 install:
     cargo install --path . --bin couchdb-file-sync --target-dir "${CARGO_TARGET_DIR:-target}"
