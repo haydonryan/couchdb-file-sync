@@ -52,7 +52,7 @@ chrono = { version = "0.4", features = ["serde"] }
 globset = "0.4"
 
 # HTTP client for Telegram
-reqwest = { version = "0.13.4", features = ["json", "query"] }
+reqwest = { version = "0.13.5", features = ["json", "query"] }
 
 # Error handling
 anyhow = "1.0"
