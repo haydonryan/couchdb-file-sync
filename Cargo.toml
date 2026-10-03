@@ -77,6 +77,11 @@ http-body-util = "0.1.5"
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 parking_lot = "0.12"
 
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+
 [package.metadata.release]
 allow-branch = ["main", "master"]
 sign-commit = false
