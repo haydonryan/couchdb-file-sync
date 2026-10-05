@@ -1696,7 +1696,7 @@ mod tests {
         assert_eq!(report.downloaded.0, 0);
         assert_eq!(report.deleted_local, 0);
         assert_eq!(report.conflicts, 0);
-        assert!(report.errors.is_empty());
+        assert_eq!(report.errors, [] as [String; 0]);
 
         // Trieage ran: the planned upload is the new file.
         // Dry run wrote nothing to the state DB:
@@ -2763,7 +2763,7 @@ mod tests {
         assert!(async_db.get_conflicts().await.unwrap().is_empty());
         async_db.reset_sync_state().await.unwrap();
         assert!(async_db.get_checkpoint().await.unwrap().is_none());
-        assert!(async_db.get_all_file_states().await.unwrap().is_empty());
+        assert_eq!(async_db.get_all_file_states().await.unwrap(), []);
     }
 
     #[tokio::test]
@@ -2945,7 +2945,7 @@ mod tests {
         assert_eq!(report.downloaded.0, 3, "all pre-existing files downloaded");
         assert_eq!(report.uploaded.0, 0);
         assert_eq!(report.conflicts, 0);
-        assert!(report.errors.is_empty());
+        assert_eq!(report.errors, [] as [String; 0]);
         assert_eq!(
             std::fs::read_to_string(root.as_path().join("a.txt")).unwrap(),
             "aaaaa",

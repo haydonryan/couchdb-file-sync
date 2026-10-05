@@ -657,7 +657,7 @@ mod tests {
     fn test_get_all_file_states_empty() {
         let db = test_db();
         let states = db.get_all_file_states().expect("get_all_file_states");
-        assert!(states.is_empty());
+        assert_eq!(states, []);
     }
 
     #[test]
@@ -691,7 +691,7 @@ mod tests {
         assert_eq!(cleared, 2);
 
         let states = db.get_all_file_states().expect("get_all_file_states");
-        assert!(states.is_empty());
+        assert_eq!(states, []);
     }
 
     // ── conflict operations ──────────────────────────────────────────────
@@ -862,7 +862,7 @@ mod tests {
         db.reset_sync_state().expect("reset_sync_state");
 
         // Verify everything is gone
-        assert!(db.get_all_file_states().expect("file states").is_empty());
+        assert_eq!(db.get_all_file_states().expect("file states"), []);
         assert!(db.get_conflicts().expect("conflicts").is_empty());
         assert!(db.get_checkpoint().expect("checkpoint").is_none());
     }

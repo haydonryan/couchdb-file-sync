@@ -597,8 +597,8 @@ mod tests {
 
         // Empty by default
         assert!(config.paths.is_empty());
-        assert!(config.ignore.patterns.is_empty());
-        assert!(config.ignore.ignore_files.is_empty());
+        assert_eq!(config.ignore.patterns, [] as [String; 0]);
+        assert_eq!(config.ignore.ignore_files, [] as [String; 0]);
 
         // Conflict defaults
         assert_eq!(

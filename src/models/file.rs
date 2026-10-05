@@ -344,7 +344,7 @@ mod tests {
         assert_eq!(doc.doc_type, DocType::Plain);
         assert!(!doc.deleted);
         assert!(doc.rev.is_none());
-        assert!(doc.children.is_empty());
+        assert_eq!(doc.children, [] as [String; 0]);
         assert_eq!(doc.hash, "hash1");
         // ctime and mtime should be set to approximately now
         let now_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0);
