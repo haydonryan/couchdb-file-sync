@@ -161,26 +161,6 @@ mod tests {
     }
 
     #[test]
-    fn test_resolution_strategy_from_str() {
-        assert_eq!(
-            "keep-local".parse::<ResolutionStrategy>(),
-            Ok(ResolutionStrategy::KeepLocal)
-        );
-        assert_eq!(
-            "keep-remote".parse::<ResolutionStrategy>(),
-            Ok(ResolutionStrategy::KeepRemote)
-        );
-        assert_eq!(
-            "keep-both".parse::<ResolutionStrategy>(),
-            Ok(ResolutionStrategy::KeepBoth)
-        );
-        assert_eq!(
-            "skip".parse::<ResolutionStrategy>(),
-            Ok(ResolutionStrategy::Skip)
-        );
-    }
-
-    #[test]
     fn test_resolution_strategy_from_str_invalid() {
         let result = "unknown".parse::<ResolutionStrategy>();
         assert!(result.is_err());

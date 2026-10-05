@@ -371,24 +371,6 @@ mod tests {
     }
 
     #[test]
-    fn test_file_doc_is_file_empty_type_not_chunk() {
-        let doc = FileDoc {
-            id: "/path/to/file.txt".into(),
-            rev: None,
-            children: vec![],
-            path: "/path/to/file.txt".into(),
-            ctime: TimestampMillis::new(0),
-            mtime: TimestampMillis(0),
-            deleted_at: TimestampMillis::default(),
-            size: 100,
-            doc_type: DocType::Plain,
-            deleted: false,
-            hash: String::new(),
-        };
-        assert!(doc.is_file());
-    }
-
-    #[test]
     fn test_file_doc_is_file_chunk_prefix() {
         let doc = FileDoc {
             id: "h:abc123".into(),

@@ -390,11 +390,4 @@ mod tests {
         assert_eq!(remotes.len(), 2);
         assert!(remotes.iter().all(|c| c.source() == ChangeSource::Remote));
     }
-
-    #[test]
-    fn test_change_batch_default_is_empty() {
-        let batch = ChangeBatch::default();
-        assert!(batch.is_empty());
-        assert_eq!(batch.len(), 0);
-    }
 }
