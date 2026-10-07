@@ -72,7 +72,7 @@ rand = "0.10.3"
 tempfile = "3.27"
 tokio-test = "0.4"
 filetime = "0.2"
-hyper = { version = "1.11", features = ["server", "http1"] }
+hyper = { version = "1.12", features = ["server", "http1"] }
 http-body-util = "0.1.5"
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 parking_lot = "0.12"
