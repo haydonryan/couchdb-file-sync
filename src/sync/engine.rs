@@ -173,8 +173,7 @@ impl ApplyWorker {
         local_path: &str,
         remote_path: &str,
     ) -> Result<(usize, Option<String>)> {
-        let relative_path = local_path.trim_start_matches('/');
-        let file_path = self.root_dir.as_path().join(relative_path);
+        let file_path = self.root_dir.join_contained(local_path)?;
         let metadata = tokio::fs::metadata(&file_path).await?;
         let mtime = u64::try_from(
             metadata
@@ -267,8 +266,7 @@ impl ApplyWorker {
             return Ok(None);
         };
 
-        let relative_path = local_path.trim_start_matches('/');
-        let file_path = self.root_dir.as_path().join(relative_path);
+        let file_path = self.root_dir.join_contained(local_path)?;
         if let Some(parent) = file_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -355,8 +353,7 @@ impl ApplyWorker {
     async fn apply_to_filesystem(&self, change: &Change) -> Result<()> {
         let remote_path = change.path();
         let local_path = self.couchdb.get_local_path(remote_path);
-        let relative_path = local_path.trim_start_matches('/');
-        let file_path = self.root_dir.as_path().join(relative_path);
+        let file_path = self.root_dir.join_contained(&local_path)?;
 
         debug!("[DOWNLOAD] Remote is newer, downloading chunked file");
         debug!("[DOWNLOAD] {} -> {}", remote_path, local_path);
@@ -791,7 +788,7 @@ impl SyncEngine {
         let mut report = SyncReport::default();
 
         for local_path in local_deletes {
-            let file_path = self.root_dir.as_path().join(&local_path);
+            let file_path = self.root_dir.join_contained(&local_path)?;
             if file_path.exists() {
                 tokio::fs::remove_file(&file_path).await?;
                 report.deleted_local += 1;
@@ -980,7 +977,7 @@ impl SyncEngine {
             &triage_result.remote_deletes,
             &stored_states,
             &mut remote_to_apply,
-        );
+        )?;
 
         // ── Debug skipped items ───────────────────────────────────────────
         for decision in &triage_result.skipped {
@@ -1241,11 +1238,10 @@ impl SyncEngine {
         remote_deletes: &[Change],
         stored_states: &HashMap<String, FileState>,
         remote_to_apply: &mut Vec<Change>,
-    ) {
+    ) -> Result<()> {
         for rc in remote_deletes {
             let local_path = self.couchdb.get_local_path(rc.path());
-            let relative_path = local_path.trim_start_matches('/');
-            let file_path = self.root_dir.as_path().join(relative_path);
+            let file_path = self.root_dir.join_contained(&local_path)?;
             let stored_state = stored_states.get(&local_path);
             let local_mtime = file_path
                 .metadata()
@@ -1261,6 +1257,7 @@ impl SyncEngine {
                 debug!("  Remote deleted, no local file/state, skipping");
             }
         }
+        Ok(())
     }
 
     /// Get local file state    /// Get local file state
@@ -3210,7 +3207,9 @@ mod tests {
             Some(Utc::now() + Duration::hours(1)),
         );
         let mut to_apply = Vec::new();
-        engine.handle_remote_deletes(&[fresh_delete], &stored_states, &mut to_apply);
+        engine
+            .handle_remote_deletes(&[fresh_delete], &stored_states, &mut to_apply)
+            .unwrap();
 
         assert_eq!(to_apply.len(), 1, "newer remote delete is scheduled");
         assert_eq!(to_apply[0].path(), "test-prefix/fresh.txt");
@@ -3220,7 +3219,9 @@ mod tests {
             Some(Utc::now() - Duration::days(2)),
         );
         let mut to_apply = Vec::new();
-        engine.handle_remote_deletes(&[stale_delete], &stored_states, &mut to_apply);
+        engine
+            .handle_remote_deletes(&[stale_delete], &stored_states, &mut to_apply)
+            .unwrap();
 
         assert!(to_apply.is_empty(), "stale remote delete is skipped");
     }
