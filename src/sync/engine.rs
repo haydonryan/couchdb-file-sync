@@ -844,6 +844,15 @@ impl SyncEngine {
         }
     }
 
+    /// Replace the engine's ignore policy (both the scanner and the incoming
+    /// remote-path guard). Used by the live sync loop to apply a policy that
+    /// the watcher reloaded after an ignore-file change, so the next scan
+    /// re-evaluates the tree under the new rules.
+    pub fn reload_ignore(&mut self, ignore_matcher: IgnoreMatcher) {
+        self.scanner = Scanner::new(self.root_dir.clone(), ignore_matcher.clone());
+        self.ignore_matcher = ignore_matcher;
+    }
+
     /// Enable pruning of soft-delete tombstones older than `retention` on each
     /// non-dry-run sync cycle. Pass `None` (or omit) to disable pruning.
     #[must_use]
@@ -2596,6 +2605,31 @@ mod tests {
             !engine
                 .ignore_matcher()
                 .should_ignore(std::path::Path::new("src/main.rs"))
+        );
+    }
+
+    #[test]
+    fn engine_reload_ignore_replaces_policy_and_scanner() {
+        // reload_ignore must update both the engine's incoming-path guard and
+        // the scanner used for local scans, so a live reload re-evaluates the
+        // tree under the new rules.
+        let couch = test_couchdb();
+        let local = test_local_db();
+        let root = test_root("/tmp/test-engine-reload-ignore");
+        let mut engine = SyncEngine::new(couch, local, root);
+
+        assert!(
+            !engine
+                .ignore_matcher()
+                .should_ignore(std::path::Path::new("debug.log"))
+        );
+
+        engine.reload_ignore(IgnoreMatcher::from_content("*.log"));
+
+        assert!(
+            engine
+                .ignore_matcher()
+                .should_ignore(std::path::Path::new("debug.log"))
         );
     }
 

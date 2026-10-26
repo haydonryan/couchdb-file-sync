@@ -1,4 +1,6 @@
+use crate::config::IgnoreConfig;
 use globset::{Glob, GlobMatcher};
+use std::collections::HashSet;
 use std::path::Path;
 use tracing::{debug, warn};
 
@@ -32,18 +34,90 @@ impl IgnoreMatcher {
         }
     }
 
-    /// Load patterns from a .sync-ignore file
+    /// Parse patterns from string content, tolerating malformed lines by
+    /// warning and skipping them (used by internal/legacy callers).
+    #[must_use]
+    pub fn from_content(content: &str) -> Self {
+        Self {
+            patterns: Self::parse_patterns(content, false).unwrap_or_default(),
+        }
+    }
+
+    /// Append patterns parsed strictly from `content` to this matcher.
     ///
     /// # Errors
     ///
-    /// Returns an error if the ignore file cannot be read.
-    pub fn from_file(path: &Path) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        Ok(Self::from_content(&content))
+    /// Returns an error on the first malformed pattern; the matcher is left
+    /// unchanged on failure.
+    pub fn extend_from_content_result(&mut self, content: &str) -> anyhow::Result<()> {
+        let entries = Self::parse_patterns(content, true)?;
+        self.patterns.extend(entries);
+        Ok(())
     }
 
-    /// Parse patterns from string content
-    pub fn from_content(content: &str) -> Self {
+    /// Append patterns parsed strictly from the file at `path` to this matcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or contains a malformed
+    /// pattern (fail closed).
+    pub fn extend_from_file(&mut self, path: &Path) -> anyhow::Result<()> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("failed to read ignore file {}: {}", path.display(), e))?;
+        self.extend_from_content_result(&content)
+    }
+
+    /// Build the effective ignore policy from every configured source.
+    ///
+    /// Sources are applied in precedence order, and because later patterns
+    /// override earlier ones (a negation can re-include a path ignored by an
+    /// earlier pattern), later sources take precedence:
+    ///
+    /// 1. `config.patterns` — inline YAML patterns.
+    /// 2. Each file in `config.ignore_files`, in listed order.
+    /// 3. `.sync-ignore` — always applied last (highest precedence), unless it
+    ///    was already listed in `ignore_files`.
+    ///
+    /// This fails closed: a malformed pattern in any source, or an explicitly
+    /// configured `ignore_files` entry that is missing or unreadable, aborts
+    /// the build with an error so the operator's exclusion policy can never
+    /// silently degrade to "ignore nothing". The default `.sync-ignore` file is
+    /// optional — if absent it is skipped — but any explicitly configured
+    /// `ignore_files` entry must exist and be readable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a configured pattern is malformed or a configured
+    /// ignore file is missing, unreadable, or malformed.
+    pub fn from_config(root: &Path, config: &IgnoreConfig) -> anyhow::Result<Self> {
+        let mut matcher = Self {
+            patterns: Self::parse_patterns(&config.patterns.join("\n"), true)?,
+        };
+
+        let mut seen = HashSet::new();
+        for file in &config.ignore_files {
+            matcher.extend_from_file(&root.join(file))?;
+            seen.insert(file.as_str());
+        }
+
+        // `.sync-ignore` is always the final, highest-precedence source. Skip
+        // re-processing it if the operator already listed it in `ignore_files`.
+        if !seen.contains(".sync-ignore") {
+            let sync_ignore = root.join(".sync-ignore");
+            if sync_ignore.exists() {
+                matcher.extend_from_file(&sync_ignore)?;
+            }
+        }
+
+        Ok(matcher)
+    }
+
+    /// Parse gitignore-style pattern lines into compiled entries.
+    ///
+    /// When `strict` is false a malformed line is warned and skipped (legacy
+    /// behavior); when `strict` is true the first malformed line aborts the
+    /// parse with an error so operator-configured rules fail closed.
+    fn parse_patterns(content: &str, strict: bool) -> anyhow::Result<Vec<IgnoreEntry>> {
         let mut patterns = Vec::new();
 
         for line in content.lines() {
@@ -67,6 +141,11 @@ impl IgnoreMatcher {
             let glob = match Self::pattern_to_glob(pattern_str) {
                 Ok(glob) => glob,
                 Err(e) => {
+                    if strict {
+                        return Err(anyhow::anyhow!(
+                            "invalid ignore pattern '{pattern_str}': {e}"
+                        ));
+                    }
                     warn!("Invalid ignore pattern '{}': {}", pattern_str, e);
                     continue;
                 }
@@ -79,7 +158,7 @@ impl IgnoreMatcher {
             debug!("Added ignore pattern: {} (negation: {})", line, is_negation);
         }
 
-        Self { patterns }
+        Ok(patterns)
     }
 
     /// Convert a gitignore-style pattern to a glob pattern

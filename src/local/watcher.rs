@@ -5,10 +5,10 @@ use notify_debouncer_full::{
     notify::{EventKind, RecommendedWatcher, RecursiveMode},
 };
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// File system watcher with debouncing
 pub struct FileWatcher {
@@ -117,20 +117,33 @@ impl EventSender {
 }
 
 impl FileWatcher {
-    /// Create a new file watcher
+    /// Create a new file watcher.
+    ///
+    /// `shared_policy` is the live, reloadable ignore policy shared with the
+    /// sync engine. `ignore_files` lists the root-relative paths (e.g.
+    /// `.sync-ignore`) whose edits should trigger a live policy reload. When
+    /// such a file changes, `reload` is invoked to rebuild the policy, the
+    /// result is written back into `shared_policy`, and a reconciliation
+    /// notice is signalled on `overflow_tx` so the live loop rescans with the
+    /// new rules. A reload failure keeps the previous (last-good) policy and
+    /// logs an error rather than silently exposing files.
     ///
     /// # Errors
     ///
     /// Returns an error if the underlying notify debouncer cannot be created.
     pub fn new(
         root_dir: SyncDirPath,
-        ignore_matcher: IgnoreMatcher,
+        shared_policy: Arc<RwLock<IgnoreMatcher>>,
+        ignore_files: Vec<PathBuf>,
+        reload: Arc<dyn Fn() -> anyhow::Result<IgnoreMatcher> + Send + Sync>,
         debounce_ms: u64,
         overflow_tx: mpsc::Sender<()>,
     ) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::channel(100);
-        let ignore_matcher = Arc::new(ignore_matcher);
-        let closure_matcher = ignore_matcher;
+        let closure_policy = shared_policy;
+        // Clone the overflow channel so the reload path can signal a
+        // reconciliation rescan independently of the drop-warning sender.
+        let reload_signal = overflow_tx.clone();
         let root = root_dir.clone();
         let sender = EventSender::new(event_tx, overflow_tx, DROP_WARN_INTERVAL);
         let mut debouncer = new_debouncer(
@@ -139,7 +152,35 @@ impl FileWatcher {
             move |result: DebounceEventResult| match result {
                 Ok(events) => {
                     for event in events {
-                        process_event(&event, &sender, &closure_matcher, &root);
+                        // An edit to a configured ignore file must reload the
+                        // live policy and reconcile, not be synced as content.
+                        if is_ignore_file_event(&event, &ignore_files, &root) {
+                            match reload() {
+                                Ok(new_policy) => {
+                                    let Ok(mut guard) = closure_policy.write() else {
+                                        error!(
+                                            "Ignore policy lock poisoned; keeping previous policy"
+                                        );
+                                        continue;
+                                    };
+                                    *guard = new_policy;
+                                    info!("Reloaded ignore policy after ignore-file change");
+                                    let _ = reload_signal.try_send(());
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Ignore-file change failed to reload policy (keeping previous policy): {}",
+                                        e
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+                        let Ok(current) = closure_policy.read() else {
+                            error!("Ignore policy lock poisoned; skipping event");
+                            continue;
+                        };
+                        process_event(&event, &sender, &current, &root);
                     }
                 }
                 Err(errors) => {
@@ -214,6 +255,18 @@ impl FileWatcher {
             .ok()
             .map(std::path::Path::to_path_buf)
     }
+}
+
+/// Returns true when any of `event`'s paths is one of the configured ignore
+/// files (root-relative), meaning the edit should reload the live policy
+/// rather than be treated as syncable content.
+fn is_ignore_file_event(event: &DebouncedEvent, ignore_files: &[PathBuf], root: &Path) -> bool {
+    ignore_files.iter().any(|ignore_file| {
+        event
+            .paths
+            .iter()
+            .any(|path| path.strip_prefix(root).ok() == Some(ignore_file.as_path()))
+    })
 }
 
 /// Process a debounced event and send to channel
@@ -325,11 +378,20 @@ impl AsyncFileWatcher {
     /// Returns an error if the underlying [`FileWatcher`] cannot be created.
     pub fn start(
         root_dir: SyncDirPath,
-        ignore_matcher: IgnoreMatcher,
+        shared_policy: Arc<RwLock<IgnoreMatcher>>,
+        ignore_files: Vec<PathBuf>,
+        reload: Arc<dyn Fn() -> anyhow::Result<IgnoreMatcher> + Send + Sync>,
         debounce_ms: u64,
         overflow_tx: mpsc::Sender<()>,
     ) -> Result<Self> {
-        let inner = FileWatcher::new(root_dir, ignore_matcher, debounce_ms, overflow_tx)?;
+        let inner = FileWatcher::new(
+            root_dir,
+            shared_policy,
+            ignore_files,
+            reload,
+            debounce_ms,
+            overflow_tx,
+        )?;
         Ok(Self { inner })
     }
 
@@ -881,9 +943,14 @@ mod tests {
         // the debouncer, this assertion would fail at runtime.
         let tmp = tempfile::tempdir().expect("temporary dir");
         let (_overflow_tx, _overflow_rx) = tokio::sync::mpsc::channel(1);
+        let policy = Arc::new(RwLock::new(IgnoreMatcher::empty()));
+        let reload: Arc<dyn Fn() -> anyhow::Result<IgnoreMatcher> + Send + Sync> =
+            Arc::new(|| Ok(IgnoreMatcher::empty()));
         let watcher = FileWatcher::new(
             SyncDirPath::new(tmp.path()).expect("valid test root"),
-            IgnoreMatcher::empty(),
+            policy,
+            Vec::new(),
+            reload,
             100,
             _overflow_tx,
         )
@@ -893,6 +960,44 @@ mod tests {
             watcher._debouncer.is_some(),
             "FileWatcher must hold the notify debouncer so it is cleaned up on Drop"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Ignore-file change detection (live policy reload, story #6359)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_is_ignore_file_event_detects_configured_ignore_files() {
+        let root = Path::new("/root");
+        let event = debounced_event(
+            EventKind::Modify(ModifyKind::Any),
+            vec![PathBuf::from("/root/.sync-ignore")],
+        );
+        let ignore_files = vec![PathBuf::from(".sync-ignore")];
+        assert!(is_ignore_file_event(&event, &ignore_files, root));
+    }
+
+    #[test]
+    fn test_is_ignore_file_event_ignores_regular_files() {
+        let root = Path::new("/root");
+        let event = debounced_event(
+            EventKind::Modify(ModifyKind::Any),
+            vec![PathBuf::from("/root/notes.md")],
+        );
+        let ignore_files = vec![PathBuf::from(".sync-ignore")];
+        assert!(!is_ignore_file_event(&event, &ignore_files, root));
+    }
+
+    #[test]
+    fn test_is_ignore_file_event_nested_ignore_file() {
+        // A nested ignore file (e.g. config/.gitignore) is detected as long as
+        // it is listed as a configured ignore file.
+        let root = Path::new("/root");
+        let event = debounced_event(
+            EventKind::Create(CreateKind::Any),
+            vec![PathBuf::from("/root/sub/.gitignore")],
+        );
+        let ignore_files = vec![PathBuf::from("sub/.gitignore")];
+        assert!(is_ignore_file_event(&event, &ignore_files, root));
     }
 
     // -----------------------------------------------------------------------

@@ -1,4 +1,4 @@
-use crate::config::{AppConfig, SyncPath, default_user_config_file};
+use crate::config::{AppConfig, IgnoreConfig, SyncPath, default_user_config_file};
 use crate::couchdb::{ChangeFeedEntry, ChangesFeed, CouchDb};
 use crate::local::{AsyncFileWatcher, LocalDb, SyncIdentityCheck, compute_file_hash};
 use crate::matrix::MatrixNotifier;
@@ -21,7 +21,7 @@ use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -525,7 +525,7 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
     info!("Running sync in: {}", path.display());
 
     // Load ignore patterns
-    let ignore_matcher = load_ignore_patterns(&path);
+    let ignore_matcher = load_ignore_patterns(&path, &config)?;
 
     // Open local database
     let db_path = state_db_path(&path);
@@ -603,7 +603,7 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
 pub async fn rebuild_remote(path: PathBuf, config: AppConfig) -> Result<SyncReport> {
     info!("Rebuilding remote from local in: {}", path.display());
 
-    let ignore_matcher = load_ignore_patterns(&path);
+    let ignore_matcher = load_ignore_patterns(&path, &config)?;
     let db_path = state_db_path(&path);
     let local_db = LocalDb::open(&db_path)?;
     let couchdb = CouchDb::new(
@@ -646,7 +646,7 @@ pub async fn rebuild_remote(path: PathBuf, config: AppConfig) -> Result<SyncRepo
 pub async fn rebuild_local(path: PathBuf, config: AppConfig) -> Result<SyncReport> {
     info!("Rebuilding local from remote in: {}", path.display());
 
-    let ignore_matcher = load_ignore_patterns(&path);
+    let ignore_matcher = load_ignore_patterns(&path, &config)?;
     let db_path = state_db_path(&path);
     let local_db = LocalDb::open(&db_path)?;
     let couchdb = CouchDb::new(
@@ -1129,7 +1129,7 @@ async fn daemon_sync(
     info!("Running sync in: {}", path.display());
 
     // Load ignore patterns
-    let ignore_matcher = load_ignore_patterns(path);
+    let ignore_matcher = load_ignore_patterns(path, config)?;
 
     // Open local database
     let db_path = state_db_path(path);
@@ -1494,11 +1494,23 @@ async fn attempt_live_reconciliation(
     reconcile: Option<&mut Reconcile>,
     config: &AppConfig,
     path: &Path,
+    ignore_policy: &Arc<RwLock<IgnoreMatcher>>,
 ) {
     let Some(r) = reconcile else { return };
     if !(r.pending() && r.due()) {
         return;
     }
+    // Refresh the engine from the shared policy so a live ignore-file change
+    // (reloaded by the watcher into `ignore_policy`) is applied before this
+    // reconciliation rescan re-evaluates the tree with the new rules. Clone
+    // the matcher out of the lock so no read guard is held across the await.
+    let current_policy = if let Ok(guard) = ignore_policy.read() {
+        guard.clone()
+    } else {
+        warn!("Ignore policy lock poisoned; skipping reconciliation");
+        return;
+    };
+    engine.reload_ignore(current_policy);
     match engine.sync().await {
         Ok(report) => {
             if !report.errors.is_empty() {
@@ -1607,7 +1619,7 @@ where
 async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
     info!("Starting live sync in: {}", path.display());
 
-    let (ignore_matcher, mut engine) = build_live_sync_engine(&path, &config).await?;
+    let (ignore_policy, mut engine) = build_live_sync_engine(&path, &config).await?;
 
     // Watcher coverage BEFORE bootstrap: start the local watcher first so any
     // edit made during the bootstrap sync (the bootstrap-to-watch transition)
@@ -1618,7 +1630,7 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
     let local_handle = spawn_local_watcher_source(
         config.clone(),
         &resolve_sync_dir(&path)?,
-        ignore_matcher.clone(),
+        ignore_policy.clone(),
         local_tx,
         overflow_tx,
     );
@@ -1649,7 +1661,7 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
         &mut engine,
         &config,
         &path,
-        &ignore_matcher,
+        &ignore_policy,
         local_rx,
         remote_rx,
         ack_tx,
@@ -1676,7 +1688,7 @@ async fn run_live_loop(
     engine: &mut SyncEngine,
     config: &AppConfig,
     path: &Path,
-    ignore_matcher: &IgnoreMatcher,
+    ignore_policy: &Arc<RwLock<IgnoreMatcher>>,
     mut local_rx: mpsc::Receiver<Change>,
     mut remote_rx: mpsc::Receiver<ChangeFeedEntry>,
     ack_tx: mpsc::Sender<String>,
@@ -1704,7 +1716,7 @@ async fn run_live_loop(
     // transition converges immediately rather than waiting for the next event.
     if let Some(r) = reconcile.as_mut() {
         r.mark_full_rescan();
-        attempt_live_reconciliation(engine, Some(r), config, path).await;
+        attempt_live_reconciliation(engine, Some(r), config, path, ignore_policy).await;
     } else {
         let _ = engine.sync().await;
     }
@@ -1738,10 +1750,16 @@ async fn run_live_loop(
                         path.display()
                     ));
                 };
+                // Clone the matcher out of the lock so the read guard is not
+                // held across the await (RwLockReadGuard is not Send).
+                let current_policy = ignore_policy
+                    .read()
+                    .map_err(|_| anyhow::anyhow!("ignore policy lock poisoned"))?
+                    .clone();
                 if apply_live_remote_entry(
                     engine,
                     &mut touched,
-                    ignore_matcher,
+                    &current_policy,
                     entry,
                     &mut remote_cursor,
                     &ack_tx,
@@ -1784,7 +1802,7 @@ async fn run_live_loop(
 
         // Attempt a bounded reconciliation whenever work is pending and the
         // cooldown has elapsed (runs after any event, and on each timer tick).
-        attempt_live_reconciliation(engine, reconcile.as_mut(), config, path).await;
+        attempt_live_reconciliation(engine, reconcile.as_mut(), config, path, ignore_policy).await;
     }
 }
 
@@ -1797,8 +1815,11 @@ fn size_limit(config: &AppConfig) -> Option<u64> {
 async fn build_live_sync_engine(
     path: &Path,
     config: &AppConfig,
-) -> Result<(Arc<IgnoreMatcher>, SyncEngine)> {
-    let ignore_matcher = Arc::new(load_ignore_patterns(path));
+) -> Result<(Arc<RwLock<IgnoreMatcher>>, SyncEngine)> {
+    // The live policy is shared and reloadable: the watcher rebuilds it when an
+    // ignore file changes and the reconciliation loop refreshes the engine from
+    // it before each rescan.
+    let ignore_policy = Arc::new(RwLock::new(load_ignore_patterns(path, config)?));
 
     let db_path = state_db_path(path);
     let local_db = LocalDb::open(&db_path)?;
@@ -1825,7 +1846,11 @@ async fn build_live_sync_engine(
     .await?;
     validate_sync_mapping(&local_db, &identity)?;
 
-    let engine = SyncEngine::with_ignore(couchdb, local_db, sync_dir, (*ignore_matcher).clone())
+    let initial_policy = ignore_policy
+        .read()
+        .map_err(|_| anyhow::anyhow!("ignore policy lock poisoned"))?
+        .clone();
+    let engine = SyncEngine::with_ignore(couchdb, local_db, sync_dir, initial_policy)
         .with_tombstone_retention(
             (config.sync.tombstone_retention_secs > 0)
                 .then(|| std::time::Duration::from_secs(config.sync.tombstone_retention_secs)),
@@ -1837,7 +1862,7 @@ async fn build_live_sync_engine(
         )
         .with_max_file_size(size_limit(config));
 
-    Ok((ignore_matcher, engine))
+    Ok((ignore_policy, engine))
 }
 
 async fn bootstrap_live_sync(engine: &mut SyncEngine) -> Result<String> {
@@ -1913,18 +1938,27 @@ impl Drop for LiveProducerGuard {
 fn spawn_local_watcher_source(
     config: AppConfig,
     root: &SyncDirPath,
-    ignore_matcher: Arc<IgnoreMatcher>,
+    ignore_policy: Arc<RwLock<IgnoreMatcher>>,
     local_tx: mpsc::Sender<Change>,
     overflow_tx: mpsc::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
     let watcher_root = root.clone();
-    let watcher_ignore = ignore_matcher;
+    let watcher_policy = ignore_policy;
     let debounce_ms = config.sync.debounce_ms;
     let watcher_config = config;
+    // On an ignore-file edit the watcher rebuilds the full policy from the
+    // config + root so live rule changes take effect and trigger a rescan.
+    let reload_root = watcher_root.clone();
+    let reload_config = watcher_config.clone();
+    let reload: Arc<dyn Fn() -> anyhow::Result<IgnoreMatcher> + Send + Sync> =
+        Arc::new(move || load_ignore_patterns(reload_root.as_path(), &reload_config));
+    let ignore_files = policy_ignore_files(&watcher_config.ignore);
     tokio::spawn(async move {
         if let Err(e) = run_local_watcher(
             watcher_root.clone(),
-            watcher_ignore,
+            watcher_policy,
+            ignore_files,
+            reload,
             debounce_ms,
             local_tx,
             overflow_tx,
@@ -1985,14 +2019,18 @@ fn spawn_remote_changes_source(
 
 async fn run_local_watcher(
     root: SyncDirPath,
-    ignore_matcher: Arc<IgnoreMatcher>,
+    ignore_policy: Arc<RwLock<IgnoreMatcher>>,
+    ignore_files: Vec<PathBuf>,
+    reload: Arc<dyn Fn() -> anyhow::Result<IgnoreMatcher> + Send + Sync>,
     debounce_ms: u64,
     tx: mpsc::Sender<Change>,
     overflow_tx: mpsc::Sender<()>,
 ) -> Result<()> {
     let mut watcher = AsyncFileWatcher::start(
         root.clone(),
-        (*ignore_matcher).clone(),
+        ignore_policy,
+        ignore_files,
+        reload,
         debounce_ms,
         overflow_tx,
     )?;
@@ -2597,23 +2635,34 @@ pub fn status(path: &Path, json: bool, _config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-/// Helper to load ignore patterns
-fn load_ignore_patterns(root: &Path) -> IgnoreMatcher {
-    let sync_ignore = root.join(".sync-ignore");
-    if sync_ignore.exists() {
-        match IgnoreMatcher::from_file(&sync_ignore) {
-            Ok(matcher) => {
-                info!("Loaded ignore patterns from .sync-ignore");
-                matcher
-            }
-            Err(e) => {
-                error!("Failed to load .sync-ignore: {}", e);
-                IgnoreMatcher::empty()
-            }
-        }
-    } else {
-        IgnoreMatcher::empty()
+/// Helper to load the effective ignore policy from all configured sources.
+///
+/// Composes the YAML `ignore.patterns`, each `ignore.ignore_files` entry, and
+/// the default `.sync-ignore` file with documented precedence (see
+/// [`IgnoreMatcher::from_config`]). Fails closed: an unreadable/malformed
+/// explicitly-configured rule aborts the load so mutation planning never runs
+/// with a silently-degraded exclusion policy.
+///
+/// # Errors
+///
+/// Returns an error if a configured pattern is malformed or a configured
+/// ignore file is missing, unreadable, or malformed.
+fn load_ignore_patterns(root: &Path, config: &AppConfig) -> anyhow::Result<IgnoreMatcher> {
+    let matcher = IgnoreMatcher::from_config(root, &config.ignore)?;
+    info!("Loaded ignore policy from config and ignore files");
+    Ok(matcher)
+}
+
+/// The root-relative ignore files that participate in the effective policy.
+/// Used by the live watcher to detect edits that should trigger a policy
+/// reload. Always includes `.sync-ignore` (the default, highest-precedence
+/// source) alongside any explicitly configured `ignore_files` entries.
+fn policy_ignore_files(config: &IgnoreConfig) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = config.ignore_files.iter().map(PathBuf::from).collect();
+    if !config.ignore_files.iter().any(|f| f == ".sync-ignore") {
+        files.push(PathBuf::from(".sync-ignore"));
     }
+    files
 }
 
 fn state_dir(root: &Path) -> PathBuf {
@@ -2963,11 +3012,15 @@ mod tests {
 
     // ── load_ignore_patterns ──────────────────────────────────────────────
 
+    fn default_config() -> AppConfig {
+        AppConfig::default()
+    }
+
     #[test]
     fn test_load_ignore_patterns_no_file() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let matcher = load_ignore_patterns(root);
+        let matcher = load_ignore_patterns(root, &default_config()).unwrap();
         assert!(matcher.is_empty());
     }
 
@@ -2976,7 +3029,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join(".sync-ignore"), "*.log\n*.tmp\nbuild/\n").unwrap();
-        let matcher = load_ignore_patterns(root);
+        let matcher = load_ignore_patterns(root, &default_config()).unwrap();
         assert!(!matcher.is_empty());
         assert!(matcher.is_ignored("debug.log", false));
         assert!(matcher.is_ignored("file.tmp", false));
@@ -2988,7 +3041,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join(".sync-ignore"), "").unwrap();
-        let matcher = load_ignore_patterns(root);
+        let matcher = load_ignore_patterns(root, &default_config()).unwrap();
         assert!(matcher.is_empty());
     }
 
@@ -3001,8 +3054,98 @@ mod tests {
             "# This is a comment\n# Another comment\n",
         )
         .unwrap();
-        let matcher = load_ignore_patterns(root);
+        let matcher = load_ignore_patterns(root, &default_config()).unwrap();
         assert!(matcher.is_empty());
+    }
+
+    #[test]
+    fn test_load_ignore_patterns_yaml_patterns_applied() {
+        // YAML ignore.patterns are loaded even without a .sync-ignore file.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut config = default_config();
+        config.ignore.patterns = vec!["*.log".into(), "secret/".into()];
+        let matcher = load_ignore_patterns(root, &config).unwrap();
+        assert!(matcher.is_ignored("debug.log", false));
+        assert!(matcher.is_ignored("secret/creds.txt", false));
+        assert!(!matcher.is_ignored("main.rs", false));
+    }
+
+    #[test]
+    fn test_load_ignore_patterns_extra_ignore_file_loaded() {
+        // An explicitly configured ignore_files entry is read and applied.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("custom.ignore"), "*.tmp\n").unwrap();
+        let mut config = default_config();
+        config.ignore.ignore_files = vec!["custom.ignore".into()];
+        let matcher = load_ignore_patterns(root, &config).unwrap();
+        assert!(matcher.is_ignored("file.tmp", false));
+        assert!(!matcher.is_ignored("file.log", false));
+    }
+
+    #[test]
+    fn test_load_ignore_patterns_precedence_sync_ignore_overrides_yaml() {
+        // .sync-ignore (highest precedence, applied last) can re-include a
+        // path ignored by the YAML patterns.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".sync-ignore"), "!important.log\n").unwrap();
+        let mut config = default_config();
+        config.ignore.patterns = vec!["*.log".into()];
+        let matcher = load_ignore_patterns(root, &config).unwrap();
+        assert!(matcher.is_ignored("debug.log", false));
+        assert!(!matcher.is_ignored("important.log", false));
+    }
+
+    #[test]
+    fn test_load_ignore_patterns_fails_closed_on_invalid_yaml_pattern() {
+        // A malformed YAML pattern aborts the load instead of being skipped.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut config = default_config();
+        config.ignore.patterns = vec!["[invalid".into()];
+        assert!(load_ignore_patterns(root, &config).is_err());
+    }
+
+    #[test]
+    fn test_load_ignore_patterns_fails_closed_on_unreadable_ignore_file() {
+        // A configured ignore_files entry that is missing aborts the load
+        // (fail closed) rather than silently degrading to ignore-nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut config = default_config();
+        config.ignore.ignore_files = vec!["missing.ignore".into()];
+        assert!(load_ignore_patterns(root, &config).is_err());
+    }
+
+    #[test]
+    fn test_load_ignore_patterns_fails_closed_on_malformed_ignore_file() {
+        // A malformed pattern inside a configured ignore file aborts the load.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("custom.ignore"), "*.tmp\n[bad\n").unwrap();
+        let mut config = default_config();
+        config.ignore.ignore_files = vec!["custom.ignore".into()];
+        assert!(load_ignore_patterns(root, &config).is_err());
+    }
+
+    #[test]
+    fn test_load_ignore_patterns_absent_sync_ignore_is_optional() {
+        // The default .sync-ignore is optional: a missing one is fine, unlike
+        // an explicitly configured ignore_files entry.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(load_ignore_patterns(root, &default_config()).is_ok());
+    }
+
+    #[test]
+    fn test_policy_ignore_files_includes_sync_ignore() {
+        let mut config = default_config();
+        config.ignore.ignore_files = vec!["a.ignore".into()];
+        let files = policy_ignore_files(&config.ignore);
+        assert!(files.contains(&PathBuf::from("a.ignore")));
+        assert!(files.contains(&PathBuf::from(".sync-ignore")));
     }
 
     // ── TouchTracker (content-identity echo suppression) ──────────────────
@@ -3617,7 +3760,7 @@ mod tests {
                 &mut engine,
                 &config,
                 dir.path(),
-                &IgnoreMatcher::empty(),
+                &Arc::new(RwLock::new(IgnoreMatcher::empty())),
                 local_rx,
                 remote_rx,
                 ack_tx,
@@ -3665,7 +3808,7 @@ mod tests {
                 &mut engine,
                 &config,
                 dir.path(),
-                &IgnoreMatcher::empty(),
+                &Arc::new(RwLock::new(IgnoreMatcher::empty())),
                 local_rx,
                 remote_rx,
                 ack_tx,
