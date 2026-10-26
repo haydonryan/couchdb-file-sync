@@ -8,7 +8,7 @@ use crate::sync::triage;
 use anyhow::Result;
 use chrono::{TimeZone, Utc};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, warn};
@@ -44,6 +44,12 @@ pub struct SyncEngine {
     /// allocation/transfer, reported in the sync report, and never recorded as
     /// synced state (so a skipped file never becomes a deletion candidate).
     max_file_size: Option<u64>,
+    /// Root-relative destination directory for keep-both preservation copies.
+    /// When set, `write_keep_both_preservation` stores the remote version under
+    /// `<root>/<conflict_dir>/<relative-dir>/<name>.remote` instead of a
+    /// dot-prefixed copy next to the original file. The directory is excluded
+    /// from sync so preserved copies can never reenter a cycle accidentally.
+    conflict_dir: Option<PathBuf>,
 }
 
 /// Report from a sync operation
@@ -833,6 +839,7 @@ impl SyncEngine {
             orphan_chunk_grace: None,
             orphan_chunk_batch: 0,
             max_file_size: None,
+            conflict_dir: None,
         }
     }
 
@@ -854,7 +861,19 @@ impl SyncEngine {
             orphan_chunk_grace: None,
             orphan_chunk_batch: 0,
             max_file_size: None,
+            conflict_dir: None,
         }
+    }
+
+    /// Set the root-relative destination directory for keep-both preservation
+    /// copies. When set, `write_keep_both_preservation` stores the remote
+    /// version under `<root>/<conflict_dir>`; when `None`, it keeps the legacy
+    /// dot-prefixed copy next to the original file. The directory is expected
+    /// to be excluded from sync by the caller's ignore policy.
+    #[must_use]
+    pub fn with_conflict_dir(mut self, conflict_dir: Option<PathBuf>) -> Self {
+        self.conflict_dir = conflict_dir;
+        self
     }
 
     /// Replace the engine's ignore policy (both the scanner and the incoming
@@ -2337,11 +2356,14 @@ impl SyncEngine {
     }
 
     /// Write the remote version's content to a unique, deliberately local-only
-    /// preservation copy. The destination is dot-prefixed so the default ignore
-    /// matcher excludes it from scanning/upload; a free numeric suffix keeps it
-    /// collision-safe so an existing backup always survives. No file state is
-    /// recorded, so it is never queued for any remote path. Returns the
-    /// relative local path written.
+    /// preservation copy. By default the destination is dot-prefixed so the
+    /// default ignore matcher excludes it from scanning/upload; when a
+    /// `conflict_dir` is configured the copy is written under
+    /// `<root>/<conflict_dir>/<relative-dir>/<name>.remote` instead (that
+    /// directory is excluded from sync by the caller's ignore policy). A free
+    /// numeric suffix keeps it collision-safe so an existing backup always
+    /// survives. No file state is recorded, so it is never queued for any
+    /// remote path. Returns the relative local path written.
     async fn write_keep_both_preservation(
         &self,
         local_path: &str,
@@ -2353,19 +2375,33 @@ impl SyncEngine {
             Some((d, n)) => (d, n),
             None => ("", local_path),
         };
-        let first = if dir.is_empty() {
-            format!(".{name}.remote")
-        } else {
-            format!("{dir}/.{name}.remote")
+        // Resolve the preservation path. With a configured `conflict_dir` the
+        // copy lives under `<conflict_dir>/<dir>/<name>.remote`, mirroring the
+        // original's subdirectory so same-named files in different folders
+        // never collide. Without one it keeps the legacy dot-prefixed copy
+        // next to the original file.
+        let base = format!("{name}.remote");
+        let candidate_at = |suffix: u64| -> String {
+            let suffixed = if suffix == 0 {
+                base.clone()
+            } else {
+                format!("{base}.{suffix}")
+            };
+            match &self.conflict_dir {
+                Some(conflict_dir) if dir.is_empty() => {
+                    format!("{}/{}", conflict_dir.display(), suffixed)
+                }
+                Some(conflict_dir) => {
+                    format!("{}/{dir}/{suffixed}", conflict_dir.display())
+                }
+                None if dir.is_empty() => format!(".{suffixed}"),
+                None => format!("{dir}/.{suffixed}"),
+            }
         };
-        let mut candidate = first.clone();
+        let mut candidate = candidate_at(0);
         let mut n = 1u64;
         while self.root_dir.join_contained(&candidate)?.exists() {
-            candidate = if dir.is_empty() {
-                format!(".{name}.remote.{n}")
-            } else {
-                format!("{dir}/.{name}.remote.{n}")
-            };
+            candidate = candidate_at(n);
             n += 1;
         }
 
@@ -6383,6 +6419,87 @@ mod tests {
         assert_eq!(report.uploaded.0, 0, "kept local must not re-upload");
         assert_eq!(report.downloaded.0, 0);
         assert_eq!(report.conflicts, 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_conflict_keep_both_writes_to_configured_conflict_dir() {
+        // When `conflict_dir` is configured, keep-both must write the remote
+        // preservation copy under `<root>/<conflict_dir>/<relative-dir>/` rather
+        // than next to the original file, keeping the local file intact and the
+        // copy local-only.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let state_db = db_dir.path().join("state.db");
+
+        let local_path = "docs/conflict.txt";
+        let local_full = root.as_path().join(local_path);
+        std::fs::create_dir_all(local_full.parent().unwrap()).unwrap();
+        std::fs::write(&local_full, b"LOCAL-B").unwrap();
+
+        let local = LocalDb::open(&state_db).unwrap();
+        seed_file_state(&local, local_path, &compute_bytes_hash(b"REMOTE-A"), 8);
+        let remote_state = RemoteState {
+            hash: compute_bytes_hash(b"REMOTE-A"),
+            size: 8,
+            modified_at: Utc::now(),
+            couch_rev: CouchRev::new("2-bbb").unwrap(),
+            deleted: false,
+        };
+        let local_state = local.get_file_state(local_path).unwrap().unwrap();
+        local
+            .store_conflict(&Conflict::new(
+                local_path.to_string(),
+                local_state,
+                remote_state,
+            ))
+            .unwrap();
+
+        let remote_path = format!("test-prefix/{local_path}");
+        let mut engine = SyncEngine::new(
+            test_canned_couch(
+                "test-prefix/",
+                resolve_canned_couch(&remote_path, b"REMOTE-A", "2-bbb"),
+            ),
+            LocalDb::open(&state_db).unwrap(),
+            root.clone(),
+        )
+        .with_conflict_dir(Some(PathBuf::from(".conflicts")));
+        engine
+            .resolve_conflict(local_path, ResolutionStrategy::KeepBoth)
+            .await
+            .expect("keep-both should succeed");
+
+        // The copy lands under the configured conflict_dir, mirroring the
+        // original's subdirectory.
+        let preserved = root.as_path().join(".conflicts/docs/conflict.txt.remote");
+        assert_eq!(
+            std::fs::read_to_string(&preserved).unwrap(),
+            "REMOTE-A",
+            "remote version preserved under the configured conflict_dir"
+        );
+
+        // No sync state is recorded for the preservation copy, so it is never
+        // queued for a remote path.
+        assert!(
+            engine
+                .get_file_state(".conflicts/docs/conflict.txt.remote")
+                .await
+                .unwrap()
+                .is_none(),
+            "preservation copy under conflict_dir must not be tracked"
+        );
+
+        // The local version is kept.
+        assert_eq!(
+            std::fs::read_to_string(&local_full).unwrap(),
+            "LOCAL-B",
+            "local version is kept"
+        );
+        assert!(
+            engine.get_conflicts().await.unwrap().is_empty(),
+            "keep-both must remove the conflict record"
+        );
     }
 
     #[tokio::test]

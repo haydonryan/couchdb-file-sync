@@ -353,6 +353,28 @@ pub struct ConflictConfig {
     pub conflict_dir: Option<PathBuf>,
 }
 
+impl ConflictConfig {
+    /// Validate that the configured conflict policy is one the application
+    /// actually executes. `auto_resolve` is documented but automatic
+    /// resolution is never implemented; accepting it silently would imply
+    /// conflicts are resolved when they never are, so a config that enables it
+    /// fails closed before any sync runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `auto_resolve` is true.
+    pub fn validate_supported(&self) -> Result<()> {
+        if self.auto_resolve {
+            anyhow::bail!(
+                "conflicts.auto_resolve is not supported: automatic conflict resolution is not \
+                 implemented. Remove `auto_resolve: true`; conflicts are resolved interactively \
+                 via `couchdb-file-sync resolve`."
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Notification configuration
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct NotificationConfig {
@@ -696,6 +718,54 @@ mod tests {
         assert_eq!(conflict.default_strategy, ConflictStrategy::KeepBoth);
         assert!(!conflict.auto_resolve);
         assert!(conflict.conflict_dir.is_none());
+    }
+
+    #[test]
+    fn test_validate_supported_accepts_each_default_strategy() {
+        // Every supported strategy is accepted by the policy gate.
+        for strategy in [
+            ConflictStrategy::KeepLocal,
+            ConflictStrategy::KeepRemote,
+            ConflictStrategy::KeepBoth,
+            ConflictStrategy::Skip,
+        ] {
+            let config = ConflictConfig {
+                default_strategy: strategy,
+                auto_resolve: false,
+                conflict_dir: None,
+            };
+            assert!(
+                config.validate_supported().is_ok(),
+                "strategy {strategy:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_supported_rejects_auto_resolve() {
+        // auto_resolve is documented but never executed; it must fail closed
+        // rather than being silently accepted.
+        let config = ConflictConfig {
+            default_strategy: ConflictStrategy::KeepBoth,
+            auto_resolve: true,
+            conflict_dir: None,
+        };
+        let err = config.validate_supported().unwrap_err();
+        assert!(
+            err.to_string().contains("auto_resolve is not supported"),
+            "error should name the unsupported setting: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_supported_accepts_conflict_dir() {
+        // A configured preservation directory does not trigger the policy gate.
+        let config = ConflictConfig {
+            default_strategy: ConflictStrategy::KeepBoth,
+            auto_resolve: false,
+            conflict_dir: Some(PathBuf::from(".conflicts")),
+        };
+        assert!(config.validate_supported().is_ok());
     }
 
     #[test]

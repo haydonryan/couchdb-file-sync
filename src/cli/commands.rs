@@ -1,4 +1,6 @@
-use crate::config::{AppConfig, IgnoreConfig, SyncPath, default_user_config_file};
+use crate::config::{
+    AppConfig, ConflictStrategy, IgnoreConfig, SyncPath, default_user_config_file,
+};
 use crate::couchdb::{ChangeFeedEntry, ChangesFeed, CouchDb};
 use crate::local::{AsyncFileWatcher, LocalDb, SyncIdentityCheck, compute_file_hash};
 use crate::matrix::MatrixNotifier;
@@ -524,6 +526,10 @@ pub fn validate_unique_mappings(paths: &[SyncPath]) -> Result<()> {
 pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<SyncReport> {
     info!("Running sync in: {}", path.display());
 
+    // Fail closed on a conflict policy the application does not execute before
+    // any sync work begins.
+    validate_conflict_policy(&config)?;
+
     // Load ignore patterns
     let ignore_matcher = load_ignore_patterns(&path, &config)?;
 
@@ -603,6 +609,8 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
 pub async fn rebuild_remote(path: PathBuf, config: AppConfig) -> Result<SyncReport> {
     info!("Rebuilding remote from local in: {}", path.display());
 
+    validate_conflict_policy(&config)?;
+
     let ignore_matcher = load_ignore_patterns(&path, &config)?;
     let db_path = state_db_path(&path);
     let local_db = LocalDb::open(&db_path)?;
@@ -645,6 +653,8 @@ pub async fn rebuild_remote(path: PathBuf, config: AppConfig) -> Result<SyncRepo
 /// connection cannot be established, or the rebuild fails.
 pub async fn rebuild_local(path: PathBuf, config: AppConfig) -> Result<SyncReport> {
     info!("Rebuilding local from remote in: {}", path.display());
+
+    validate_conflict_policy(&config)?;
 
     let ignore_matcher = load_ignore_patterns(&path, &config)?;
     let db_path = state_db_path(&path);
@@ -1008,6 +1018,9 @@ pub async fn daemon(
     // Reject duplicate/conflicting mappings before any worker starts: two
     // mappings that share a canonical root would double-sync the same state DB.
     validate_unique_mappings(&paths)?;
+
+    // Fail closed on an unsupported conflict policy before any worker starts.
+    validate_conflict_policy(&config)?;
 
     let path_list: Vec<_> = paths
         .iter()
@@ -2430,7 +2443,8 @@ pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
     .await?;
     validate_sync_mapping(&local_db, &identity)?;
 
-    let mut engine = SyncEngine::new(couchdb, local_db, root);
+    let mut engine = SyncEngine::new(couchdb, local_db, root)
+        .with_conflict_dir(config.conflicts.conflict_dir.clone());
 
     println!("Found {} conflict(s) to resolve:\n", conflicts.len());
 
@@ -2485,11 +2499,23 @@ pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
             (ResolutionStrategy::KeepBoth, "Keep Both (merge manually)"),
             (ResolutionStrategy::Skip, "Skip"),
         ];
+        // Honor the configured `default_strategy` as the prompt's default
+        // selection instead of always preselecting the first option.
+        let default_strategy: ResolutionStrategy = match config.conflicts.default_strategy {
+            ConflictStrategy::KeepLocal => ResolutionStrategy::KeepLocal,
+            ConflictStrategy::KeepRemote => ResolutionStrategy::KeepRemote,
+            ConflictStrategy::KeepBoth => ResolutionStrategy::KeepBoth,
+            ConflictStrategy::Skip => ResolutionStrategy::Skip,
+        };
+        let default_index = strategies
+            .iter()
+            .position(|(strategy, _)| *strategy == default_strategy)
+            .unwrap_or(0);
         let options: Vec<&str> = strategies.iter().map(|(_, label)| *label).collect();
         let selection = Select::with_theme(&ColorfulTheme::default())
             .with_prompt("How do you want to resolve this conflict?")
             .items(&options)
-            .default(0)
+            .default(default_index)
             .interact()?;
 
         let strategy = strategies[selection].0;
@@ -2648,9 +2674,29 @@ pub fn status(path: &Path, json: bool, _config: &AppConfig) -> Result<()> {
 /// Returns an error if a configured pattern is malformed or a configured
 /// ignore file is missing, unreadable, or malformed.
 fn load_ignore_patterns(root: &Path, config: &AppConfig) -> anyhow::Result<IgnoreMatcher> {
-    let matcher = IgnoreMatcher::from_config(root, &config.ignore)?;
+    let mut matcher = IgnoreMatcher::from_config(root, &config.ignore)?;
+    // Preservation copies written under the configured `conflict_dir` must
+    // never reenter sync, whether or not the directory is dot-prefixed. Add it
+    // to the effective policy so its contents are excluded from every scan.
+    if let Some(conflict_dir) = &config.conflicts.conflict_dir {
+        let pattern = format!("{}/", conflict_dir.display());
+        matcher.extend_from_content_result(&pattern)?;
+    }
     info!("Loaded ignore policy from config and ignore files");
     Ok(matcher)
+}
+
+/// Fail closed when the configured conflict policy requests behavior the
+/// application does not execute. `auto_resolve` is documented in the example
+/// config but automatic resolution is not implemented; silently accepting it
+/// would imply conflicts are resolved when they never are, so a config that
+/// enables it is rejected before any sync runs.
+///
+/// # Errors
+///
+/// Returns an error when `conflicts.auto_resolve` is true.
+fn validate_conflict_policy(config: &AppConfig) -> anyhow::Result<()> {
+    config.conflicts.validate_supported()
 }
 
 /// The root-relative ignore files that participate in the effective policy.
@@ -3082,6 +3128,68 @@ mod tests {
         let matcher = load_ignore_patterns(root, &config).unwrap();
         assert!(matcher.is_ignored("file.tmp", false));
         assert!(!matcher.is_ignored("file.log", false));
+    }
+
+    #[test]
+    fn test_load_ignore_patterns_excludes_conflict_dir_dot_prefix() {
+        // A dot-prefixed configured conflict_dir is excluded from sync so its
+        // preservation copies never reenter a cycle.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut config = default_config();
+        config.conflicts.conflict_dir = Some(PathBuf::from(".conflicts"));
+        let matcher = load_ignore_patterns(root, &config).unwrap();
+        assert!(
+            matcher.should_ignore(Path::new(".conflicts/report.pdf.remote")),
+            "preservation copy under dot-prefixed conflict_dir must be ignored"
+        );
+        assert!(matcher.should_ignore(Path::new(".conflicts/docs/report.pdf.remote")));
+    }
+
+    #[test]
+    fn test_load_ignore_patterns_excludes_conflict_dir_non_dot_prefix() {
+        // Even a non-dot-prefixed conflict_dir is excluded, so copies cannot
+        // reenter sync regardless of the directory name.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut config = default_config();
+        config.conflicts.conflict_dir = Some(PathBuf::from("conflicts"));
+        let matcher = load_ignore_patterns(root, &config).unwrap();
+        assert!(
+            matcher.should_ignore(Path::new("conflicts/report.pdf.remote")),
+            "preservation copy under non-dot conflict_dir must be ignored"
+        );
+        assert!(
+            !matcher.should_ignore(Path::new("docs/report.pdf")),
+            "unrelated files must not be ignored"
+        );
+    }
+
+    #[test]
+    fn test_validate_conflict_policy_rejects_auto_resolve() {
+        let mut config = default_config();
+        config.conflicts.auto_resolve = true;
+        let err = validate_conflict_policy(&config).unwrap_err();
+        assert!(
+            err.to_string().contains("auto_resolve is not supported"),
+            "error should name the unsupported setting: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_conflict_policy_accepts_supported_policies() {
+        // Each supported default strategy and a configured conflict_dir pass.
+        for strategy in [
+            ConflictStrategy::KeepLocal,
+            ConflictStrategy::KeepRemote,
+            ConflictStrategy::KeepBoth,
+            ConflictStrategy::Skip,
+        ] {
+            let mut config = default_config();
+            config.conflicts.default_strategy = strategy;
+            config.conflicts.conflict_dir = Some(PathBuf::from(".conflicts"));
+            assert!(validate_conflict_policy(&config).is_ok());
+        }
     }
 
     #[test]
