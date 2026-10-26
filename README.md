@@ -306,6 +306,12 @@ detection, and conflict identification) without writing anything to CouchDB,
 the local filesystem, or the state database, then prints a summary of what
 would be uploaded, downloaded, deleted, and conflicted.
 
+A one-shot `sync` exits `0` only when every queued change applied cleanly.
+If any apply fails (or a file is skipped, e.g. oversized), it processes and
+reports all configured roots, prints a partial-failure summary listing the
+errors, and exits nonzero so scripts can detect that synchronization did not
+fully complete.
+
 ### `couchdb-file-sync daemon [PATH]`
 
 Run continuous sync daemon.

@@ -2732,39 +2732,57 @@ fn state_db_path(root: &Path) -> PathBuf {
     state_dir(root).join("state.db")
 }
 
-/// Helper to print sync report.
+/// Render the human-facing sync report as a string.
 ///
 /// When `dry_run` is true the counts are labelled as "would" actions and the
-/// summary makes clear that no changes were made.
-fn print_sync_report(report: &SyncReport, dry_run: bool) {
-    println!();
+/// summary makes clear that no changes were made. A successful (non-dry) run
+/// prints "Sync complete ✓"; a run with apply errors prints an explicit
+/// partial-failure header naming the error count so human completion status
+/// reflects actual completed synchronization.
+fn format_sync_report(report: &SyncReport, dry_run: bool) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    out.push('\n');
     if dry_run {
-        println!("Dry run complete — no changes were made");
-        println!("  Would upload:  {}", report.uploaded.0);
-        println!("  Would download: {}", report.downloaded.0);
-        println!("  Would delete (local): {}", report.deleted_local);
-        println!("  Would delete (remote): {}", report.deleted_remote);
+        let _ = writeln!(out, "Dry run complete — no changes were made");
+        let _ = writeln!(out, "  Would upload:  {}", report.uploaded.0);
+        let _ = writeln!(out, "  Would download: {}", report.downloaded.0);
+        let _ = writeln!(out, "  Would delete (local): {}", report.deleted_local);
+        let _ = writeln!(out, "  Would delete (remote): {}", report.deleted_remote);
+    } else if report.errors.is_empty() {
+        let _ = writeln!(out, "Sync complete ✓");
+        let _ = writeln!(out, "  Uploaded:  {}", report.uploaded.0);
+        let _ = writeln!(out, "  Downloaded: {}", report.downloaded.0);
+        let _ = writeln!(out, "  Deleted (local): {}", report.deleted_local);
+        let _ = writeln!(out, "  Deleted (remote): {}", report.deleted_remote);
     } else {
-        println!("Sync complete ✓");
-        println!("  Uploaded:  {}", report.uploaded.0);
-        println!("  Downloaded: {}", report.downloaded.0);
-        println!("  Deleted (local): {}", report.deleted_local);
-        println!("  Deleted (remote): {}", report.deleted_remote);
+        let _ = writeln!(out, "Sync completed with {} error(s)", report.errors.len());
+        let _ = writeln!(out, "  Uploaded:  {}", report.uploaded.0);
+        let _ = writeln!(out, "  Downloaded: {}", report.downloaded.0);
+        let _ = writeln!(out, "  Deleted (local): {}", report.deleted_local);
+        let _ = writeln!(out, "  Deleted (remote): {}", report.deleted_remote);
     }
 
     if report.conflicts > 0 {
-        println!("  Conflicts: {} ⚠️", report.conflicts);
-        println!();
-        println!("Run 'couchdb-file-sync conflicts' to see details");
+        let _ = writeln!(out, "  Conflicts: {} ⚠️", report.conflicts);
+        out.push('\n');
+        let _ = writeln!(out, "Run 'couchdb-file-sync conflicts' to see details");
     }
 
     if !report.errors.is_empty() {
-        println!();
-        println!("Errors:");
+        out.push('\n');
+        let _ = writeln!(out, "Errors:");
         for error in &report.errors {
-            println!("  • {error}");
+            let _ = writeln!(out, "  • {error}");
         }
     }
+
+    out
+}
+
+/// Print the human-facing sync report.
+fn print_sync_report(report: &SyncReport, dry_run: bool) {
+    print!("{}", format_sync_report(report, dry_run));
 }
 
 #[cfg(test)]
@@ -2975,6 +2993,63 @@ mod tests {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             print_sync_report(&report, false);
         }));
+    }
+
+    #[test]
+    fn format_sync_report_flags_partial_failure_and_omits_success_checkmark() {
+        // A non-dry report with apply errors must not claim "Sync complete ✓";
+        // it must surface an explicit partial-failure header and every error.
+        let report = SyncReport {
+            uploaded: UploadCount(5),
+            downloaded: DownloadCount(3),
+            deleted_local: 1,
+            deleted_remote: 0,
+            conflicts: 0,
+            errors: vec!["timeout".to_string(), "permission denied".to_string()],
+        };
+        let text = format_sync_report(&report, false);
+        assert!(
+            !text.contains("Sync complete ✓"),
+            "failed sync must not claim the success checkmark, got: {text}"
+        );
+        assert!(
+            text.contains("Sync completed with 2 error(s)"),
+            "partial-failure header must name the error count, got: {text}"
+        );
+        assert!(text.contains("timeout"), "error text must be listed");
+        assert!(
+            text.contains("permission denied"),
+            "error text must be listed"
+        );
+
+        // The same report as a dry-run keeps its planned phrasing and reports
+        // no errors (dry-run does not apply, so it never fails).
+        let dry = format_sync_report(&report, true);
+        assert!(
+            dry.contains("Dry run complete"),
+            "dry run keeps its planned phrasing, got: {dry}"
+        );
+    }
+
+    #[test]
+    fn format_sync_report_success_shows_checkmark() {
+        let report = SyncReport {
+            uploaded: UploadCount(2),
+            downloaded: DownloadCount(1),
+            deleted_local: 0,
+            deleted_remote: 1,
+            conflicts: 0,
+            errors: vec![],
+        };
+        let text = format_sync_report(&report, false);
+        assert!(
+            text.contains("Sync complete ✓"),
+            "clean sync must claim completion, got: {text}"
+        );
+        assert!(
+            !text.contains("error"),
+            "clean sync must not mention errors, got: {text}"
+        );
     }
 
     #[test]

@@ -706,28 +706,43 @@ async fn apply_one_upload(
     );
 
     let is_deleted = matches!(change.change_type(), ChangeType::Deleted);
+
+    // Dry-run reports the *planned* outcome (what would happen) without
+    // applying anything, so counters retain the full planned counts.
+    if dry_run {
+        return Ok(UploadOutcome {
+            uploaded: usize::from(!is_deleted),
+            deleted_remote: usize::from(is_deleted),
+            error: None,
+        });
+    }
+
+    // Apply the change, counting it only when it actually succeeds so a failed
+    // upload is never reported as uploaded/deleted. The per-file error is
+    // preserved in `outcome.error` so the batch collects every failure without
+    // dropping per-path information.
     let mut outcome = UploadOutcome {
-        uploaded: usize::from(!is_deleted),
-        deleted_remote: usize::from(is_deleted),
+        uploaded: 0,
+        deleted_remote: 0,
         error: None,
     };
-
-    if !dry_run {
-        if is_deleted {
-            match worker.apply_to_couchdb(&change).await {
-                Ok(()) => {
-                    // Preserve the original post-delete local state refresh.
-                    worker.local_db.delete_file_state(change.path()).await?;
-                }
-                Err(e) => {
-                    error!("Failed to upload {}: {}", change.path(), e);
-                    outcome.error = Some(format!("Upload {}: {}", change.path(), e));
-                }
+    if is_deleted {
+        match worker.apply_to_couchdb(&change).await {
+            Ok(()) => {
+                // Preserve the original post-delete local state refresh.
+                worker.local_db.delete_file_state(change.path()).await?;
+                outcome.deleted_remote = 1;
             }
-        } else if let Err(e) = worker.apply_to_couchdb(&change).await {
-            error!("Failed to upload {}: {}", change.path(), e);
-            outcome.error = Some(format!("Upload {}: {}", change.path(), e));
+            Err(e) => {
+                error!("Failed to upload {}: {}", change.path(), e);
+                outcome.error = Some(format!("Upload {}: {}", change.path(), e));
+            }
         }
+    } else if let Err(e) = worker.apply_to_couchdb(&change).await {
+        error!("Failed to upload {}: {}", change.path(), e);
+        outcome.error = Some(format!("Upload {}: {}", change.path(), e));
+    } else {
+        outcome.uploaded = 1;
     }
 
     Ok(outcome)
@@ -793,15 +808,33 @@ async fn apply_one_download(
     );
 
     let is_deleted = matches!(change.change_type(), ChangeType::Deleted);
+
+    // Dry-run reports the *planned* outcome (what would happen) without
+    // applying anything, so counters retain the full planned counts.
+    if dry_run {
+        return Ok(DownloadOutcome {
+            downloaded: usize::from(!is_deleted),
+            deleted_local: usize::from(is_deleted),
+            error: None,
+        });
+    }
+
+    // Apply the change, counting it only when it actually succeeds so a failed
+    // download is never reported as downloaded/deleted. The per-file error is
+    // preserved in `outcome.error` so the batch collects every failure without
+    // dropping per-path information.
     let mut outcome = DownloadOutcome {
-        downloaded: usize::from(!is_deleted),
-        deleted_local: usize::from(is_deleted),
+        downloaded: 0,
+        deleted_local: 0,
         error: None,
     };
-
-    if !dry_run && let Err(e) = worker.apply_to_filesystem(&change).await {
+    if let Err(e) = worker.apply_to_filesystem(&change).await {
         error!("Failed to download {}: {}", change.path(), e);
         outcome.error = Some(format!("Download {}: {}", change.path(), e));
+    } else if is_deleted {
+        outcome.deleted_local = 1;
+    } else {
+        outcome.downloaded = 1;
     }
 
     Ok(outcome)
@@ -3141,6 +3174,144 @@ mod tests {
             engine.couchdb.test_write_calls(),
             0,
             "dry run must not write to CouchDB"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_counts_only_successful_uploads_in_a_mixed_cycle() {
+        // A one-shot sync with one upload that succeeds and one that fails must
+        // report the successful count only, surface the per-path error, and
+        // leave the failed file retryable (no saved state, no checkpoint advance).
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        // Two new local files: ok.txt uploads, fail.txt fails at save.
+        std::fs::write(root.as_path().join("ok.txt"), "ok content").unwrap();
+        std::fs::write(root.as_path().join("fail.txt"), "fail content").unwrap();
+
+        let canned = CannedCouch {
+            changes: Vec::new(),
+            last_seq: "500-after".to_string(),
+            save_errors: std::collections::HashSet::from(["prefix/fail.txt".to_string()]),
+            ..CannedCouch::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let report = engine.sync().await.expect("mixed upload sync");
+
+        assert_eq!(
+            report.uploaded.0, 1,
+            "only the successful upload counts, not the failed one"
+        );
+        assert_eq!(report.errors.len(), 1, "the failed upload is surfaced");
+        assert!(
+            report.errors.iter().any(|e| e.contains("fail.txt")),
+            "error must name the failed path: {:?}",
+            report.errors
+        );
+        assert_eq!(
+            report.deleted_remote, 0,
+            "no remote deletion planned in this cycle"
+        );
+
+        // The successful upload is recorded; the failed one is left unrecorded
+        // so the next cycle retries it (no checkpoint advance past a failure).
+        assert!(
+            engine.get_file_state("ok.txt").await.unwrap().is_some(),
+            "successful upload must be recorded"
+        );
+        assert!(
+            engine.get_file_state("fail.txt").await.unwrap().is_none(),
+            "failed upload must not be recorded (retryable next cycle)"
+        );
+        assert!(
+            engine.get_checkpoint().await.unwrap().is_none(),
+            "checkpoint must not advance when any apply failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_counts_only_successful_downloads_in_a_mixed_cycle() {
+        // A one-shot sync with one download that succeeds and one that fails
+        // must report the successful count only, surface the per-path error,
+        // and leave the failed file absent (retryable next cycle).
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+
+        let remote_prefix = "prefix/";
+        let ok_path = format!("{remote_prefix}ok.txt");
+        let fail_path = format!("{remote_prefix}fail.txt");
+        let mut metadata = std::collections::HashMap::new();
+        let mut contents = std::collections::HashMap::new();
+        for (i, p) in [&ok_path, &fail_path].into_iter().enumerate() {
+            let mut doc = FileDoc::new(p.clone(), String::new(), 3);
+            doc.rev = Some(format!("1-{i}"));
+            doc.path = p.clone();
+            metadata.insert(p.clone(), doc);
+        }
+        contents.insert(ok_path.clone(), b"ok!".to_vec());
+
+        let canned = CannedCouch {
+            changes: vec![
+                Change::remote_created(
+                    ok_path.clone(),
+                    "okhash".to_string(),
+                    3,
+                    Utc::now(),
+                    "1-0".to_string(),
+                ),
+                Change::remote_created(
+                    fail_path.clone(),
+                    "failhash".to_string(),
+                    3,
+                    Utc::now(),
+                    "1-1".to_string(),
+                ),
+            ],
+            last_seq: "500-after".to_string(),
+            metadata,
+            contents,
+            content_errors: std::collections::HashSet::from([fail_path.clone()]),
+            ..CannedCouch::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch(remote_prefix, canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let report = engine.sync().await.expect("mixed download sync");
+
+        assert_eq!(
+            report.downloaded.0, 1,
+            "only the successful download counts, not the failed one"
+        );
+        assert_eq!(report.errors.len(), 1, "the failed download is surfaced");
+        assert!(
+            report.errors.iter().any(|e| e.contains("fail.txt")),
+            "error must name the failed path: {:?}",
+            report.errors
+        );
+
+        // The successful download is written; the failed one is left absent so
+        // the next cycle retries it (no checkpoint advance past a failure).
+        assert_eq!(
+            std::fs::read(root.as_path().join("ok.txt")).unwrap(),
+            b"ok!",
+            "successful download must be written"
+        );
+        assert!(
+            !root.as_path().join("fail.txt").exists(),
+            "failed download must not be written"
+        );
+        assert!(
+            engine.get_checkpoint().await.unwrap().is_none(),
+            "checkpoint must not advance when any apply failed"
         );
     }
 
@@ -5944,8 +6115,8 @@ mod tests {
             .await
             .expect("batch upload must not abort the sync");
 
-        // Every file is accounted for and every failure is collected.
-        assert_eq!(report.uploaded.0, N, "all uploads accounted for");
+        // Every failure is collected and only the successful uploads count.
+        assert_eq!(report.uploaded.0, N - 2, "only successful uploads counted");
         assert_eq!(report.deleted_remote, 0);
         assert_eq!(
             report.errors.len(),
@@ -6019,7 +6190,11 @@ mod tests {
             .await
             .expect("batch download must not abort the sync");
 
-        assert_eq!(report.downloaded.0, N, "all downloads accounted for");
+        assert_eq!(
+            report.downloaded.0,
+            N - 2,
+            "only successful downloads counted"
+        );
         assert_eq!(report.deleted_local, 0);
         assert_eq!(
             report.errors.len(),
@@ -6083,7 +6258,7 @@ mod tests {
             .await
             .expect("batch upload must not abort the sync");
 
-        assert_eq!(report.uploaded.0, N, "all uploads accounted for");
+        assert_eq!(report.uploaded.0, N - 2, "only successful uploads counted");
         assert_eq!(
             report.errors.len(),
             2,
@@ -6145,8 +6320,9 @@ mod tests {
         .expect("batch upload must not abort the sync");
 
         assert_eq!(
-            report.uploaded.0, N,
-            "all uploads accounted for across waves"
+            report.uploaded.0,
+            N - 3,
+            "only successful uploads counted across waves"
         );
         assert_eq!(
             report.errors.len(),
