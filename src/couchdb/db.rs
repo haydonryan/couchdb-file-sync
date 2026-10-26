@@ -18,16 +18,16 @@ const RETRY_BASE_BACKOFF_MS: u64 = 250;
 
 /// Characters allowed unencoded when percent-encoding a `CouchDB` document id.
 ///
-/// A file document id is a filesystem path, so `/` is preserved as a path
-/// separator while every other reserved/unsafe character (space, `#`, `?`,
-/// `%`, `&`, `+`, `=` …) is percent-encoded. Without this, ids containing such
-/// characters would be truncated or mangled when interpolated into a URL.
-const FILE_ID_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
-    .remove(b'/')
-    .remove(b'-')
-    .remove(b'.')
-    .remove(b'_')
-    .remove(b'~');
+/// A document id is opaque to the transport: even a filesystem-path id such as
+/// `notes/foo.md` must be encoded as `notes%2Ffoo.md` so `CouchDB` treats it as
+/// one literal document id rather than a path with separators. Encoding every
+/// reserved character (including `/`, `.`, `%`, `#`, `?`, `&`, `+`, `=`) keeps
+/// an untrusted id from escaping the selected database via `../` dot segments,
+/// being truncated at `#`/`?`, or injecting query/fragment/URL parameters. Only
+/// RFC 3986 unreserved characters (`A-Za-z0-9`, `-`, `_`, `~`) are left as-is;
+/// the server percent-decodes the rest, so a legitimate id like `notes/foo.md`
+/// still round-trips exactly to the same document.
+const DOC_ID_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'~');
 
 /// True if `id` is a chunk document id (generated as `h:<hex><hex>`).
 ///
@@ -1060,7 +1060,11 @@ impl CouchDb {
 
     /// Get a chunk document by ID
     async fn get_chunk(&self, chunk_id: &str) -> Result<Option<ChunkDoc>> {
-        let url = format!("{}/{}", self.base_db_url, chunk_id);
+        // Encode the chunk id as a single literal URL path segment so it can
+        // never escape the selected database via `../`, be truncated at `#`/`?`,
+        // or inject query/fragment parameters.
+        let encoded_id = utf8_percent_encode(chunk_id, DOC_ID_ENCODE_SET);
+        let url = format!("{}/{encoded_id}", self.base_db_url);
 
         let response = self
             .retry_transient::<_, _, reqwest::Response, anyhow::Error>(|| {
@@ -1174,6 +1178,17 @@ impl CouchDb {
                     doc.id
                 );
             };
+            // The server must return the exact document we asked for. A
+            // mismatched identity (e.g. a different doc reached through a
+            // rewritten/encoded id) is not this file's content and must be
+            // rejected rather than concatenated.
+            if chunk.id != *chunk_id {
+                anyhow::bail!(
+                    "Chunk {chunk_id} for file {} returned unexpected identity {:?}; refusing to return content",
+                    doc.id,
+                    chunk.id
+                );
+            }
             // The format contract reserves `Leaf` for chunk records. A
             // wrong-type record (e.g. a nested file doc) is not content and must
             // be rejected rather than concatenated as bytes.
@@ -1217,7 +1232,11 @@ impl CouchDb {
 
     /// Save a chunk document to `CouchDB`
     async fn save_chunk(&self, chunk: &ChunkDoc) -> Result<()> {
-        let url = format!("{}/{}", self.base_db_url, chunk.id);
+        // Encode the chunk id as a single literal URL path segment (see
+        // `get_chunk`) so a crafted id cannot escape the selected database or
+        // inject query/fragment parameters.
+        let encoded_id = utf8_percent_encode(&chunk.id, DOC_ID_ENCODE_SET);
+        let url = format!("{}/{encoded_id}", self.base_db_url);
 
         let response = self
             .retry_transient::<_, _, reqwest::Response, anyhow::Error>(|| {
@@ -1307,9 +1326,20 @@ impl CouchDb {
         }
 
         for chunk_id in chunk_ids {
-            if let Some(chunk) = self.get_chunk(chunk_id).await?
-                && let Some(rev) = chunk.rev
-            {
+            let Some(chunk) = self.get_chunk(chunk_id).await? else {
+                continue;
+            };
+            // Only hard-delete the exact leaf chunk we asked for. A mismatched
+            // identity or a non-leaf record reached through a crafted id must
+            // never be deleted.
+            if chunk.id != *chunk_id || chunk.doc_type != crate::models::DocType::Leaf {
+                warn!(
+                    "Refusing to delete {chunk_id}: server returned {:?} of type {:?}",
+                    chunk.id, chunk.doc_type
+                );
+                continue;
+            }
+            if let Some(rev) = chunk.rev {
                 self.delete_doc(chunk_id, &rev).await?;
             }
         }
@@ -1322,16 +1352,21 @@ impl CouchDb {
     ///
     /// Returns an error if the `CouchDB` delete request fails.
     async fn delete_doc(&self, id: &str, rev: &str) -> Result<()> {
-        // The id is a filesystem path that may contain URL-reserved characters
-        // (space, `#`, `?`, `%`, ...). Percent-encode it (preserving `/`
-        // separators) so the DELETE targets the correct document instead of
-        // being truncated or mangled by the URL parser.
-        let encoded_id = utf8_percent_encode(id, FILE_ID_ENCODE_SET);
-        let url = format!("{}/{encoded_id}?rev={rev}", self.base_db_url);
+        // The id may be a filesystem path containing URL-reserved characters
+        // (space, `#`, `?`, `%`, ...). Encode it as a single literal URL path
+        // segment (see `DOC_ID_ENCODE_SET`) so the DELETE targets the correct
+        // document instead of being truncated, mangled, or able to traverse
+        // `../` out of the selected database.
+        let encoded_id = utf8_percent_encode(id, DOC_ID_ENCODE_SET);
+        let url = format!("{}/{encoded_id}", self.base_db_url);
         let mut request = self.http_client.delete(&url);
         if let Some((username, password)) = &self.auth {
             request = request.basic_auth(username, Some(password));
         }
+        // Send the revision as a structured query parameter so it is
+        // percent-encoded and can never inject extra query parameters or a
+        // fragment into the request.
+        request = request.query(&[("rev", rev)]);
         match request.send().await {
             Ok(response) if response.status().is_success() => {
                 debug!("Deleted document: {}", id);
@@ -2046,6 +2081,264 @@ mod tests {
             result.is_ok(),
             "successful chunk delete must return Ok, got: {result:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 6372: document/child id traversal + reserved-character safety
+    // -----------------------------------------------------------------------
+
+    /// Normalize a raw request path the way a reverse proxy resolves dot
+    /// segments: collapse `.` and pop the last segment for `..`. `%2F` is NOT
+    /// decoded before this, matching how nginx/CouchDB route on the raw path —
+    /// so `..%2Fvictim` is a single literal segment and never resolves to the
+    /// parent database.
+    fn normalize_raw_path(path: &str) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for seg in path.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    out.pop();
+                }
+                s => out.push(s),
+            }
+        }
+        out
+    }
+
+    /// Percent-decode the final path segment to recover the real document id,
+    /// mimicking how `CouchDB` decodes `%2F`, `%3A`, `%2E` etc. back into the
+    /// doc id when it looks a document up.
+    fn decoded_last_segment(path: &str) -> String {
+        let seg = path.split('/').next_back().unwrap_or("");
+        percent_encoding::percent_decode_str(seg)
+            .decode_utf8_lossy()
+            .into_owned()
+    }
+
+    /// Spawn an in-process fake `CouchDB` server exposing two logical
+    /// databases: `test_db` (the selected database) and `victim` (a database
+    /// the client must never address). The server normalizes dot segments in
+    /// the raw request path like a real reverse proxy, sets `victim_accessed`
+    /// if any request resolves to the victim database, and records every raw
+    /// request target. Returns the base database URL, the victim-accessed
+    /// flag, the recorded request paths, the server thread handle, and the
+    /// shutdown flag.
+    #[allow(clippy::type_complexity)]
+    fn spawn_traversal_couch() -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind traversal couch");
+        let addr = listener.local_addr().expect("traversal couch addr");
+        let base_db_url = format!("http://{addr}/test_db");
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let victim_accessed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let shutdown_thread = shutdown.clone();
+        let victim_thread = victim_accessed.clone();
+        let paths_thread = paths.clone();
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("traversal couch runtime");
+            runtime.block_on(async move {
+                listener
+                    .set_nonblocking(true)
+                    .expect("set traversal couch nonblocking");
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .expect("traversal couch tokio listener");
+                loop {
+                    if shutdown_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    match tokio::time::timeout(Duration::from_millis(10), listener.accept()).await {
+                        Ok(Ok((stream, _))) => {
+                            let victim = victim_thread.clone();
+                            let paths = paths_thread.clone();
+                            let service = hyper::service::service_fn(move |req| {
+                                handle_traversal_req(req, victim.clone(), paths.clone())
+                            });
+                            tokio::spawn(async move {
+                                let io = hyper_util::rt::TokioIo::new(stream);
+                                let _ = hyper::server::conn::http1::Builder::new()
+                                    .serve_connection(io, service)
+                                    .await;
+                            });
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_elapsed) => {}
+                    }
+                }
+            });
+        });
+        (base_db_url, victim_accessed, paths, handle, shutdown)
+    }
+
+    /// Serve one request on the two-database fake. Sets `victim` if the raw
+    /// path (after dot-segment normalization) resolves to the `victim`
+    /// database, records the raw request target, and answers the selected
+    /// database's ordinary `chunk1` GET with a leaf chunk, everything else
+    /// with 404, PUT with 201, DELETE with 200.
+    #[allow(clippy::unused_async)]
+    async fn handle_traversal_req(
+        req: hyper::Request<hyper::body::Incoming>,
+        victim: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        paths: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Result<hyper::Response<http_body_util::Full<hyper::body::Bytes>>, hyper::Error> {
+        let (parts, _body) = req.into_parts();
+        let path = parts.uri.path().to_string();
+        paths.lock().expect("record path").push(path.clone());
+        let segments = normalize_raw_path(&path);
+        // Any request that resolves to the victim database is a successful
+        // escape from the selected database.
+        if segments.first().is_some_and(|s| *s == "victim") {
+            victim.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let mut response =
+            hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::new()));
+        let under_test_db = segments.first().is_some_and(|s| *s == "test_db");
+        match parts.method {
+            hyper::Method::GET if under_test_db && path.ends_with("/chunk1") => {
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from_static(
+                    br#"{"_id":"chunk1","_rev":"1-abc","data":"aGVsbG8=","type":"leaf"}"#,
+                ));
+            }
+            hyper::Method::GET if under_test_db => {
+                *response.status_mut() = hyper::StatusCode::NOT_FOUND;
+            }
+            hyper::Method::DELETE => {
+                *response.body_mut() =
+                    http_body_util::Full::new(hyper::body::Bytes::from_static(br#"{"ok":true}"#));
+            }
+            hyper::Method::PUT => {
+                *response.status_mut() = hyper::StatusCode::CREATED;
+            }
+            _ => {
+                *response.status_mut() = hyper::StatusCode::NOT_FOUND;
+            }
+        }
+        Ok(response)
+    }
+
+    #[test]
+    fn legitimate_doc_id_encodes_slash_and_round_trips() {
+        // A filesystem-path id keeps its exact identity: `notes/foo.md` is
+        // sent as literal segments `notes%2Ffoo%2Emd`, which CouchDB decodes
+        // back to the same document id. No path traversal is possible because
+        // the encoded slash and dots are not routing separators.
+        assert_eq!(
+            utf8_percent_encode("notes/foo.md", DOC_ID_ENCODE_SET).to_string(),
+            "notes%2Ffoo%2Emd"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)]
+    async fn traversal_and_reserved_ids_cannot_escape_selected_database() {
+        let (base_db_url, victim_accessed, paths, server, shutdown) = spawn_traversal_couch();
+        let db = couchdb_at(&base_db_url);
+
+        // 1. Direct delete_doc with a `../` traversal id: must stay inside
+        //    `test_db`, never reach `victim`, and succeed against the 404-free
+        //    DELETE handler.
+        let result = db.delete_doc("../victim/target", "1-abc").await;
+        assert!(
+            result.is_ok(),
+            "traversal delete_doc must be Ok: {result:?}"
+        );
+        assert!(
+            !victim_accessed.load(std::sync::atomic::Ordering::SeqCst),
+            "delete_doc `../victim/target` escaped to the victim database"
+        );
+
+        // 2. get_chunk with a `../` traversal id: must not escape the selected
+        //    database (returns None from the 404, never touches `victim`).
+        let fetched = db.get_chunk("../victim/target").await;
+        assert!(
+            fetched.is_ok(),
+            "traversal get_chunk must be Ok: {fetched:?}"
+        );
+        assert!(
+            !victim_accessed.load(std::sync::atomic::Ordering::SeqCst),
+            "get_chunk `../victim/target` escaped to the victim database"
+        );
+
+        // 3. save_chunk with reserved characters (`# ? % &` and a space): the
+        //    `#`/`?` must be percent-encoded, not truncated or turned into a
+        //    fragment/query, and the victim database must stay untouched.
+        let reserved_id = "foo#bar?baz%qux& plus";
+        let chunk = ChunkDoc::new_encoded(reserved_id.to_string(), b"data".to_vec());
+        let result = db.save_chunk(&chunk).await;
+        assert!(
+            result.is_ok(),
+            "reserved-id save_chunk must be Ok: {result:?}"
+        );
+        assert!(
+            !victim_accessed.load(std::sync::atomic::Ordering::SeqCst),
+            "reserved-id save_chunk escaped to the victim database"
+        );
+        {
+            let saved_paths = paths.lock().expect("read saved paths");
+            let put_path = saved_paths
+                .iter()
+                .find(|p| p.starts_with("/test_db/foo%23"))
+                .expect("save_chunk must encode `#` as %23");
+            // `#`, `?` and `%` must be percent-encoded in the request path —
+            // never truncated, turned into a fragment/query, or left as a raw
+            // reserved char.
+            assert!(
+                put_path.contains("%23") && put_path.contains("%3F") && put_path.contains("%25"),
+                "reserved chars must be percent-encoded in the request path: {put_path}"
+            );
+            assert!(
+                !put_path.contains('#') && !put_path.contains('?'),
+                "no literal reserved chars may appear in the request path: {put_path}"
+            );
+        }
+
+        // 4. get_chunk with a reserved-character id: must not escape and must
+        //    not be truncated at `#`/`?`.
+        let fetched = db.get_chunk(reserved_id).await;
+        assert!(
+            fetched.is_ok(),
+            "reserved-id get_chunk must be Ok: {fetched:?}"
+        );
+        assert!(
+            !victim_accessed.load(std::sync::atomic::Ordering::SeqCst),
+            "reserved-id get_chunk escaped to the victim database"
+        );
+
+        // 5. delete_chunks with a traversal child id: get_chunk returns None
+        //    (stays in `test_db`), so nothing is deleted and `victim` is never
+        //    addressed.
+        let result = db.delete_chunks(&["../victim/target".to_string()]).await;
+        assert!(
+            result.is_ok(),
+            "traversal delete_chunks must be Ok: {result:?}"
+        );
+        assert!(
+            !victim_accessed.load(std::sync::atomic::Ordering::SeqCst),
+            "delete_chunks `../victim/target` escaped to the victim database"
+        );
+
+        // 6. Ordinary chunk operations still pass end-to-end (fetch + delete).
+        let result = db.delete_chunks(&["chunk1".to_string()]).await;
+        assert!(
+            result.is_ok(),
+            "ordinary delete_chunks must be Ok: {result:?}"
+        );
+        assert!(
+            !victim_accessed.load(std::sync::atomic::Ordering::SeqCst),
+            "ordinary chunk operations must not touch the victim database"
+        );
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("traversal couch server join");
     }
 
     // -----------------------------------------------------------------------
@@ -3465,7 +3758,8 @@ mod tests {
         let (parts, _body) = req.into_parts();
         let mut response =
             hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::new()));
-        if parts.method == hyper::Method::GET && parts.uri.path().ends_with(chunk_id) {
+        if parts.method == hyper::Method::GET && decoded_last_segment(parts.uri.path()) == chunk_id
+        {
             // The chunk is missing: return 404 so `get_chunk` yields None.
             *response.status_mut() = hyper::StatusCode::NOT_FOUND;
         } else if parts.method == hyper::Method::GET {
@@ -3581,14 +3875,12 @@ mod tests {
         let mut response =
             hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::new()));
         if parts.method == hyper::Method::GET {
-            let path = parts.uri.path();
-            if let Some((_, chunk)) = chunks.iter().find(|(id, _)| path.ends_with(id.as_str())) {
+            let decoded_id = decoded_last_segment(parts.uri.path());
+            if let Some((_, chunk)) = chunks.iter().find(|(id, _)| decoded_id == **id) {
                 *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(
                     serde_json::to_string(chunk).expect("serialize chunk"),
                 ));
-            } else if let Some((_, body)) =
-                file_docs.iter().find(|(id, _)| path.ends_with(id.as_str()))
-            {
+            } else if let Some((_, body)) = file_docs.iter().find(|(id, _)| decoded_id == **id) {
                 *response.body_mut() =
                     http_body_util::Full::new(hyper::body::Bytes::from(body.as_bytes().to_vec()));
             } else {
@@ -3853,14 +4145,8 @@ mod tests {
         let (parts, body) = req.into_parts();
         let mut response =
             hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::new()));
-        let last_segment = parts
-            .uri
-            .path()
-            .split('/')
-            .next_back()
-            .unwrap_or("")
-            .to_string();
-        match (parts.method.clone(), last_segment.as_str()) {
+        let id = decoded_last_segment(parts.uri.path());
+        match (parts.method.clone(), id.as_str()) {
             (hyper::Method::PUT, id) if !id.is_empty() => {
                 use http_body_util::BodyExt;
                 let bytes = body.collect().await.expect("collect chunk body").to_bytes();
@@ -4174,14 +4460,8 @@ mod tests {
         let (parts, body) = req.into_parts();
         let mut response =
             hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::new()));
-        let last_segment = parts
-            .uri
-            .path()
-            .split('/')
-            .next_back()
-            .unwrap_or("")
-            .to_string();
-        match (parts.method.clone(), last_segment.as_str()) {
+        let id = decoded_last_segment(parts.uri.path());
+        match (parts.method.clone(), id.as_str()) {
             (hyper::Method::PUT, id) if !id.is_empty() => {
                 use http_body_util::BodyExt;
                 // Always drain the request body first so the connection stays in

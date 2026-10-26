@@ -3949,13 +3949,11 @@ mod tests {
         let (parts, body) = req.into_parts();
         let mut response =
             hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::new()));
-        let id = parts
-            .uri
-            .path()
-            .split('/')
-            .next_back()
-            .unwrap_or("")
-            .to_string();
+        let id = percent_encoding::percent_decode_str(
+            parts.uri.path().split('/').next_back().unwrap_or(""),
+        )
+        .decode_utf8_lossy()
+        .into_owned();
         match (parts.method, id.as_str()) {
             (hyper::Method::PUT, id) if !id.is_empty() => {
                 use http_body_util::BodyExt;
