@@ -8,7 +8,9 @@ use crate::sync::triage;
 use anyhow::Result;
 use chrono::{TimeZone, Utc};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, warn};
 
 /// Maximum number of per-file upload/download operations applied in parallel
@@ -257,6 +259,7 @@ impl ApplyWorker {
         remote_path: &str,
         local_path: &str,
         require_doc: bool,
+        protect_local_edits: bool,
     ) -> Result<Option<usize>> {
         let Some(doc) = self.couchdb.fetch_metadata(remote_path).await? else {
             if require_doc {
@@ -304,8 +307,58 @@ impl ApplyWorker {
             );
         }
 
-        tokio::fs::write(&file_path, &content).await?;
-        debug!("[DOWNLOAD] Wrote {} bytes to disk", content.len());
+        // Capture the expected local baseline recorded at last sync so we can
+        // revalidate the on-disk file immediately before replacement below.
+        let stored_state = self.local_db.get_file_state(local_path).await?;
+
+        // Stage the verified bytes in a sibling temp file in the same
+        // directory (same filesystem as the target) so the final install is
+        // an atomic rename. A partial write, cancellation or disk-full
+        // mid-transfer can therefore only corrupt the temp file — never the
+        // live local file. The unique name lets a leftover staging file be
+        // identified and cleaned up.
+        let parent = file_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine parent directory for {local_path}"))?;
+        let staging = parent.join(format!(
+            ".{}.{}.{}.download",
+            file_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file"),
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default(),
+        ));
+        {
+            let mut f = tokio::fs::File::create(&staging).await?;
+            f.write_all(&content).await?;
+            f.flush().await?;
+            f.sync_all().await?;
+        }
+
+        // Revalidate the expected local state immediately before the atomic
+        // replacement: if a user edited the file during the (possibly long)
+        // transfer above, the on-disk content no longer matches the baseline
+        // recorded at last sync, so we must abort rather than clobber the
+        // user's version. On any failure, clean up the staging file so no
+        // temp residue is left behind.
+        let replace = async {
+            if protect_local_edits {
+                revalidate_local_baseline(local_path, &file_path, stored_state.as_ref()).await?;
+            }
+            tokio::fs::rename(&staging, &file_path).await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        if let Err(e) = replace {
+            let _ = tokio::fs::remove_file(&staging).await;
+            debug!("[DOWNLOAD] Cleaned up staging file for {}", local_path);
+            return Err(e);
+        }
 
         let metadata = tokio::fs::metadata(&file_path).await?;
         let state = FileState {
@@ -361,7 +414,7 @@ impl ApplyWorker {
         match change.change_type() {
             ChangeType::Created | ChangeType::Modified => {
                 if let Some(bytes) = self
-                    .download_remote_file(remote_path, &local_path, false)
+                    .download_remote_file(remote_path, &local_path, false, true)
                     .await?
                 {
                     info!(
@@ -383,6 +436,37 @@ impl ApplyWorker {
             }
         }
         Ok(())
+    }
+}
+
+/// Verify the on-disk file at `file_path` still matches the last-synced
+/// baseline recorded in `stored_state`, so a concurrent local edit is never
+/// clobbered by an atomic download replacement.
+///
+/// Returns `Ok(())` when it is safe to replace the file: the file does not
+/// exist (nothing local to protect), or its current content hash equals the
+/// baseline hash. Returns an error when the file exists but diverges from
+/// the baseline (a local edit happened during the transfer) or exists with no
+/// tracked baseline (an untracked local file). In both error cases the caller
+/// must leave the on-disk file untouched.
+async fn revalidate_local_baseline(
+    local_path: &str,
+    file_path: &Path,
+    stored_state: Option<&FileState>,
+) -> Result<()> {
+    let Ok(on_disk) = tokio::fs::read(file_path).await else {
+        // No local file to protect: safe to create/install fresh.
+        return Ok(());
+    };
+    let on_disk_hash = compute_bytes_hash(&on_disk);
+    match stored_state.map(|s| s.hash.as_str()) {
+        Some(expected) if expected != on_disk_hash => anyhow::bail!(
+            "local file {local_path} changed on disk during download (no longer matches last-synced state); aborting to protect local edits"
+        ),
+        Some(_) => Ok(()),
+        None => anyhow::bail!(
+            "local file {local_path} exists but has no tracked sync state; aborting download to protect untracked local content"
+        ),
     }
 }
 
@@ -798,7 +882,7 @@ impl SyncEngine {
         for remote_path in remote_downloads {
             let local_path = self.couchdb.get_local_path(&remote_path);
             if self
-                .download_remote_file(&remote_path, &local_path, true)
+                .download_remote_file(&remote_path, &local_path, true, false)
                 .await?
                 .is_some()
             {
@@ -1304,9 +1388,10 @@ impl SyncEngine {
         remote_path: &str,
         local_path: &str,
         require_doc: bool,
+        protect_local_edits: bool,
     ) -> Result<Option<usize>> {
         self.apply_worker()
-            .download_remote_file(remote_path, local_path, require_doc)
+            .download_remote_file(remote_path, local_path, require_doc, protect_local_edits)
             .await
     }
 
@@ -1440,14 +1525,14 @@ impl SyncEngine {
             }
             ResolutionStrategy::KeepRemote => {
                 // Force download remote version
-                self.download_remote_file(&remote_path, local_path, true)
+                self.download_remote_file(&remote_path, local_path, true, false)
                     .await?;
                 info!("Resolved conflict (keep-remote): {}", local_path);
             }
             ResolutionStrategy::KeepBoth => {
                 // Save remote as .remote file
                 let local_remote_path = format!("{local_path}.remote");
-                self.download_remote_file(&remote_path, &local_remote_path, true)
+                self.download_remote_file(&remote_path, &local_remote_path, true, false)
                     .await?;
                 info!("Saved remote version as: {}", local_remote_path);
 
@@ -2354,7 +2439,7 @@ mod tests {
         );
 
         let bytes_written = engine
-            .download_remote_file(remote_path, "dl.txt", true)
+            .download_remote_file(remote_path, "dl.txt", true, true)
             .await
             .expect("download should succeed")
             .expect("download should write content");
@@ -2419,7 +2504,7 @@ mod tests {
         );
 
         let err = engine_a
-            .download_remote_file(remote_path, local_path, true)
+            .download_remote_file(remote_path, local_path, true, true)
             .await
             .expect_err("content fetch failure should propagate as Err");
         assert!(
@@ -2467,7 +2552,7 @@ mod tests {
         );
 
         engine_b
-            .download_remote_file(remote_path2, local_path2, true)
+            .download_remote_file(remote_path2, local_path2, true, true)
             .await
             .expect_err("content fetch failure should propagate as Err");
         assert!(
@@ -2516,7 +2601,7 @@ mod tests {
         );
 
         let bytes = engine
-            .download_remote_file(remote_path, "empty.txt", true)
+            .download_remote_file(remote_path, "empty.txt", true, true)
             .await
             .expect("empty-content download should succeed")
             .expect("empty-content download should write a file");
@@ -2569,7 +2654,7 @@ mod tests {
         );
 
         engine
-            .download_remote_file(remote_path, "corrupt.txt", true)
+            .download_remote_file(remote_path, "corrupt.txt", true, true)
             .await
             .expect_err("hash mismatch must fail the download");
 
@@ -2624,7 +2709,7 @@ mod tests {
         );
 
         let bytes = engine
-            .download_remote_file(remote_path, "good.txt", true)
+            .download_remote_file(remote_path, "good.txt", true, true)
             .await
             .expect("matching hash download should succeed")
             .expect("matching hash download should write a file");
@@ -2646,8 +2731,179 @@ mod tests {
         );
     }
 
-    // ── Regressions for moving blocking LocalDb (rusqlite) I/O off the
-    // async executor (#2937) ─────────────────────────────────────────────
+    /// Helper: list any leftover `.download` staging residue in `dir`.
+    fn staging_residue(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.ends_with(".download"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn download_protects_local_edit_during_delayed_transfer() {
+        // Regression for #6340: a user edit that lands while a download is in
+        // flight (delayed network fetch) must not be clobbered by the atomic
+        // replacement. The download aborts, the user's bytes stay on disk,
+        // the recorded sync state is unchanged, and no staging file leaks.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+
+        let remote_path = "prefix/edit.txt";
+        let local_path = "edit.txt";
+        let baseline: Vec<u8> = b"baseline-content".to_vec();
+        std::fs::write(root.as_path().join(local_path), &baseline).unwrap();
+
+        let local = test_local_db();
+        let mut stored = FileState::new(
+            local_path.to_string(),
+            compute_bytes_hash(&baseline),
+            baseline.len() as u64,
+            Utc::now() - chrono::Duration::days(1),
+        );
+        stored.couch_rev = Some(CouchRev::new("1-base").unwrap());
+        stored.last_sync_at = Utc::now() - chrono::Duration::days(1);
+        local.save_file_state(&stored).unwrap();
+
+        let remote_content: Vec<u8> = b"remote-new-content".to_vec();
+        let mut remote_doc = FileDoc::new(
+            remote_path.to_string(),
+            compute_bytes_hash(&remote_content),
+            remote_content.len() as u64,
+        );
+        remote_doc.rev = Some("2-new".to_string());
+        remote_doc.path = remote_path.to_string();
+
+        // Delay the content fetch so the user edit lands mid-transfer.
+        let probe = std::sync::Arc::new(ConcurrencyProbe::default());
+        let canned = CannedCouch {
+            changes: Vec::new(),
+            last_seq: "2".to_string(),
+            metadata: std::collections::HashMap::from([(remote_path.to_string(), remote_doc)]),
+            contents: std::collections::HashMap::from([(
+                remote_path.to_string(),
+                remote_content.clone(),
+            )]),
+            content_errors: std::collections::HashSet::new(),
+            probe: Some(probe),
+            batch_delay: Some(std::time::Duration::from_millis(500)),
+            ..CannedCouch::default()
+        };
+        let engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        // Simulate the user editing the file while the (delayed) download is
+        // transferring: write new user bytes shortly after the fetch starts.
+        let edit_dir = root.as_path().to_path_buf();
+        let user_edit: Vec<u8> = b"user-edit-during-download".to_vec();
+        let task_edit = user_edit.clone();
+        let edit_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            std::fs::write(edit_dir.join("edit.txt"), &task_edit).unwrap();
+        });
+
+        let err = engine
+            .download_remote_file(remote_path, local_path, true, true)
+            .await
+            .expect_err("download must abort rather than clobber the user edit");
+        assert!(
+            format!("{err:#}").contains("changed on disk"),
+            "error should identify the protected local edit: {err:#}"
+        );
+        edit_task.await.unwrap();
+
+        assert_eq!(
+            std::fs::read(root.as_path().join(local_path)).unwrap(),
+            user_edit,
+            "user bytes edited during the download must remain intact"
+        );
+        assert!(
+            staging_residue(dir.path()).is_empty(),
+            "aborted download must leave no staging residue"
+        );
+        let state_after = engine
+            .get_file_state(local_path)
+            .await
+            .unwrap()
+            .expect("seeded baseline state must still be present");
+        assert_eq!(
+            state_after.hash,
+            compute_bytes_hash(&baseline),
+            "aborted download must not update the recorded sync state"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_protects_untracked_local_file() {
+        // A local file that exists without any tracked sync state is treated
+        // as untracked local content and must not be overwritten by a
+        // download. The file stays intact, no state is saved, no staging
+        // residue remains.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+
+        let remote_path = "prefix/untracked.txt";
+        let local_path = "untracked.txt";
+        std::fs::write(root.as_path().join(local_path), b"precious-local").unwrap();
+
+        let remote_content: Vec<u8> = b"remote-content".to_vec();
+        let mut remote_doc = FileDoc::new(
+            remote_path.to_string(),
+            compute_bytes_hash(&remote_content),
+            remote_content.len() as u64,
+        );
+        remote_doc.rev = Some("1-remote".to_string());
+        remote_doc.path = remote_path.to_string();
+
+        let canned = CannedCouch {
+            changes: Vec::new(),
+            last_seq: "1".to_string(),
+            metadata: std::collections::HashMap::from([(remote_path.to_string(), remote_doc)]),
+            contents: std::collections::HashMap::from([(remote_path.to_string(), remote_content)]),
+            content_errors: std::collections::HashSet::new(),
+            ..CannedCouch::default()
+        };
+        let engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let err = engine
+            .download_remote_file(remote_path, local_path, true, true)
+            .await
+            .expect_err("download must abort to protect the untracked local file");
+        assert!(
+            format!("{err:#}").contains("untracked"),
+            "error should identify the untracked local file: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read(root.as_path().join(local_path)).unwrap(),
+            b"precious-local",
+            "untracked local file must remain untouched"
+        );
+        assert!(
+            staging_residue(dir.path()).is_empty(),
+            "aborted download must leave no staging residue"
+        );
+        assert!(
+            engine.get_file_state(local_path).await.unwrap().is_none(),
+            "aborted download must not save any FileState"
+        );
+    }
 
     /// `get_conflicts()` synthesizes `local_state.last_sync_at` with `Utc::now()`
     /// on every read (that field is not persisted in the conflicts table), so
