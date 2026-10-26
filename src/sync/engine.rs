@@ -741,7 +741,17 @@ impl SyncEngine {
     pub async fn rebuild_remote_from_local(&mut self) -> Result<SyncReport> {
         info!("========== REMOTE REBUILD STARTING ==========");
 
-        let local_states = self.scanner.full_scan().await?;
+        let outcome = self.scanner.full_scan().await?;
+        // A rebuild that deletes remote files must not run on an incomplete
+        // scan: an unreadable subtree or missing/unmounted sync root would
+        // otherwise tombstone remote files that still exist locally.
+        if !outcome.complete {
+            anyhow::bail!(
+                "Refusing remote rebuild: local scan is incomplete (unreadable \
+                 subtree or missing/unmounted sync root); not tombstoning remote files"
+            );
+        }
+        let local_states = outcome.states;
         let remote_docs = self.couchdb.get_all_files().await?;
         let (uploads, remote_deletes) =
             triage::plan_remote_rebuild(&local_states, &remote_docs, self.couchdb.remote_prefix());
@@ -778,7 +788,17 @@ impl SyncEngine {
     pub async fn rebuild_local_from_remote(&mut self) -> Result<SyncReport> {
         info!("========== LOCAL REBUILD STARTING ==========");
 
-        let local_states = self.scanner.full_scan().await?;
+        let outcome = self.scanner.full_scan().await?;
+        // A rebuild that deletes local files must not run on an incomplete
+        // scan: files hidden in an unreadable subtree would be missed and
+        // orphaned by the rebuild.
+        if !outcome.complete {
+            anyhow::bail!(
+                "Refusing local rebuild: local scan is incomplete (unreadable \
+                 subtree or missing/unmounted sync root)"
+            );
+        }
+        let local_states = outcome.states;
         let remote_docs = self.couchdb.get_all_files().await?;
         let (local_deletes, remote_downloads) =
             triage::plan_local_rebuild(&local_states, &remote_docs);
@@ -855,15 +875,18 @@ impl SyncEngine {
         // Polluted/ignored states are excluded above, so their hashes are never
         // reused.
         let stored_states = Arc::new(valid_stored_states);
-        let current_states = self
+        let outcome = self
             .scanner
             .full_scan_with_stored(stored_states.clone())
             .await?;
+        let current_states = outcome.states;
 
         debug!("Scanned {} files on disk", current_states.len());
         debug!("Found {} files in local database", stored_states.len());
 
-        let changes = self.scanner.detect_changes(&current_states, &stored_states);
+        let changes =
+            self.scanner
+                .detect_changes(&current_states, &stored_states, outcome.complete);
 
         debug!("Detected {} changes from local scan", changes.len());
         for change in &changes {

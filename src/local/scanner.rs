@@ -31,6 +31,22 @@ fn is_racily_clean(modified_at: DateTime<Utc>) -> bool {
         <= chrono::Duration::seconds(TIMESTAMP_GRANULARITY_SECS)
 }
 
+/// Result of a full filesystem scan: the discovered file states plus a flag
+/// recording whether every subtree and file was actually read.
+///
+/// `complete` is `false` whenever the directory walk or any per-file
+/// metadata/hash read failed (permission or I/O error) or the sync root is
+/// missing/unmounted. When it is `false`, absence of a stored path from
+/// `states` does NOT prove the file was deleted — it may simply be hidden in
+/// an unreadable subtree — so callers must not infer deletions from the scan.
+#[derive(Debug, Clone)]
+pub struct ScanOutcome {
+    /// The file states discovered by the scan, in walk order.
+    pub states: Vec<FileState>,
+    /// `true` only when the walk and every per-file read succeeded.
+    pub complete: bool,
+}
+
 /// Scans the filesystem for changes
 #[derive(Clone)]
 pub struct Scanner {
@@ -68,7 +84,7 @@ impl Scanner {
     /// # Errors
     ///
     /// Returns an error if the blocking scan task fails.
-    pub async fn full_scan(&self) -> Result<Vec<FileState>> {
+    pub async fn full_scan(&self) -> Result<ScanOutcome> {
         self.full_scan_with_stored(Arc::new(Vec::new())).await
     }
 
@@ -90,15 +106,21 @@ impl Scanner {
     pub async fn full_scan_with_stored(
         &self,
         stored_states: Arc<Vec<FileState>>,
-    ) -> Result<Vec<FileState>> {
+    ) -> Result<ScanOutcome> {
         let scanner = self.clone();
         Ok(tokio::task::spawn_blocking(move || scanner.scan_blocking(&stored_states)).await?)
     }
 
     /// Walk the directory tree and hash every file using blocking filesystem
     /// calls. Called on a blocking thread pool by [`Self::full_scan`].
-    fn scan_blocking(&self, stored_states: &[FileState]) -> Vec<FileState> {
+    ///
+    /// Any walk error (including an unreadable subtree or a missing/unmounted
+    /// sync root) or any per-file metadata/hash read failure marks the result
+    /// incomplete, so callers know absence from the returned states cannot be
+    /// used to infer deletions.
+    fn scan_blocking(&self, stored_states: &[FileState]) -> ScanOutcome {
         let mut states = Vec::new();
+        let mut complete = true;
         // Index stored states by relative path for O(1) reuse lookups. Keys are
         // borrowed, so no path/hash strings are copied.
         let stored_map: HashMap<&str, &FileState> =
@@ -108,7 +130,8 @@ impl Scanner {
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    warn!("Error walking directory: {}", e);
+                    warn!("Error walking directory: {}; marking scan incomplete", e);
+                    complete = false;
                     continue;
                 }
             };
@@ -141,12 +164,17 @@ impl Scanner {
                     states.push(state);
                 }
                 Err(e) => {
-                    warn!("Failed to scan file {}: {}", path.display(), e);
+                    warn!(
+                        "Failed to scan file {}: {}; marking scan incomplete",
+                        path.display(),
+                        e
+                    );
+                    complete = false;
                 }
             }
         }
 
-        states
+        ScanOutcome { states, complete }
     }
 
     /// Scan a single file, always computing the SHA-256 hash.
@@ -280,11 +308,17 @@ impl Scanner {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Detect changes by comparing current state with stored state
+    /// Detect changes by comparing current state with stored state.
+    ///
+    /// `scan_complete` records whether `current_states` came from a complete
+    /// scan ([`ScanOutcome::complete`]). When it is `false`, a stored path
+    /// absent from `current_states` may simply be hidden in an unreadable
+    /// subtree, so no deletion is inferred from its absence.
     pub fn detect_changes(
         &self,
         current_states: &[FileState],
         stored_states: &[FileState],
+        scan_complete: bool,
     ) -> Vec<Change> {
         let mut changes = Vec::new();
         let stored_map: std::collections::HashMap<_, _> =
@@ -334,24 +368,46 @@ impl Scanner {
             }
         }
 
-        // Detect deleted files
+        // Detect deleted files.
         for stored in stored_states {
-            if !current_map.contains_key(&stored.path) {
-                // A stored path absent from the scan could mean it was truly
-                // deleted, OR that it still exists on disk but failed to scan
-                // (permission error, transient I/O error, or a race with a
-                // concurrent delete/rename). Reporting a delete for a file that
-                // is still present would destroy its remote copy, so only treat
-                // it as deleted when it is genuinely gone from the filesystem.
-                let full_path = self.root_dir.as_path().join(&stored.path);
-                if full_path.exists() {
+            if current_map.contains_key(&stored.path) {
+                continue;
+            }
+            // A stored path absent from the scan could mean it was truly
+            // deleted, OR that the scan could not read it (permission or I/O
+            // error, an unreadable/missing ancestor subtree, an absent or
+            // unmounted sync root, or a race with a concurrent delete/rename).
+            // Reporting a delete for a file that is still present would destroy
+            // its remote copy, so absence is only treated as a deletion when
+            // the scan was complete AND the file is genuinely gone from the
+            // filesystem.
+            if !scan_complete {
+                debug!("Scan incomplete; not inferring deletion of {}", stored.path);
+                continue;
+            }
+            let full_path = self.root_dir.as_path().join(&stored.path);
+            match std::fs::metadata(&full_path) {
+                Ok(_) => {
+                    // Still present on disk (e.g. it exists but could not be
+                    // hashed, or a race recreated it); not a deletion.
                     debug!(
                         "File {} exists on disk but could not be scanned; not reporting a delete",
                         stored.path
                     );
-                    continue;
                 }
-                changes.push(Change::local_deleted(stored.path.clone()));
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Genuinely gone: the metadata probe confirms absence
+                    // rather than an inaccessible path.
+                    changes.push(Change::local_deleted(stored.path.clone()));
+                }
+                Err(e) => {
+                    // Permission denied or another I/O error: absence cannot be
+                    // distinguished from inaccessibility, so do not tombstone.
+                    debug!(
+                        "Cannot verify absence of {} ({}); not reporting a delete",
+                        stored.path, e
+                    );
+                }
             }
         }
 
@@ -418,6 +474,7 @@ mod tests {
     use crate::models::IgnoreMatcher;
     use crate::models::change::{ChangeSource, ChangeType};
     use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
@@ -506,7 +563,7 @@ mod tests {
         assert_eq!(state.modified_at, stored.modified_at);
 
         // Change detection against the stored state reports no change.
-        let changes = scanner.detect_changes(&[state], &[stored]);
+        let changes = scanner.detect_changes(&[state], &[stored], true);
         assert!(changes.is_empty(), "unchanged file must produce no changes");
     }
 
@@ -546,7 +603,7 @@ mod tests {
         assert_ne!(state.hash, stored.hash, "hash must be recomputed");
         assert_eq!(state.hash, compute_file_hash(&file_path).unwrap());
 
-        let changes = scanner.detect_changes(&[state], &[stored]);
+        let changes = scanner.detect_changes(&[state], &[stored], true);
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path(), "edit.txt");
         assert_eq!(changes[0].change_type(), ChangeType::Modified);
@@ -588,7 +645,7 @@ mod tests {
         assert_ne!(state.hash, stored.hash, "hash must be recomputed");
         assert_eq!(state.hash, compute_file_hash(&file_path).unwrap());
 
-        let changes = scanner.detect_changes(&[state], &[stored]);
+        let changes = scanner.detect_changes(&[state], &[stored], true);
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].change_type(), ChangeType::Modified);
     }
@@ -642,7 +699,7 @@ mod tests {
         );
         assert_eq!(state.hash, compute_file_hash(&file_path).unwrap());
 
-        let changes = scanner.detect_changes(&[state], &[stored]);
+        let changes = scanner.detect_changes(&[state], &[stored], true);
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path(), "racy.txt");
         assert_eq!(changes[0].change_type(), ChangeType::Modified);
@@ -701,7 +758,7 @@ mod tests {
         );
         assert_eq!(state.hash, compute_file_hash(&file_path).unwrap());
 
-        let changes = scanner.detect_changes(&[state], &[stored]);
+        let changes = scanner.detect_changes(&[state], &[stored], true);
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path(), "preserved.txt");
         assert_eq!(changes[0].change_type(), ChangeType::Modified);
@@ -723,7 +780,7 @@ mod tests {
         let scanner = Scanner::new(root.clone(), IgnoreMatcher::empty());
 
         // Establish the stored states (this first scan hashes everything).
-        let mut stored_vec = scanner.full_scan().await.unwrap();
+        let mut stored_vec = scanner.full_scan().await.unwrap().states;
         let hashes_after_first = scanner.hash_computations();
         assert_eq!(hashes_after_first, 3, "first scan must hash all 3 files");
 
@@ -747,8 +804,9 @@ mod tests {
             hashes_after_second, hashes_after_first,
             "unchanged scan must not re-hash any file"
         );
-        assert_eq!(current.len(), 3);
-        for state in &current {
+        assert_eq!(current.states.len(), 3);
+        assert!(current.complete, "unchanged scan must be complete");
+        for state in &current.states {
             let stored = stored_states
                 .iter()
                 .find(|s| s.path == state.path)
@@ -758,7 +816,7 @@ mod tests {
             assert_eq!(state.modified_at, stored.modified_at);
         }
         // And change detection sees no changes.
-        let changes = scanner.detect_changes(&current, &stored_states);
+        let changes = scanner.detect_changes(&current.states, &stored_states, current.complete);
         assert!(changes.is_empty());
     }
 
@@ -871,7 +929,7 @@ mod tests {
             SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
-        let states = scanner.full_scan().await.unwrap();
+        let states = scanner.full_scan().await.unwrap().states;
 
         assert_eq!(states.len(), 3);
         let paths: Vec<&str> = states.iter().map(|s| s.path.as_str()).collect();
@@ -891,7 +949,7 @@ mod tests {
             SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
-        let states = scanner.full_scan().await.unwrap();
+        let states = scanner.full_scan().await.unwrap().states;
 
         assert_eq!(states.len(), 2);
         let paths: Vec<&str> = states.iter().map(|s| s.path.as_str()).collect();
@@ -909,7 +967,7 @@ mod tests {
             SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
-        let states = scanner.full_scan().await.unwrap();
+        let states = scanner.full_scan().await.unwrap().states;
 
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].path, "file.txt");
@@ -924,7 +982,7 @@ mod tests {
 
         let matcher = IgnoreMatcher::from_content("*.log");
         let scanner = Scanner::new(SyncDirPath::new(temp_dir.path()).unwrap(), matcher);
-        let states = scanner.full_scan().await.unwrap();
+        let states = scanner.full_scan().await.unwrap().states;
 
         let paths: Vec<&str> = states.iter().map(|s| s.path.as_str()).collect();
         assert!(paths.contains(&"keep.txt"));
@@ -942,7 +1000,7 @@ mod tests {
             SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
-        let states = scanner.full_scan().await.unwrap();
+        let states = scanner.full_scan().await.unwrap().states;
 
         let paths: Vec<&str> = states.iter().map(|s| s.path.as_str()).collect();
         assert!(paths.contains(&"visible.txt"));
@@ -956,7 +1014,7 @@ mod tests {
             SyncDirPath::new(temp_dir.path()).unwrap(),
             IgnoreMatcher::empty(),
         );
-        let states = scanner.full_scan().await.unwrap();
+        let states = scanner.full_scan().await.unwrap().states;
 
         assert!(
             states.is_empty(),
@@ -1063,7 +1121,7 @@ mod tests {
         let current = vec![state.clone()];
         let stored = vec![state];
 
-        let changes = scanner.detect_changes(&current, &stored);
+        let changes = scanner.detect_changes(&current, &stored, true);
         assert!(changes.is_empty(), "No changes expected when states match");
     }
 
@@ -1083,7 +1141,7 @@ mod tests {
         )];
         let stored: Vec<FileState> = vec![];
 
-        let changes = scanner.detect_changes(&current, &stored);
+        let changes = scanner.detect_changes(&current, &stored, true);
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path(), "new.txt");
         assert_eq!(changes[0].change_type(), ChangeType::Created);
@@ -1113,7 +1171,7 @@ mod tests {
             Utc::now(),
         )];
 
-        let changes = scanner.detect_changes(&current, &stored);
+        let changes = scanner.detect_changes(&current, &stored, true);
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path(), "edit.txt");
         assert_eq!(changes[0].change_type(), ChangeType::Modified);
@@ -1138,7 +1196,7 @@ mod tests {
         )];
         let current: Vec<FileState> = vec![];
 
-        let changes = scanner.detect_changes(&current, &stored);
+        let changes = scanner.detect_changes(&current, &stored, true);
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path(), "gone.txt");
         assert_eq!(changes[0].change_type(), ChangeType::Deleted);
@@ -1166,7 +1224,7 @@ mod tests {
         // The file is missing from `current` (as when its scan errored).
         let current: Vec<FileState> = vec![];
 
-        let changes = scanner.detect_changes(&current, &stored);
+        let changes = scanner.detect_changes(&current, &stored, true);
         assert!(
             changes.is_empty(),
             "present-but-unscanned file must not be reported deleted"
@@ -1197,7 +1255,7 @@ mod tests {
             FileState::new("create.txt".to_string(), "h4".to_string(), 4, Utc::now()),
         ];
 
-        let changes = scanner.detect_changes(&current, &stored);
+        let changes = scanner.detect_changes(&current, &stored, true);
         assert_eq!(changes.len(), 3);
         let change_paths: Vec<&str> = changes
             .iter()
@@ -1206,5 +1264,144 @@ mod tests {
         assert!(change_paths.contains(&"create.txt"));
         assert!(change_paths.contains(&"modify.txt"));
         assert!(change_paths.contains(&"delete.txt"));
+    }
+
+    /// Regression test for #6341: an incomplete scan (any unreadable subtree,
+    /// walk error, or missing/unmounted sync root) must NEVER infer a deletion
+    /// from a stored path's absence, even when the file is genuinely gone.
+    /// Otherwise an unreadable ancestor would tombstone tracked remote files.
+    #[test]
+    fn test_detect_changes_incomplete_scan_never_infers_deletion() {
+        let temp_dir = TempDir::new().unwrap();
+        let scanner = Scanner::new(
+            SyncDirPath::new(temp_dir.path()).unwrap(),
+            IgnoreMatcher::empty(),
+        );
+
+        let stored = vec![FileState::new(
+            "gone.txt".to_string(),
+            "hash".to_string(),
+            10,
+            Utc::now(),
+        )];
+        // The file does not exist on disk AND the scan was incomplete. Absence
+        // may still be an artifact of the incomplete scan, so no deletion.
+        let current: Vec<FileState> = vec![];
+        let changes = scanner.detect_changes(&current, &stored, false);
+        assert!(
+            changes.is_empty(),
+            "incomplete scan must not infer a deletion for an absent stored path"
+        );
+    }
+
+    /// Even within a complete scan, absence must be confirmed by a `NotFound`
+    /// metadata probe. An inaccessible ancestor (permission denied) is not
+    /// evidence of deletion, so the stored path must not be tombstoned.
+    #[test]
+    fn test_detect_changes_inaccessible_ancestor_not_deleted() {
+        if is_effective_root() {
+            // Root bypasses permission checks; chmod-based tests are void.
+            return;
+        }
+        let temp_dir = TempDir::new().unwrap();
+        let secret_dir = temp_dir.path().join("secret");
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        std::fs::write(secret_dir.join("data.txt"), b"data").unwrap();
+        let mut perms = std::fs::metadata(&secret_dir).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&secret_dir, perms).unwrap();
+
+        let scanner = Scanner::new(
+            SyncDirPath::new(temp_dir.path()).unwrap(),
+            IgnoreMatcher::empty(),
+        );
+        let stored = vec![FileState::new(
+            "secret/data.txt".to_string(),
+            "hash".to_string(),
+            4,
+            Utc::now(),
+        )];
+        let current: Vec<FileState> = vec![];
+
+        let changes = scanner.detect_changes(&current, &stored, true);
+        assert!(
+            changes.is_empty(),
+            "inaccessible metadata must not be treated as a deletion"
+        );
+    }
+
+    /// A missing/unmounted sync root must be reported as an incomplete scan so
+    /// callers cannot tombstone tracked files from it.
+    #[tokio::test]
+    async fn test_full_scan_missing_root_is_incomplete() {
+        let missing = std::env::temp_dir().join(format!(
+            "couchfs-missing-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let scanner = Scanner::new(SyncDirPath::new(&missing).unwrap(), IgnoreMatcher::empty());
+        let outcome = scanner.full_scan().await.unwrap();
+        assert!(
+            !outcome.complete,
+            "a missing sync root must produce an incomplete scan"
+        );
+        assert!(outcome.states.is_empty());
+    }
+
+    /// A non-root permission failure inside a subtree must mark the whole scan
+    /// incomplete, and change detection over that outcome must not infer
+    /// deletions for the hidden files.
+    #[tokio::test]
+    async fn test_full_scan_incomplete_when_subtree_unreadable() {
+        if is_effective_root() {
+            // Root bypasses permission checks; chmod-based tests are void.
+            return;
+        }
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::write(temp_dir.path().join("visible.txt"), b"keep").unwrap();
+        let locked_dir = temp_dir.path().join("locked");
+        std::fs::create_dir_all(&locked_dir).unwrap();
+        std::fs::write(locked_dir.join("hidden.txt"), b"secret").unwrap();
+        let mut perms = std::fs::metadata(&locked_dir).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&locked_dir, perms).unwrap();
+
+        let scanner = Scanner::new(
+            SyncDirPath::new(temp_dir.path()).unwrap(),
+            IgnoreMatcher::empty(),
+        );
+        let outcome = scanner.full_scan().await.unwrap();
+        assert!(
+            !outcome.complete,
+            "unreadable subtree must mark the scan incomplete"
+        );
+        // The visible file is still discovered; only completeness is lost.
+        assert!(outcome.states.iter().any(|s| s.path == "visible.txt"));
+
+        // Change detection over the incomplete outcome must not tombstone the
+        // hidden file even though it is absent from the scan.
+        let stored = vec![FileState::new(
+            "locked/hidden.txt".to_string(),
+            "hash".to_string(),
+            6,
+            Utc::now(),
+        )];
+        let changes = scanner.detect_changes(&outcome.states, &stored, outcome.complete);
+        assert!(
+            !changes
+                .iter()
+                .any(|c| c.path() == "locked/hidden.txt" && c.change_type() == ChangeType::Deleted),
+            "hidden file must not be reported deleted on an incomplete scan"
+        );
+    }
+
+    fn is_effective_root() -> bool {
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
     }
 }
