@@ -14,7 +14,7 @@ A Rust-based filesystem-to-CouchDB synchronization engine with bidirectional syn
 | ✅ | **Conflict Resolution** | CLI commands to resolve conflicts with multiple strategies |
 | ✅ | **Smart Ignore Patterns** | Gitignore-style `.sync-ignore` file support |
 | ✅ | **Authoritative Rebuilds** | Rebuild the remote from local or rebuild the local tree from remote |
-| ✅ | **Telegram Notifications** | Get notified when conflicts are detected |
+| ✅ | **Conflict Notifications** | Telegram and/or Matrix; each opted-in channel is notified once per root and conflict generation |
 | ⚠️ | **Flexible Configuration** | CLI args, YAML config, and environment variables |
 | ⚠️ | **Conflict File Preservation (optional)** | Keep-both resolution saves a unique, local-only copy (`.filename.remote`, or under `conflicts.conflict_dir` when configured) |
 | ❌ | **Live Mode** | Optional filesystem watcher + CouchDB changes feed for low-latency sync |

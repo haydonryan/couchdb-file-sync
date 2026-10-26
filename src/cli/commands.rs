@@ -8,6 +8,7 @@ use crate::models::{
     Change, ChangeType, Conflict, CouchRev, DatabaseName, ExpectedRemote, FileState, IgnoreMatcher,
     RemotePath, RemoteState, ResolutionStrategy, SyncDirPath, SyncIdentity,
 };
+use crate::notify::{ConflictNotifier, conflict_generation};
 use crate::sync::{SyncEngine, SyncReport, triage};
 use crate::telegram::TelegramNotifier;
 use anyhow::{Context, Result};
@@ -590,10 +591,31 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
             notify_sync_error_matrix(&config, Some(&path), &summary).await;
         }
 
-        // Send Telegram notifications for conflicts (one-time sync uses DB tracking)
+        // Send conflict notifications over each configured channel, tracking
+        // delivery per channel/root/generation.
         if report.conflicts > 0 {
-            notify_conflicts_telegram(&config, &db_path, &path, None).await;
-            notify_conflicts_matrix(&config, &db_path, &path, None).await;
+            if let Some(notifier) = telegram_conflict_notifier(&config) {
+                notify_conflicts(
+                    "telegram",
+                    &notifier,
+                    &config,
+                    &db_path,
+                    &path,
+                    NOTIFICATION_DELIVERY_TIMEOUT,
+                )
+                .await;
+            }
+            if let Some(notifier) = matrix_conflict_notifier(&config) {
+                notify_conflicts(
+                    "matrix",
+                    &notifier,
+                    &config,
+                    &db_path,
+                    &path,
+                    NOTIFICATION_DELIVERY_TIMEOUT,
+                )
+                .await;
+            }
         }
     }
 
@@ -690,93 +712,118 @@ pub async fn rebuild_local(path: PathBuf, config: AppConfig) -> Result<SyncRepor
     Ok(report)
 }
 
-/// Send Telegram notifications for any unnotified conflicts
-/// If `session_notified` is provided, only notify about conflicts not in that set (daemon mode)
-/// If `session_notified` is None, notify about all conflicts not marked as notified in DB (one-time sync)
-async fn notify_conflicts_telegram(
+/// Upper bound on the whole delivery attempt for one channel. If a notifier
+/// hangs (its HTTP transport should already time out after
+/// `NOTIFICATION_HTTP_TIMEOUT`), this backstop lets sync continue instead of
+/// blocking indefinitely.
+const NOTIFICATION_DELIVERY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Send conflict notifications over one channel, tracking delivery per
+/// channel/root/generation.
+///
+/// Each opted-in channel receives each brand-new conflict exactly once per
+/// root/generation; a failed or timed-out channel remains retryable without
+/// duplicating channels that already succeeded; and `notify_on_conflict`
+/// disabled means nothing is sent. Delivery state is persisted in the per-root
+/// local DB, so it survives daemon restarts and separates roots.
+async fn notify_conflicts(
+    channel: &str,
+    notifier: &dyn ConflictNotifier,
     config: &AppConfig,
     db_path: &Path,
     sync_dir: &Path,
-    mut session_notified: Option<&mut HashSet<String>>,
+    delivery_timeout: Duration,
 ) {
-    // Check if Telegram is configured
+    if !config.notifications.notify_on_conflict {
+        info!("Conflict notifications disabled; skipping {channel}");
+        return;
+    }
+
+    // Re-open database to get conflicts and delivery state.
+    let local_db = match LocalDb::open(db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("Failed to open database for {channel} notifications: {}", e);
+            return;
+        }
+    };
+
+    let delivered = match local_db.delivered_conflicts(channel) {
+        Ok(set) => set,
+        Err(e) => {
+            warn!("Failed to read {channel} delivery state: {}", e);
+            return;
+        }
+    };
+
+    let conflicts = match local_db.get_conflicts() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Failed to get conflicts for {channel} notification: {}", e);
+            return;
+        }
+    };
+
+    // Only brand-new conflicts (not yet delivered on this channel for this
+    // root/generation) are sent.
+    let new_conflicts: Vec<&Conflict> = conflicts
+        .iter()
+        .filter(|c| !delivered.contains(&(c.path.clone(), conflict_generation(c))))
+        .collect();
+
+    if new_conflicts.is_empty() {
+        return;
+    }
+
+    let sync_dir_str = sync_dir.display().to_string();
+    let attempt = tokio::time::timeout(
+        delivery_timeout,
+        notifier.notify_new_conflicts(&new_conflicts, &sync_dir_str),
+    )
+    .await;
+
+    match attempt {
+        Ok(Ok(())) => {
+            info!(
+                "Sent {channel} notification for {} new conflict(s)",
+                new_conflicts.len()
+            );
+            // Mark only this channel's deliveries, so a failed sibling channel
+            // is never suppressed and retries on the next cycle.
+            for conflict in &new_conflicts {
+                if let Err(e) = local_db.mark_conflict_delivered(
+                    channel,
+                    &conflict.path,
+                    &conflict_generation(conflict),
+                ) {
+                    warn!("Failed to mark {channel} conflict as delivered: {}", e);
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            warn!("Failed to send {channel} notification: {}", e);
+        }
+        Err(_elapsed) => {
+            warn!(
+                "{channel} notification timed out after {}s; sync continues",
+                NOTIFICATION_DELIVERY_TIMEOUT.as_secs()
+            );
+        }
+    }
+}
+
+/// Build a Telegram conflict notifier if Telegram is configured.
+fn telegram_conflict_notifier(config: &AppConfig) -> Option<TelegramNotifier> {
     let (bot_token, chat_id) = match &config.notifications.telegram.credentials {
         Some(creds) if !creds.bot_token.is_empty() && !creds.chat_id.is_empty() => {
             (creds.bot_token.clone(), creds.chat_id.clone())
         }
         _ => {
             info!("Telegram not configured, skipping conflict notifications");
-            return;
+            return None;
         }
     };
-
-    // Re-open database to get conflicts
-    let local_db = match LocalDb::open(db_path) {
-        Ok(db) => db,
-        Err(e) => {
-            warn!("Failed to open database for notifications: {}", e);
-            return;
-        }
-    };
-
-    let notifier = TelegramNotifier::new(bot_token, chat_id);
-    let sync_dir_str = sync_dir.display().to_string();
-
-    // Get all conflicts
-    let conflicts = match local_db.get_conflicts() {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("Failed to get conflicts for notification: {}", e);
-            return;
-        }
-    };
-
-    // Filter to only new conflicts based on mode
-    let new_conflicts: Vec<_> = session_notified.as_ref().map_or_else(
-        || {
-            // One-time sync: only conflicts not marked notified in DB
-            conflicts.iter().filter(|c| !c.is_notified()).collect()
-        },
-        |notified_paths| {
-            // Daemon mode: only conflicts not notified this session
-            conflicts
-                .iter()
-                .filter(|c| !notified_paths.contains(&c.path))
-                .collect()
-        },
-    );
-
-    if new_conflicts.is_empty() {
-        return;
-    }
-
-    // Send notification for all new conflicts at once
-    match notifier
-        .notify_new_conflicts(&new_conflicts, &sync_dir_str)
-        .await
-    {
-        Ok(()) => {
-            info!(
-                "Sent Telegram notification for {} new conflict(s)",
-                new_conflicts.len()
-            );
-            // Mark conflicts as notified
-            for conflict in &new_conflicts {
-                if let Some(ref mut notified) = session_notified {
-                    // Daemon mode: track in session
-                    notified.insert(conflict.path.clone());
-                } else {
-                    // One-time sync: mark in DB
-                    if let Err(e) = local_db.mark_conflict_notified(&conflict.path) {
-                        warn!("Failed to mark conflict as notified: {}", e);
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            warn!("Failed to send Telegram notification: {}", e);
-        }
-    }
+    Some(TelegramNotifier::new(bot_token, chat_id))
 }
 
 fn telegram_error_notifier(config: &AppConfig) -> Option<TelegramNotifier> {
@@ -868,16 +915,8 @@ fn matrix_error_notifier(config: &AppConfig) -> Option<MatrixNotifier> {
     ))
 }
 
-/// Send Matrix notifications for any unnotified conflicts
-/// If `session_notified` is provided, only notify about conflicts not in that set (daemon mode)
-/// If `session_notified` is None, notify about all conflicts not marked as notified in DB (one-time sync)
-async fn notify_conflicts_matrix(
-    config: &AppConfig,
-    db_path: &Path,
-    sync_dir: &Path,
-    mut session_notified: Option<&mut HashSet<String>>,
-) {
-    // Check if Matrix is configured
+/// Build a Matrix conflict notifier if Matrix is configured.
+fn matrix_conflict_notifier(config: &AppConfig) -> Option<MatrixNotifier> {
     let (homeserver_url, access_token, room_id) = match &config.notifications.matrix.credentials {
         Some(c)
             if !c.homeserver_url.is_empty()
@@ -892,20 +931,10 @@ async fn notify_conflicts_matrix(
         }
         _ => {
             info!("Matrix not configured, skipping conflict notifications");
-            return;
+            return None;
         }
     };
-
-    // Re-open database to get conflicts
-    let local_db = match LocalDb::open(db_path) {
-        Ok(db) => db,
-        Err(e) => {
-            warn!("Failed to open database for notifications: {}", e);
-            return;
-        }
-    };
-
-    let notifier = MatrixNotifier::new(
+    Some(MatrixNotifier::new(
         homeserver_url,
         access_token,
         room_id,
@@ -915,64 +944,7 @@ async fn notify_conflicts_matrix(
             .message_type
             .as_str()
             .to_string(),
-    );
-    let sync_dir_str = sync_dir.display().to_string();
-
-    // Get all conflicts
-    let conflicts = match local_db.get_conflicts() {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("Failed to get conflicts for notification: {}", e);
-            return;
-        }
-    };
-
-    // Filter to only new conflicts based on mode
-    let new_conflicts: Vec<_> = session_notified.as_ref().map_or_else(
-        || {
-            // One-time sync: only conflicts not marked notified in DB
-            conflicts.iter().filter(|c| !c.is_notified()).collect()
-        },
-        |notified_paths| {
-            // Daemon mode: only conflicts not notified this session
-            conflicts
-                .iter()
-                .filter(|c| !notified_paths.contains(&c.path))
-                .collect()
-        },
-    );
-
-    if new_conflicts.is_empty() {
-        return;
-    }
-
-    // Send notification for all new conflicts at once
-    match notifier
-        .notify_new_conflicts(&new_conflicts, &sync_dir_str)
-        .await
-    {
-        Ok(()) => {
-            info!(
-                "Sent Matrix notification for {} new conflict(s)",
-                new_conflicts.len()
-            );
-            // Mark conflicts as notified
-            for conflict in &new_conflicts {
-                if let Some(ref mut notified) = session_notified {
-                    // Daemon mode: track in session
-                    notified.insert(conflict.path.clone());
-                } else {
-                    // One-time sync: mark in DB
-                    if let Err(e) = local_db.mark_conflict_notified(&conflict.path) {
-                        warn!("Failed to mark conflict as notified: {}", e);
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            warn!("Failed to send Matrix notification: {}", e);
-        }
-    }
+    ))
 }
 
 async fn notify_sync_error_matrix(
@@ -1096,9 +1068,6 @@ pub async fn daemon(
     println!("Syncing {} path(s): {}", paths.len(), path_list.join(", "));
     println!("Press Ctrl+C to stop");
 
-    // Track which conflicts have been notified during this daemon session
-    let mut session_notified: HashSet<String> = HashSet::new();
-
     let mut interval_timer = tokio::time::interval(tokio::time::Duration::from_secs(interval));
 
     loop {
@@ -1111,7 +1080,7 @@ pub async fn daemon(
                 .remote_path
                 .clone_from(&sync_path.remote);
 
-            match daemon_sync(&sync_path.local, &path_config, &mut session_notified).await {
+            match daemon_sync(&sync_path.local, &path_config).await {
                 Ok(_) => {}
                 Err(e) => {
                     error!("Sync error for {}: {}", sync_path.local.display(), e);
@@ -1133,12 +1102,10 @@ pub async fn daemon(
     }
 }
 
-/// Internal sync function for daemon that uses session-based notification tracking
-async fn daemon_sync(
-    path: &Path,
-    config: &AppConfig,
-    session_notified: &mut HashSet<String>,
-) -> Result<SyncReport> {
+/// Internal sync function for daemon. Conflict delivery state is persisted per
+/// channel/root/generation in the local DB, so the daemon needs no in-memory
+/// session set.
+async fn daemon_sync(path: &Path, config: &AppConfig) -> Result<SyncReport> {
     info!("Running sync in: {}", path.display());
 
     // Load ignore patterns
@@ -1195,10 +1162,31 @@ async fn daemon_sync(
         notify_sync_error_matrix(config, Some(path), &summary).await;
     }
 
-    // Send Telegram notifications for NEW conflicts only (session-based tracking)
+    // Send conflict notifications over each configured channel, tracking
+    // delivery per channel/root/generation.
     if report.conflicts > 0 {
-        notify_conflicts_telegram(config, &db_path, path, Some(session_notified)).await;
-        notify_conflicts_matrix(config, &db_path, path, Some(session_notified)).await;
+        if let Some(notifier) = telegram_conflict_notifier(config) {
+            notify_conflicts(
+                "telegram",
+                &notifier,
+                config,
+                &db_path,
+                path,
+                NOTIFICATION_DELIVERY_TIMEOUT,
+            )
+            .await;
+        }
+        if let Some(notifier) = matrix_conflict_notifier(config) {
+            notify_conflicts(
+                "matrix",
+                &notifier,
+                config,
+                &db_path,
+                path,
+                NOTIFICATION_DELIVERY_TIMEOUT,
+            )
+            .await;
+        }
     }
 
     Ok(report)
@@ -2767,8 +2755,11 @@ fn print_sync_report(report: &SyncReport, dry_run: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{MatrixCredentials, TelegramCredentials};
     use crate::couchdb::db::CannedCouch;
     use crate::models::{DownloadCount, FileDoc, UploadCount};
+    use crate::notify::HttpResponse;
+    use crate::notify::tests::{FakeSender, HangingSender, make_conflict};
     use tempfile::TempDir;
 
     // ── resolve_sync_dir (CLI path resolution) ────────────────────────────
@@ -3954,5 +3945,325 @@ mod tests {
         let mut bounded = AppConfig::default();
         bounded.sync.max_file_size = 4096;
         assert_eq!(size_limit(&bounded), Some(4096));
+    }
+
+    // ── Conflict notification delivery (per channel/root/generation) ──────
+    //
+    // The delivery orchestration is exercised with real notifiers backed by
+    // fake HTTP senders so no network access is needed.
+
+    /// An `AppConfig` with both channels configured; `notify_on_conflict` is
+    /// controlled by the caller.
+    fn delivery_config(notify_on_conflict: bool) -> AppConfig {
+        let mut config = AppConfig::default();
+        config.notifications.notify_on_conflict = notify_on_conflict;
+        config.notifications.telegram.credentials = Some(TelegramCredentials {
+            bot_token: "token".into(),
+            chat_id: "chat".into(),
+        });
+        config.notifications.matrix.credentials = Some(MatrixCredentials {
+            homeserver_url: "https://matrix.example.com".into(),
+            access_token: "tok".into(),
+            room_id: "room".into(),
+        });
+        config
+    }
+
+    /// A Telegram notifier backed by `sender`.
+    fn telegram_notifier(sender: Arc<dyn crate::notify::HttpSender>) -> TelegramNotifier {
+        TelegramNotifier::with_sender("token".into(), "chat".into(), sender)
+    }
+
+    /// A Matrix notifier backed by `sender`.
+    fn matrix_notifier(sender: Arc<dyn crate::notify::HttpSender>) -> MatrixNotifier {
+        MatrixNotifier::with_sender(
+            "https://matrix.example.com".into(),
+            "tok".into(),
+            "room".into(),
+            "m.notice".into(),
+            sender,
+        )
+    }
+
+    /// A success response for a fake HTTP sender.
+    fn ok_response() -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            body: String::new(),
+        }
+    }
+
+    /// Store `conflict` in a fresh per-root DB and return its path.
+    fn db_with_conflict(dir: &TempDir, conflict: &Conflict) -> PathBuf {
+        let db_path = dir.path().join("state.db");
+        let db = LocalDb::open(&db_path).unwrap();
+        db.store_conflict(conflict).unwrap();
+        drop(db);
+        db_path
+    }
+
+    #[tokio::test]
+    async fn both_channels_each_receive_conflict_once() {
+        let config = delivery_config(true);
+        let dir = TempDir::new().unwrap();
+        let db_path = db_with_conflict(&dir, &make_conflict("/a.txt", "2-abc"));
+
+        let tg_sender = Arc::new(FakeSender::new(vec![Ok(ok_response())]));
+        let mx_sender = Arc::new(FakeSender::new(vec![Ok(ok_response())]));
+        let tg = telegram_notifier(tg_sender.clone());
+        let mx = matrix_notifier(mx_sender.clone());
+
+        notify_conflicts(
+            "telegram",
+            &tg,
+            &config,
+            &db_path,
+            dir.path(),
+            Duration::from_secs(1),
+        )
+        .await;
+        notify_conflicts(
+            "matrix",
+            &mx,
+            &config,
+            &db_path,
+            dir.path(),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        // Each channel is delivered independently: Telegram marking the
+        // conflict must not suppress Matrix.
+        assert_eq!(tg_sender.call_count("/bot"), 1);
+        assert_eq!(mx_sender.call_count("/_matrix"), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_channel_retries_without_duplicating_successful_channel() {
+        let config = delivery_config(true);
+        let dir = TempDir::new().unwrap();
+        let db_path = db_with_conflict(&dir, &make_conflict("/a.txt", "2-abc"));
+
+        // Telegram succeeds; Matrix fails on its first attempt.
+        let tg_sender = Arc::new(FakeSender::new(vec![Ok(ok_response())]));
+        let mx_sender = Arc::new(FakeSender::new(vec![
+            Err(anyhow::anyhow!("matrix unavailable")),
+            Ok(ok_response()),
+        ]));
+        let tg = telegram_notifier(tg_sender.clone());
+        let mx = matrix_notifier(mx_sender.clone());
+
+        // First pass: Telegram delivered, Matrix fails (stays retryable).
+        notify_conflicts(
+            "telegram",
+            &tg,
+            &config,
+            &db_path,
+            dir.path(),
+            Duration::from_secs(1),
+        )
+        .await;
+        notify_conflicts(
+            "matrix",
+            &mx,
+            &config,
+            &db_path,
+            dir.path(),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        // Second pass: Telegram already delivered (no duplicate); Matrix
+        // retries and now succeeds.
+        notify_conflicts(
+            "telegram",
+            &tg,
+            &config,
+            &db_path,
+            dir.path(),
+            Duration::from_secs(1),
+        )
+        .await;
+        notify_conflicts(
+            "matrix",
+            &mx,
+            &config,
+            &db_path,
+            dir.path(),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(
+            tg_sender.call_count("/bot"),
+            1,
+            "successful channel must not duplicate"
+        );
+        assert_eq!(
+            mx_sender.call_count("/_matrix"),
+            2,
+            "failed channel must retry without affecting the successful one"
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_relative_path_in_two_roots_delivered_per_root() {
+        let config = delivery_config(true);
+        // Two independent roots, each holding a conflict at the same relative
+        // path. Each root has its own local DB, so both are delivered.
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let db_a = db_with_conflict(&dir_a, &make_conflict("/same.txt", "2-abc"));
+        let db_b = db_with_conflict(&dir_b, &make_conflict("/same.txt", "2-abc"));
+
+        let tg_sender = Arc::new(FakeSender::new(vec![Ok(ok_response()), Ok(ok_response())]));
+        let tg = telegram_notifier(tg_sender.clone());
+
+        notify_conflicts(
+            "telegram",
+            &tg,
+            &config,
+            &db_a,
+            dir_a.path(),
+            Duration::from_secs(1),
+        )
+        .await;
+        notify_conflicts(
+            "telegram",
+            &tg,
+            &config,
+            &db_b,
+            dir_b.path(),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(
+            tg_sender.call_count("/bot"),
+            2,
+            "identical relative path must be delivered once per root"
+        );
+    }
+
+    #[tokio::test]
+    async fn recurrent_conflict_new_generation_is_notified_again() {
+        let config = delivery_config(true);
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.db");
+
+        let tg_sender = Arc::new(FakeSender::new(vec![Ok(ok_response()), Ok(ok_response())]));
+        let tg = telegram_notifier(tg_sender.clone());
+
+        // First conflict at generation 2.
+        {
+            let db = LocalDb::open(&db_path).unwrap();
+            db.store_conflict(&make_conflict("/a.txt", "2-abc"))
+                .unwrap();
+        }
+        notify_conflicts(
+            "telegram",
+            &tg,
+            &config,
+            &db_path,
+            dir.path(),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(tg_sender.call_count("/bot"), 1);
+
+        // Re-detecting the same conflict (same generation) must not re-notify.
+        notify_conflicts(
+            "telegram",
+            &tg,
+            &config,
+            &db_path,
+            dir.path(),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(tg_sender.call_count("/bot"), 1);
+
+        // A recurrent conflict at the same path with a new generation is a
+        // brand-new conflict and is delivered again.
+        {
+            let db = LocalDb::open(&db_path).unwrap();
+            db.store_conflict(&make_conflict("/a.txt", "3-def"))
+                .unwrap();
+        }
+        notify_conflicts(
+            "telegram",
+            &tg,
+            &config,
+            &db_path,
+            dir.path(),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(
+            tg_sender.call_count("/bot"),
+            2,
+            "new generation at the same path must be notified again"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_conflict_notifications_send_none() {
+        let config = delivery_config(false);
+        let dir = TempDir::new().unwrap();
+        let db_path = db_with_conflict(&dir, &make_conflict("/a.txt", "2-abc"));
+
+        let tg_sender = Arc::new(FakeSender::new(vec![Ok(ok_response())]));
+        let tg = telegram_notifier(tg_sender.clone());
+
+        notify_conflicts(
+            "telegram",
+            &tg,
+            &config,
+            &db_path,
+            dir.path(),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(
+            tg_sender.call_count("/bot"),
+            0,
+            "notify_on_conflict=false must send no conflict notifications"
+        );
+    }
+
+    #[tokio::test]
+    async fn hung_notifier_times_out_and_sync_continues() {
+        let config = delivery_config(true);
+        let dir = TempDir::new().unwrap();
+        let db_path = db_with_conflict(&dir, &make_conflict("/a.txt", "2-abc"));
+
+        // A notifier whose HTTP transport never responds must not block sync:
+        // the delivery is bounded by the timeout and left retryable.
+        let hanging = Arc::new(HangingSender);
+        let tg = telegram_notifier(hanging);
+
+        let start = Instant::now();
+        notify_conflicts(
+            "telegram",
+            &tg,
+            &config,
+            &db_path,
+            dir.path(),
+            Duration::from_millis(200),
+        )
+        .await;
+
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "hung notifier must time out rather than block sync"
+        );
+
+        // Nothing was marked delivered, so it remains retryable next cycle.
+        let db = LocalDb::open(&db_path).unwrap();
+        assert!(
+            db.delivered_conflicts("telegram").unwrap().is_empty(),
+            "timed-out delivery must stay retryable"
+        );
     }
 }
