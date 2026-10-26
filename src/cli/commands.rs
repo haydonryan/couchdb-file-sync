@@ -558,8 +558,14 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
     // Run sync (dry-run walks the pipeline without writing)
     let retention = (config.sync.tombstone_retention_secs > 0)
         .then(|| std::time::Duration::from_secs(config.sync.tombstone_retention_secs));
+    let orphan_grace = (config.sync.orphan_chunk_grace_secs > 0)
+        .then(|| std::time::Duration::from_secs(config.sync.orphan_chunk_grace_secs));
     let mut engine = SyncEngine::with_ignore(couchdb, local_db, root, ignore_matcher)
-        .with_tombstone_retention(retention);
+        .with_tombstone_retention(retention)
+        .with_orphan_chunk_collection(
+            orphan_grace,
+            u64::try_from(config.sync.batch_size).unwrap_or(1000),
+        );
     let report = if dry_run {
         engine.sync_dry_run().await?
     } else {
@@ -1129,8 +1135,14 @@ async fn daemon_sync(
     // Run sync
     let retention = (config.sync.tombstone_retention_secs > 0)
         .then(|| std::time::Duration::from_secs(config.sync.tombstone_retention_secs));
+    let orphan_grace = (config.sync.orphan_chunk_grace_secs > 0)
+        .then(|| std::time::Duration::from_secs(config.sync.orphan_chunk_grace_secs));
     let mut engine = SyncEngine::with_ignore(couchdb, local_db, root, ignore_matcher)
-        .with_tombstone_retention(retention);
+        .with_tombstone_retention(retention)
+        .with_orphan_chunk_collection(
+            orphan_grace,
+            u64::try_from(config.sync.batch_size).unwrap_or(1000),
+        );
     let report = engine.sync().await?;
 
     print_sync_report(&report, false);
@@ -1614,6 +1626,11 @@ async fn build_live_sync_engine(
         .with_tombstone_retention(
             (config.sync.tombstone_retention_secs > 0)
                 .then(|| std::time::Duration::from_secs(config.sync.tombstone_retention_secs)),
+        )
+        .with_orphan_chunk_collection(
+            (config.sync.orphan_chunk_grace_secs > 0)
+                .then(|| std::time::Duration::from_secs(config.sync.orphan_chunk_grace_secs)),
+            u64::try_from(config.sync.batch_size).unwrap_or(1000),
         );
 
     Ok((ignore_matcher, engine))

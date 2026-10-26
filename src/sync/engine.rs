@@ -31,6 +31,14 @@ pub struct SyncEngine {
     /// Optional retention window for soft-delete tombstones. When set, each
     /// non-dry-run sync cycle prunes tombstones older than this window.
     tombstone_retention: Option<std::time::Duration>,
+    /// Optional in-flight publication grace period for orphan chunk
+    /// collection. When set, each non-dry-run sync cycle reclaims unreferenced
+    /// chunks older than this grace window.
+    orphan_chunk_grace: Option<std::time::Duration>,
+    /// Per-cycle bound on the number of orphan chunks collected. Unreferenced
+    /// chunks beyond this limit are deferred to a later cycle so collection
+    /// stays bounded and resumable.
+    orphan_chunk_batch: u64,
 }
 
 /// Report from a sync operation
@@ -707,6 +715,8 @@ impl SyncEngine {
             root_dir,
             ignore_matcher,
             tombstone_retention: None,
+            orphan_chunk_grace: None,
+            orphan_chunk_batch: 0,
         }
     }
 
@@ -725,6 +735,8 @@ impl SyncEngine {
             root_dir,
             ignore_matcher,
             tombstone_retention: None,
+            orphan_chunk_grace: None,
+            orphan_chunk_batch: 0,
         }
     }
 
@@ -737,6 +749,48 @@ impl SyncEngine {
     ) -> Self {
         self.tombstone_retention = retention;
         self
+    }
+
+    /// Enable orphan chunk collection with an in-flight publication grace
+    /// period. When `grace` is `Some`, each non-dry-run sync cycle reclaims
+    /// unreferenced chunks older than `grace`, deferring younger ones so a
+    /// concurrent in-flight publication is never collected. `batch` bounds the
+    /// number of orphans collected per cycle (unreferenced chunks beyond it
+    /// are deferred to a later cycle). Pass `None` (or omit) to disable
+    /// collection.
+    #[must_use]
+    pub const fn with_orphan_chunk_collection(
+        mut self,
+        grace: Option<std::time::Duration>,
+        batch: u64,
+    ) -> Self {
+        self.orphan_chunk_grace = grace;
+        self.orphan_chunk_batch = batch;
+        self
+    }
+
+    /// Best-effort orphan chunk collection. Runs after uploads/downloads (so
+    /// this cycle's publications are committed) and after tombstone pruning.
+    /// Reclaims unreferenced chunks older than the in-flight grace window; a
+    /// failure is logged, never fatal to the sync.
+    async fn collect_orphans(&self) {
+        let Some(grace) = self.orphan_chunk_grace else {
+            return;
+        };
+        match self
+            .couchdb
+            .collect_orphan_chunks(self.orphan_chunk_batch, grace)
+            .await
+        {
+            Ok(result) if result.collected > 0 => {
+                info!(
+                    "Collected {} orphan chunk(s) ({} scanned, {} deferred)",
+                    result.collected, result.scanned, result.deferred
+                );
+            }
+            Ok(_) => {}
+            Err(e) => warn!("Orphan chunk collection failed: {e}"),
+        }
     }
 
     /// Cheap handle to the per-file apply state used by the bounded-concurrency
@@ -890,6 +944,15 @@ impl SyncEngine {
                 Ok(_) => {}
                 Err(e) => warn!("Tombstone pruning failed: {e}"),
             }
+        }
+
+        // 9. Collect orphan chunks (skipped in dry-run). Pruning a tombstone
+        //    hard-deletes only the metadata, orphaning the chunks it referenced,
+        //    and a failed metadata publication leaves freshly-uploaded chunks
+        //    unreferenced. Reclaim those unreferenced chunks without touching
+        //    live, shared, recoverable, or in-flight content.
+        if !dry_run {
+            self.collect_orphans().await;
         }
 
         if dry_run {
@@ -3148,6 +3211,48 @@ mod tests {
         assert_eq!(rev, Some("1-abc".to_string()));
         // chunk upload + save + old-chunk cleanup all ran.
         assert_eq!(engine.couchdb.test_write_calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn sync_runs_orphan_collection_when_enabled_and_skips_when_disabled() {
+        // An empty cycle with orphan collection disabled must not invoke the
+        // collector, and enabling it must invoke it once per non-dry-run cycle
+        // without failing the sync (reachable content is never at risk because
+        // the collector only touches unreferenced chunks).
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+
+        // Disabled (default): the collector is not invoked.
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", CannedCouch::default()),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+        let report = engine.sync().await.expect("sync with collection disabled");
+        assert!(report.errors.is_empty());
+        assert_eq!(
+            engine.couchdb.test_write_calls(),
+            0,
+            "orphan collection is disabled by default"
+        );
+
+        // Enabled: the collector runs each non-dry-run cycle without breaking
+        // the sync.
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", CannedCouch::default()),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        )
+        .with_orphan_chunk_collection(Some(std::time::Duration::from_mins(5)), 100);
+        let report = engine.sync().await.expect("sync with collection enabled");
+        assert!(report.errors.is_empty());
+        assert_eq!(
+            engine.couchdb.test_write_calls(),
+            1,
+            "orphan collection runs once when enabled"
+        );
     }
 
     #[tokio::test]

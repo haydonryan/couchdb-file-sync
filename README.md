@@ -185,6 +185,11 @@ sync:
   # Soft-delete tombstones older than this many seconds are pruned so
   # get_all_files/get_changes do not grow unbounded. 0 disables pruning.
   tombstone_retention_secs: 604800
+  # Grace period (seconds) protecting in-flight chunk publication during
+  # orphan collection. Each cycle reclaims unreferenced chunks left by failed
+  # uploads and pruned tombstones, deferring any chunk younger than this window
+  # in case a concurrent client is mid-publication. 0 disables collection.
+  orphan_chunk_grace_secs: 300
 
 notifications:
   telegram:

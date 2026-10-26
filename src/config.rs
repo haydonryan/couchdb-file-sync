@@ -292,6 +292,14 @@ pub struct SyncConfig {
     /// `get_all_files`/`get_changes` do not grow unbounded. `0` disables pruning.
     #[serde(default = "default_tombstone_retention_secs")]
     pub tombstone_retention_secs: u64,
+    /// Grace period (seconds) protecting in-flight chunk publication during
+    /// orphan collection. Each sync cycle reclaims unreferenced chunks left by
+    /// failed uploads and pruned tombstones, but an unreferenced chunk younger
+    /// than this window is left in place in case another client is mid-way
+    /// between writing the chunk and publishing the metadata that references
+    /// it. `0` disables orphan collection.
+    #[serde(default = "default_orphan_chunk_grace_secs")]
+    pub orphan_chunk_grace_secs: u64,
 }
 
 impl Default for SyncConfig {
@@ -306,6 +314,7 @@ impl Default for SyncConfig {
             parallel: default_parallel(),
             max_parallel: default_max_parallel(),
             tombstone_retention_secs: default_tombstone_retention_secs(),
+            orphan_chunk_grace_secs: default_orphan_chunk_grace_secs(),
         }
     }
 }
@@ -416,6 +425,13 @@ const fn default_max_parallel() -> usize {
 /// Default soft-delete tombstone retention: 7 days.
 const fn default_tombstone_retention_secs() -> u64 {
     7 * 24 * 60 * 60
+}
+
+/// Default in-flight publication grace period for orphan chunk collection:
+/// 5 minutes. An unreferenced chunk younger than this is assumed to be
+/// mid-publication by a concurrent client and is left for a later cycle.
+const fn default_orphan_chunk_grace_secs() -> u64 {
+    5 * 60
 }
 
 #[cfg(test)]
@@ -653,6 +669,8 @@ mod tests {
         assert_eq!(sync.max_file_size, 1024 * 1024 * 1024);
         assert!(sync.parallel);
         assert_eq!(sync.max_parallel, 4);
+        assert_eq!(sync.tombstone_retention_secs, 7 * 24 * 60 * 60);
+        assert_eq!(sync.orphan_chunk_grace_secs, 5 * 60);
     }
 
     #[test]

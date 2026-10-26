@@ -53,6 +53,19 @@ fn is_system_doc_id(id: &str) -> bool {
     id.starts_with("_design/") || id.starts_with("_local/")
 }
 
+/// Result of one orphan-chunk collection pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChunkCollectionResult {
+    /// Total chunk documents examined during the pass.
+    pub scanned: usize,
+    /// Unreachable chunks hard-deleted during the pass.
+    pub collected: usize,
+    /// Unreachable chunks left in place (still within the in-flight grace
+    /// period, missing a revision, deferred to respect the per-pass bound, or
+    /// whose delete failed).
+    pub deferred: usize,
+}
+
 /// Transport headroom (ms) reserved between the long-poll server wait and the
 /// request client timeout.
 ///
@@ -1126,6 +1139,7 @@ impl CouchDb {
             rev: None,
             data: content,
             doc_type: crate::models::DocType::Leaf,
+            created_at: crate::models::TimestampMillis::now(),
         };
 
         self.save_chunk(&chunk).await?;
@@ -1234,6 +1248,140 @@ impl CouchDb {
             }
         }
         Ok(pruned)
+    }
+
+    /// Ensure a Mango index on the `type` field exists so chunk enumeration
+    /// via `_find` is available. `Idempotent`: `CouchDB` returns success with
+    /// `result: "exists"` when the index is already present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `_index` request fails.
+    async fn ensure_chunk_type_index(&self) -> Result<()> {
+        let fields = couch_rs::types::index::IndexFields::new(vec![
+            couch_rs::types::find::SortSpec::Simple("type".to_string()),
+        ]);
+        self.db
+            .insert_index("chunk-type-index", fields, None, None)
+            .await?;
+        Ok(())
+    }
+
+    /// Collect orphan (unreachable) chunk documents, reclaiming content left
+    /// behind by failed metadata publications and pruned tombstones.
+    ///
+    /// A chunk is an orphan when its id is not referenced by any file document
+    /// (live file *or* not-yet-pruned tombstone). Two failure modes produce
+    /// such orphans:
+    ///
+    /// - A failed publication: `upload_file_content` saves new chunks *before*
+    ///   `save_file` publishes the metadata, so a failed/failed-to-commit save
+    ///   leaves the freshly uploaded chunks with no referencing document.
+    /// - Tombstone pruning: `prune_tombstones` hard-deletes obsolete delete
+    ///   tombstones (metadata only), orphaning the chunks they referenced.
+    ///
+    /// Collection is **bounded**: at most `batch_size` orphans are hard-deleted
+    /// per pass; any remainder is left in place for a later pass. It is
+    /// **resumable**: unreferenced chunks persist until collected, so an
+    /// interrupted pass continues on the next cycle. To protect a concurrent
+    /// in-flight publication — a chunk just uploaded by another client whose
+    /// metadata save has not landed yet — an unreferenced chunk younger than
+    /// `grace` is deferred rather than collected. Every delete targets the
+    /// specific revision observed during enumeration, so a chunk that changed
+    /// (or became referenced) since is never removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index setup, file-document fetch, or chunk
+    /// enumeration fails. Individual delete failures are logged and counted as
+    /// deferred rather than aborting the pass.
+    pub async fn collect_orphan_chunks(
+        &self,
+        batch_size: u64,
+        grace: Duration,
+    ) -> Result<ChunkCollectionResult> {
+        #[cfg(test)]
+        if self.test_state.is_some() {
+            self.test_write_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Ok(ChunkCollectionResult::default());
+        }
+
+        self.ensure_chunk_type_index().await?;
+
+        let batch = usize::try_from(batch_size.max(1)).unwrap_or(1000);
+
+        let now_ms = crate::models::TimestampMillis::now().as_u64();
+        let grace_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX);
+        // Only collect chunks created strictly before the grace window opens.
+        // created_at == 0 (older/externally-created chunks) is treated as old:
+        // its age is unknown but it is unreferenced, and deferring it forever
+        // would never reclaim pre-existing orphans.
+        let cutoff = now_ms.saturating_sub(grace_ms);
+
+        // Referenced chunk ids from every file document (live files and
+        // not-yet-pruned tombstones). Chunks referenced by a surviving
+        // tombstone are "recoverable" and must survive.
+        let all_files = self.get_all_files().await?;
+        let referenced: HashSet<&str> = all_files
+            .iter()
+            .flat_map(|d| d.children.iter().map(String::as_str))
+            .collect();
+
+        let mut result = ChunkCollectionResult::default();
+        let mut bookmark: Option<String> = None;
+        loop {
+            let mut query =
+                couch_rs::types::find::FindQuery::new(serde_json::json!({ "type": "leaf" }))
+                    .fields(vec![
+                        "_id".to_string(),
+                        "_rev".to_string(),
+                        "created_at".to_string(),
+                    ])
+                    .limit(u64::try_from(batch).unwrap_or(1000))
+                    .stable(true);
+            if let Some(b) = &bookmark {
+                query = query.bookmark(b);
+            }
+            let collection = self.db.find::<ChunkDoc>(&query).await?;
+
+            for chunk in &collection.rows {
+                result.scanned += 1;
+                if referenced.contains(chunk.id.as_str()) {
+                    continue;
+                }
+                let created = chunk.created_at.as_u64();
+                if created != 0 && created > cutoff {
+                    // Still inside the in-flight publication grace window.
+                    result.deferred += 1;
+                    continue;
+                }
+                if result.collected >= batch {
+                    // Per-pass bound reached; leave the rest for a later pass.
+                    result.deferred += 1;
+                    continue;
+                }
+                let Some(rev) = chunk.rev.as_deref() else {
+                    warn!("Skipping orphan chunk {} without a revision", chunk.id);
+                    result.deferred += 1;
+                    continue;
+                };
+                match self.delete_doc(&chunk.id, rev).await {
+                    Ok(()) => result.collected += 1,
+                    Err(e) => {
+                        warn!("Failed to collect orphan chunk {}: {e}", chunk.id);
+                        result.deferred += 1;
+                    }
+                }
+            }
+
+            match collection.bookmark {
+                Some(next) if next != bookmark.as_deref().unwrap_or("") => bookmark = Some(next),
+                _ => break,
+            }
+        }
+
+        Ok(result)
     }
 }
 
@@ -3348,6 +3496,255 @@ mod tests {
         assert_eq!(
             round_tripped, original,
             "non-UTF-8 bytes must round-trip byte-identical through upload+download"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Orphan chunk collection (story 6352)
+    // -----------------------------------------------------------------------
+
+    /// Build a well-formed `plain` `FileDoc` row body for the `_all_docs`
+    /// response used by `get_all_files`. A `deleted: true` doc models a
+    /// soft-delete tombstone whose chunks are still recoverable.
+    fn orphan_file_row(id: &str, children: &[&str], deleted: bool, mtime_ms: u64) -> String {
+        let children_json = serde_json::to_string(children).expect("children json");
+        format!(
+            r#"{{"id":"{id}","key":null,"value":{{"rev":"1-{id}-rev"}},"doc":{{"_id":"{id}","_rev":"1-{id}-rev","path":"{id}","children":{children_json},"ctime":0,"mtime":{mtime_ms},"size":1,"type":"plain","deleted":{deleted},"deleted_at":{mtime_ms},"hash":""}}}}"#
+        )
+    }
+
+    /// Build a chunk document projection (`id`, `rev`, `created_at`) as served
+    /// by `_find`.
+    fn orphan_chunk_json(id: &str, rev: &str, created_at_ms: u64) -> String {
+        format!(r#"{{"_id":"{id}","_rev":"{rev}","created_at":{created_at_ms}}}"#)
+    }
+
+    /// Spawn a fake `CouchDB` server that serves the given file rows on
+    /// `POST /_all_docs`, the given chunk docs on `POST /_find`, answers
+    /// `POST /_index` with success (Mango index creation), and counts
+    /// `DELETE` requests (orphan collection). Returns the base database URL,
+    /// a delete counter, the server thread handle, and a shutdown flag.
+    #[allow(clippy::type_complexity)]
+    fn spawn_orphan_collection_couch(
+        file_rows: &[String],
+        chunk_docs: &[String],
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind orphan collection couch");
+        let addr = listener.local_addr().expect("orphan collection couch addr");
+        let base_db_url = format!("http://{addr}/test_db");
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delete_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shutdown_thread = shutdown.clone();
+        let delete_count_thread = delete_count.clone();
+        let rows_json = std::sync::Arc::new(file_rows.join(","));
+        let chunks_json = std::sync::Arc::new(chunk_docs.join(","));
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("orphan collection fake couch runtime");
+            runtime.block_on(async move {
+                listener
+                    .set_nonblocking(true)
+                    .expect("set orphan collection fake couch nonblocking");
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .expect("orphan collection tokio listener");
+                loop {
+                    if shutdown_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    match tokio::time::timeout(Duration::from_millis(10), listener.accept()).await {
+                        Ok(Ok((stream, _))) => {
+                            let delete_count_thread = delete_count_thread.clone();
+                            let rows_json = rows_json.clone();
+                            let chunks_json = chunks_json.clone();
+                            let service = hyper::service::service_fn(move |req| {
+                                let delete_count_thread = delete_count_thread.clone();
+                                let rows_json = rows_json.clone();
+                                let chunks_json = chunks_json.clone();
+                                async move {
+                                    handle_orphan_collection_couch_req(
+                                        req,
+                                        rows_json,
+                                        chunks_json,
+                                        delete_count_thread,
+                                    )
+                                    .await
+                                }
+                            });
+                            tokio::spawn(async move {
+                                let io = hyper_util::rt::TokioIo::new(stream);
+                                let _ = hyper::server::conn::http1::Builder::new()
+                                    .serve_connection(io, service)
+                                    .await;
+                            });
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_elapsed) => {}
+                    }
+                }
+            });
+        });
+        (base_db_url, delete_count, handle, shutdown)
+    }
+
+    /// Serve the endpoints used by `collect_orphan_chunks`: `_index`
+    /// (index creation), `_find` (chunk enumeration), `_all_docs` (file
+    /// documents for the referenced set) and `DELETE` (orphan hard-delete).
+    #[allow(clippy::unused_async)]
+    async fn handle_orphan_collection_couch_req(
+        req: hyper::Request<hyper::body::Incoming>,
+        rows_json: std::sync::Arc<String>,
+        chunks_json: std::sync::Arc<String>,
+        delete_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Result<hyper::Response<http_body_util::Full<hyper::body::Bytes>>, hyper::Error> {
+        let (parts, _body) = req.into_parts();
+        let mut response =
+            hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::new()));
+        let last_segment = parts
+            .uri
+            .path()
+            .split('/')
+            .next_back()
+            .unwrap_or("")
+            .to_string();
+        match (parts.method.as_str(), last_segment.as_str()) {
+            ("POST", "_index") => {
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from_static(
+                    br#"{"ok":true,"result":"created"}"#,
+                ));
+            }
+            ("POST", "_find") => {
+                let body = format!(
+                    r#"{{"docs":[{chunks}],"bookmark":"nil"}}"#,
+                    chunks = chunks_json.as_str()
+                );
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(body));
+            }
+            ("POST", "_all_docs") => {
+                let body = format!(
+                    r#"{{"total_rows":0,"offset":0,"rows":[{rows}]}}"#,
+                    rows = rows_json.as_str()
+                );
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(body));
+            }
+            ("DELETE", _) => {
+                delete_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                *response.body_mut() =
+                    http_body_util::Full::new(hyper::body::Bytes::from_static(br#"{"ok":true}"#));
+            }
+            _ => {
+                *response.status_mut() = hyper::StatusCode::NOT_FOUND;
+            }
+        }
+        Ok(response)
+    }
+
+    #[tokio::test]
+    async fn collect_orphan_chunks_reclaims_unreferenced_but_keeps_live_shared_and_recoverable() {
+        // Live file references h:live1; a surviving tombstone (recoverable
+        // until pruned) references h:rec1. h:orphan1/h:orphan2 are unreferenced
+        // orphans left by a failed publication or pruned tombstone.
+        let (base_db_url, delete_count, server, shutdown) = spawn_orphan_collection_couch(
+            &[
+                orphan_file_row("notes/a.md", &["h:live1"], false, 1000),
+                orphan_file_row("notes/b.md", &["h:rec1"], true, 1000),
+            ],
+            &[
+                orphan_chunk_json("h:live1", "1-a", 1000),
+                orphan_chunk_json("h:rec1", "1-b", 1000),
+                orphan_chunk_json("h:orphan1", "1-c", 1000),
+                orphan_chunk_json("h:orphan2", "1-d", 1000),
+            ],
+        );
+        let db = couchdb_at_ephemeral(&base_db_url);
+
+        let result = db
+            .collect_orphan_chunks(100, Duration::ZERO)
+            .await
+            .expect("collect orphan chunks");
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake couch server join");
+
+        assert_eq!(result.scanned, 4, "all chunk docs should be examined");
+        assert_eq!(
+            result.collected, 2,
+            "only the two unreferenced chunks should be reclaimed"
+        );
+        assert_eq!(result.deferred, 0, "nothing should be deferred here");
+        assert_eq!(
+            delete_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly the two orphan chunks should be hard-deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_orphan_chunks_defers_chunks_within_in_flight_grace_period() {
+        // h:fresh is unreferenced but was created just now: a concurrent client
+        // may still be mid-publication, so it must be deferred, not collected.
+        let now_ms = crate::models::TimestampMillis::now().as_u64();
+        let (base_db_url, delete_count, server, shutdown) =
+            spawn_orphan_collection_couch(&[], &[orphan_chunk_json("h:fresh", "1-e", now_ms)]);
+        let db = couchdb_at_ephemeral(&base_db_url);
+
+        let result = db
+            .collect_orphan_chunks(100, std::time::Duration::from_hours(1))
+            .await
+            .expect("collect orphan chunks");
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake couch server join");
+
+        assert_eq!(result.collected, 0, "in-flight chunk must not be collected");
+        assert_eq!(result.deferred, 1, "in-flight chunk should be deferred");
+        assert_eq!(
+            delete_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no chunk should be hard-deleted while in the grace window"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_orphan_chunks_is_bounded_per_pass() {
+        // Two orphans but a batch bound of 1: only one is collected this pass,
+        // the other is deferred and reclaimed on a later (resumable) pass.
+        let (base_db_url, delete_count, server, shutdown) = spawn_orphan_collection_couch(
+            &[],
+            &[
+                orphan_chunk_json("h:orphan1", "1-f", 1000),
+                orphan_chunk_json("h:orphan2", "1-g", 1000),
+            ],
+        );
+        let db = couchdb_at_ephemeral(&base_db_url);
+
+        let result = db
+            .collect_orphan_chunks(1, Duration::ZERO)
+            .await
+            .expect("collect orphan chunks");
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake couch server join");
+
+        assert_eq!(
+            result.collected, 1,
+            "collection must respect the per-pass bound"
+        );
+        assert_eq!(
+            result.deferred, 1,
+            "the remaining orphan is deferred for a later pass"
+        );
+        assert_eq!(
+            delete_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one orphan should be hard-deleted this pass"
         );
     }
 }
