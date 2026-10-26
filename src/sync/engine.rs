@@ -3709,6 +3709,7 @@ mod tests {
             rev: Some("1-ccc".to_string()),
             data: b"aaaaa".to_vec(),
             doc_type: DocType::Leaf,
+            created_at: TimestampMillis::new(1000),
         };
         seed.insert(
             shared_chunk_id.to_string(),
