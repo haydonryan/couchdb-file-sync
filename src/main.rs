@@ -316,6 +316,11 @@ fn run_init(
 async fn run_sync(path: Option<PathBuf>, dry_run: bool, config: &AppConfig) -> Result<()> {
     let paths = resolve_paths_or_bail(path, config)?;
     cli::validate_unique_mappings(&paths)?;
+    // Every root is processed and reported before the aggregate outcome is
+    // decided, so a failure on one path never short-circuits the remaining
+    // roots. After all roots report, a partial failure yields a nonzero exit
+    // with a clear summary (the per-path report above already lists each error).
+    let mut failed = false;
     for sync_path in paths {
         let mut path_config = config.clone();
         path_config.couchdb.remote_path = sync_path.remote;
@@ -324,7 +329,15 @@ async fn run_sync(path: Option<PathBuf>, dry_run: bool, config: &AppConfig) -> R
             sync_path.local.display(),
             path_config.couchdb.remote_path
         );
-        cli::sync(sync_path.local, path_config, dry_run).await?;
+        let report = cli::sync(sync_path.local, path_config, dry_run).await?;
+        if !dry_run && !report.errors.is_empty() {
+            failed = true;
+        }
+    }
+    if failed {
+        anyhow::bail!(
+            "Sync finished with errors on one or more paths; see the per-path reports above"
+        );
     }
     Ok(())
 }
