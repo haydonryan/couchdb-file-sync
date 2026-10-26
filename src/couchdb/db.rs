@@ -244,6 +244,66 @@ fn seq_to_string(value: &Value) -> String {
     }
 }
 
+/// Classifies a transport/HTTP failure for the shared bounded retry policy.
+///
+/// Transient failures — connection errors, timeouts, and `CouchDB` 429/5xx
+/// responses — are retried up to `retry_attempts`; permanent errors (auth,
+/// schema, conflict, parse failures) fail immediately. Classification is driven
+/// by structured status codes and typed errors rather than by parsing `Display`
+/// strings, so a filename or error body that merely contains a status number
+/// (e.g. `notes/404.md` next to a connection error) is never misread as that
+/// HTTP status.
+trait RetryClassify {
+    fn is_transient(&self) -> bool;
+}
+
+impl RetryClassify for couch_rs::error::CouchError {
+    fn is_transient(&self) -> bool {
+        // `couch_rs` maps transport failures (timeouts, refused/reset
+        // connections) onto a synthetic 501 with no real HTTP response, so any
+        // 5xx (including 500 and 501) or 429 is retried.
+        self.status().is_some_and(|status| {
+            status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        })
+    }
+}
+
+impl RetryClassify for reqwest::Error {
+    fn is_transient(&self) -> bool {
+        // Timeouts and connection-level failures are transport errors.
+        if self.is_timeout() || self.is_connect() {
+            return true;
+        }
+        self.status().is_some_and(|status| {
+            status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        })
+    }
+}
+
+impl RetryClassify for anyhow::Error {
+    fn is_transient(&self) -> bool {
+        // Walk the source chain looking for a classified error. `couch_rs` and
+        // reqwest errors are stored (not stringified) inside `anyhow::Error`,
+        // so this recovers the structured status/transport kind even after the
+        // error has been converted into the crate-wide `anyhow` error type.
+        let mut cursor: Option<&(dyn std::error::Error + 'static)> = Some(self.as_ref());
+        while let Some(err) = cursor {
+            if let Some(req) = err.downcast_ref::<reqwest::Error>()
+                && req.is_transient()
+            {
+                return true;
+            }
+            if let Some(couch) = err.downcast_ref::<couch_rs::error::CouchError>()
+                && couch.is_transient()
+            {
+                return true;
+            }
+            cursor = err.source();
+        }
+        false
+    }
+}
+
 impl CouchDb {
     /// Create a new `CouchDB` client.
     ///
@@ -657,13 +717,13 @@ impl CouchDb {
     ///
     /// The operation is attempted at most [`Self::retry_attempts`] times in
     /// total (the initial attempt plus retries; never fewer than one). Only
-    /// failures classified as transient by [`Self::is_transient`] are retried;
+    /// failures classified as transient by [`RetryClassify`] are retried;
     /// persistent errors are returned immediately.
     async fn retry_transient<F, Fut, T, E>(&self, op: F) -> std::result::Result<T, E>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = std::result::Result<T, E>>,
-        E: std::fmt::Display,
+        E: RetryClassify + std::fmt::Display,
     {
         let mut attempts: u32 = 0;
         let total = self.retry_attempts.max(1);
@@ -671,7 +731,7 @@ impl CouchDb {
         loop {
             match op().await {
                 Ok(value) => return Ok(value),
-                Err(e) if Self::is_transient(&e) && attempts + 1 < total => {
+                Err(e) if e.is_transient() && attempts + 1 < total => {
                     attempts += 1;
                     let backoff = self.backoff(attempts);
                     warn!(
@@ -699,31 +759,6 @@ impl CouchDb {
             let shift = if attempts >= 7 { 6 } else { attempts - 1 };
             Duration::from_millis(RETRY_BASE_BACKOFF_MS.saturating_mul(1u64 << shift))
         }
-    }
-
-    /// Whether `err` represents a transient connectivity failure that is safe
-    /// to retry (connection refused/reset, timeouts, DNS failures, and `CouchDB`
-    /// 429/5xx responses).
-    fn is_transient<E: std::fmt::Display>(err: &E) -> bool {
-        let lower = err.to_string().to_ascii_lowercase();
-        lower.contains("timeout")
-            || lower.contains("timed out")
-            || lower.contains("connection refused")
-            || lower.contains("connection reset")
-            || lower.contains("connection closed")
-            || lower.contains("broken pipe")
-            || lower.contains("eof while")
-            || lower.contains("network is unreachable")
-            || lower.contains("temporary failure in name resolution")
-            || lower.contains("name or service not known")
-            || lower.contains(" 502 ")
-            || lower.contains(" 503 ")
-            || lower.contains(" 504 ")
-            || lower.contains(" 429 ")
-            || lower.contains("502 bad gateway")
-            || lower.contains("503 service unavailable")
-            || lower.contains("504 gateway timeout")
-            || lower.contains("too many requests")
     }
 
     /// Get the full remote path for a local file
@@ -771,9 +806,11 @@ impl CouchDb {
         match self.retry_transient(|| self.db.get(path)).await {
             Ok(doc) => Ok(Some(doc)),
             Err(e) => {
-                // Check if it's a 404
-                let err_str = e.to_string();
-                if err_str.contains("404") || err_str.contains("Not Found") {
+                // Only an actual HTTP 404 means absence. Structured status
+                // detection (rather than substring matching on the error text)
+                // means a filename or message that merely contains "404" or
+                // "Not Found" is never mistaken for a missing document.
+                if e.is_not_found() {
                     Ok(None)
                 } else {
                     Err(e.into())
@@ -825,7 +862,7 @@ impl CouchDb {
         loop {
             match self.db.save(doc).await {
                 Ok(_details) => break,
-                Err(e) if Self::is_transient(&e) && attempts + 1 < total => {
+                Err(e) if e.is_transient() && attempts + 1 < total => {
                     attempts += 1;
                     let backoff = self.backoff(attempts);
                     warn!(
@@ -1033,9 +1070,9 @@ impl CouchDb {
                 Ok(Some(doc))
             }
             Err(e) => {
-                // Check if it's a 404
-                let err_str = e.to_string();
-                if err_str.contains("404") || err_str.contains("Not Found") {
+                // Only an actual HTTP 404 means absence (structured status,
+                // never a substring match on the error text).
+                if e.is_not_found() {
                     debug!("[FETCH METADATA] Not found: {}", path);
                     Ok(None)
                 } else {
@@ -1062,26 +1099,34 @@ impl CouchDb {
     async fn get_chunk(&self, chunk_id: &str) -> Result<Option<ChunkDoc>> {
         let url = format!("{}/{}", self.base_db_url, chunk_id);
 
-        let response = self
-            .retry_transient::<_, _, reqwest::Response, anyhow::Error>(|| {
-                let mut request = self.http_client.get(&url);
-                if let Some((username, password)) = &self.auth {
-                    request = request.basic_auth(username, Some(password));
+        // Status validation lives *inside* the retryable operation so a
+        // transient 429/5xx chunk fetch is retried; only a genuine 404 maps to
+        // "no such chunk" (Ok(None)). Permanent statuses (auth, schema, …) are
+        // returned as errors without retrying.
+        self.retry_transient::<_, _, Option<ChunkDoc>, anyhow::Error>(|| {
+            let mut request = self.http_client.get(&url);
+            if let Some((username, password)) = &self.auth {
+                request = request.basic_auth(username, Some(password));
+            }
+            async move {
+                let response = request.send().await?;
+                let status = response.status();
+                if status == reqwest::StatusCode::NOT_FOUND {
+                    return Ok(None);
                 }
-                async move { request.send().await.map_err(Into::into) }
-            })
-            .await?;
-
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to fetch chunk {}: {}", chunk_id, response.status());
-        }
-
-        let chunk: ChunkDoc = response.json().await?;
-        Ok(Some(chunk))
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(couch_rs::error::CouchError::new(
+                        format!("Failed to fetch chunk {chunk_id}: {status} - {body}"),
+                        status,
+                    )
+                    .into());
+                }
+                let chunk: ChunkDoc = response.json().await?;
+                Ok(Some(chunk))
+            }
+        })
+        .await
     }
 
     /// Get file content by fetching and combining all chunks.
@@ -1219,29 +1264,36 @@ impl CouchDb {
     async fn save_chunk(&self, chunk: &ChunkDoc) -> Result<()> {
         let url = format!("{}/{}", self.base_db_url, chunk.id);
 
-        let response = self
-            .retry_transient::<_, _, reqwest::Response, anyhow::Error>(|| {
-                let mut request = self.http_client.put(&url);
-                if let Some((username, password)) = &self.auth {
-                    request = request.basic_auth(username, Some(password));
-                }
+        // Status validation lives *inside* the retryable operation. A chunk
+        // PUT is idempotent on its unique id, so a transient 429/5xx — or a
+        // write that committed but whose acknowledgement was lost (a timeout or
+        // dropped connection) — is safely retried without duplicating content:
+        // re-sending the same chunk id/body just overwrites the same document.
+        self.retry_transient::<_, _, (), anyhow::Error>(|| {
+            let mut request = self.http_client.put(&url);
+            if let Some((username, password)) = &self.auth {
+                request = request.basic_auth(username, Some(password));
+            }
 
-                async move {
-                    request
-                        .header("Content-Type", "application/json")
-                        .json(chunk)
-                        .send()
-                        .await
-                        .map_err(Into::into)
+            async move {
+                let response = request
+                    .header("Content-Type", "application/json")
+                    .json(chunk)
+                    .send()
+                    .await?;
+                let status = response.status();
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(couch_rs::error::CouchError::new(
+                        format!("Failed to save chunk {}: {status} - {body}", chunk.id),
+                        status,
+                    )
+                    .into());
                 }
-            })
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to save chunk {}: {} - {}", chunk.id, status, body);
-        }
+                Ok(())
+            }
+        })
+        .await?;
 
         debug!("Saved chunk: {}", chunk.id);
         Ok(())
@@ -1328,26 +1380,37 @@ impl CouchDb {
         // being truncated or mangled by the URL parser.
         let encoded_id = utf8_percent_encode(id, FILE_ID_ENCODE_SET);
         let url = format!("{}/{encoded_id}?rev={rev}", self.base_db_url);
-        let mut request = self.http_client.delete(&url);
-        if let Some((username, password)) = &self.auth {
-            request = request.basic_auth(username, Some(password));
-        }
-        match request.send().await {
-            Ok(response) if response.status().is_success() => {
-                debug!("Deleted document: {}", id);
-                Ok(())
+
+        // `delete_doc` previously bypassed the shared retry policy entirely. It
+        // now applies the same bounded retry with status validation inside the
+        // retryable operation: transient 429/5xx and lost-acknowledgement
+        // failures retry up to the configured limit; permanent errors (auth,
+        // conflict, schema) fail immediately. A retried DELETE is idempotent on
+        // the pinned revision.
+        self.retry_transient::<_, _, (), anyhow::Error>(|| {
+            let mut request = self.http_client.delete(&url);
+            if let Some((username, password)) = &self.auth {
+                request = request.basic_auth(username, Some(password));
             }
-            Ok(response) => {
+            async move {
+                let response = request.send().await?;
                 let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                warn!("Failed to delete {}: {} - {}", id, status, body);
-                anyhow::bail!("Failed to delete {id}: {status} - {body}")
+                if status.is_success() {
+                    Ok(())
+                } else {
+                    let body = response.text().await.unwrap_or_default();
+                    warn!("Failed to delete {}: {status} - {body}", id);
+                    Err(couch_rs::error::CouchError::new(
+                        format!("Failed to delete {id}: {status} - {body}"),
+                        status,
+                    )
+                    .into())
+                }
             }
-            Err(e) => {
-                warn!("Failed to delete {}: {}", id, e);
-                anyhow::bail!("Failed to delete {id}: {e}")
-            }
-        }
+        })
+        .await?;
+        debug!("Deleted document: {}", id);
+        Ok(())
     }
 
     /// Permanently remove soft-delete tombstones that have outlived the
@@ -1557,6 +1620,27 @@ pub fn build_couch_url(host: &str, port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A minimal error type implementing [`RetryClassify`] so the retry-loop
+    /// mechanics tests can exercise transient vs. permanent classification
+    /// without a real transport error.
+    #[derive(Debug, PartialEq)]
+    enum TestRetryError {
+        Transient,
+        Permanent,
+    }
+
+    impl std::fmt::Display for TestRetryError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{self:?}")
+        }
+    }
+
+    impl RetryClassify for TestRetryError {
+        fn is_transient(&self) -> bool {
+            matches!(self, Self::Transient)
+        }
+    }
 
     /// Helper to create a `CouchDb` instance for testing without a real `CouchDB`.
     /// The methods under test (`is_path_allowed`, `get_remote_path`, `get_local_path`)
@@ -1788,11 +1872,11 @@ mod tests {
         let calls = std::sync::atomic::AtomicUsize::new(0);
 
         let result = db
-            .retry_transient::<_, _, u32, String>(|| {
+            .retry_transient::<_, _, u32, TestRetryError>(|| {
                 let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async move {
                     if n < 2 {
-                        Err("connection refused".to_string())
+                        Err(TestRetryError::Transient)
                     } else {
                         Ok(42u32)
                     }
@@ -1815,11 +1899,11 @@ mod tests {
         let calls = std::sync::atomic::AtomicUsize::new(0);
 
         let result = db
-            .retry_transient::<_, _, (), String>(|| {
+            .retry_transient::<_, _, (), TestRetryError>(|| {
                 let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async move {
                     let _ = n;
-                    Err("connection reset by peer".to_string())
+                    Err(TestRetryError::Transient)
                 }
             })
             .await;
@@ -1838,11 +1922,11 @@ mod tests {
         let calls = std::sync::atomic::AtomicUsize::new(0);
 
         let result = db
-            .retry_transient::<_, _, (), String>(|| {
+            .retry_transient::<_, _, (), TestRetryError>(|| {
                 let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async move {
                     let _ = n;
-                    Err("400 bad request: invalid document".to_string())
+                    Err(TestRetryError::Permanent)
                 }
             })
             .await;
@@ -1861,11 +1945,11 @@ mod tests {
         let calls = std::sync::atomic::AtomicUsize::new(0);
 
         let result = db
-            .retry_transient::<_, _, (), String>(|| {
+            .retry_transient::<_, _, (), TestRetryError>(|| {
                 let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async move {
                     let _ = n;
-                    Err("connection refused".to_string())
+                    Err(TestRetryError::Transient)
                 }
             })
             .await;
@@ -1879,15 +1963,35 @@ mod tests {
     }
 
     #[test]
-    fn timeout_is_classified_as_transient() {
-        assert!(CouchDb::is_transient(&"operation timed out".to_string()));
-        assert!(CouchDb::is_transient(
-            &"error sending request: request timed out".to_string()
-        ));
-        assert!(CouchDb::is_transient(&"connection refused".to_string()));
-        assert!(CouchDb::is_transient(&"502 bad gateway".to_string()));
-        assert!(!CouchDb::is_transient(&"400 bad request".to_string()));
-        assert!(!CouchDb::is_transient(&"JSON parse error".to_string()));
+    fn couch_error_classifies_by_structured_status() {
+        // 5xx (including the previously-missed 500), 501 (couch_rs's synthetic
+        // transport mapping), and 429 are transient.
+        for status in [
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR, // 500
+            reqwest::StatusCode::BAD_GATEWAY,           // 502
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,   // 503
+            reqwest::StatusCode::GATEWAY_TIMEOUT,       // 504
+            reqwest::StatusCode::NOT_IMPLEMENTED,       // 501
+            reqwest::StatusCode::TOO_MANY_REQUESTS,     // 429
+        ] {
+            assert!(
+                couch_rs::error::CouchError::new("boom".to_string(), status).is_transient(),
+                "{status} should be transient"
+            );
+        }
+        // Permanent auth/schema/conflict errors fail immediately (no retry).
+        for status in [
+            reqwest::StatusCode::BAD_REQUEST,  // 400
+            reqwest::StatusCode::UNAUTHORIZED, // 401
+            reqwest::StatusCode::FORBIDDEN,    // 403
+            reqwest::StatusCode::NOT_FOUND,    // 404
+            reqwest::StatusCode::CONFLICT,     // 409
+        ] {
+            assert!(
+                !couch_rs::error::CouchError::new("boom".to_string(), status).is_transient(),
+                "{status} should NOT be transient"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2045,6 +2149,524 @@ mod tests {
         assert!(
             result.is_ok(),
             "successful chunk delete must return Ok, got: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Story 6371: structured HTTP errors + consistent bounded retry semantics
+    // -----------------------------------------------------------------------
+
+    /// One scripted response for [`spawn_scripted_couch`]. Each request pops
+    /// the next step off the queue; an exhausted script defaults to `200`.
+    enum ScriptedStep {
+        /// Respond immediately with `status` and body.
+        Respond { status: u16, body: String },
+        /// Hold the connection open for `delay_ms` (longer than the client's
+        /// request timeout) before responding, so reqwest times out — a
+        /// deterministic "write committed but acknowledgement lost" / transient
+        /// transport failure.
+        StallThen {
+            delay_ms: u64,
+            status: u16,
+            body: String,
+        },
+    }
+
+    /// Spawn an in-process scripted fake `CouchDB` server that plays back a
+    /// queue of [`ScriptedStep`] responses (one per request), lets tests count
+    /// the total requests issued, and records every PUT/POST/DELETE target so
+    /// tests can assert a retried write did not duplicate a document. Returns
+    /// the base DB URL, the bare server address (for the `couch_rs` client),
+    /// the script queue, the request counter, the write map, the server thread
+    /// handle, and a shutdown flag.
+    #[allow(clippy::type_complexity)]
+    fn spawn_scripted_couch(
+        steps: Vec<ScriptedStep>,
+    ) -> (
+        String,
+        String,
+        std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<ScriptedStep>>>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind scripted couch");
+        let addr = listener.local_addr().expect("scripted couch addr");
+        let base_db_url = format!("http://{addr}/test_db");
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let script = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+            steps,
+        )));
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let (shutdown_thread, script_thread, requests_thread, writes_thread) = (
+            shutdown.clone(),
+            script.clone(),
+            requests.clone(),
+            writes.clone(),
+        );
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("scripted couch runtime");
+            runtime.block_on(async move {
+                listener
+                    .set_nonblocking(true)
+                    .expect("set scripted couch nonblocking");
+                let listener =
+                    tokio::net::TcpListener::from_std(listener).expect("scripted couch listener");
+                loop {
+                    if shutdown_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    match tokio::time::timeout(Duration::from_millis(10), listener.accept()).await {
+                        Ok(Ok((stream, _))) => {
+                            let script = script_thread.clone();
+                            let requests = requests_thread.clone();
+                            let writes = writes_thread.clone();
+                            let service = hyper::service::service_fn(move |req| {
+                                let script = script.clone();
+                                let requests = requests.clone();
+                                let writes = writes.clone();
+                                async move {
+                                    handle_scripted_req(req, &script, &requests, &writes).await
+                                }
+                            });
+                            tokio::spawn(async move {
+                                let io = hyper_util::rt::TokioIo::new(stream);
+                                let _ = hyper::server::conn::http1::Builder::new()
+                                    .serve_connection(io, service)
+                                    .await;
+                            });
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_elapsed) => {}
+                    }
+                }
+            });
+        });
+        (
+            base_db_url,
+            format!("http://{addr}"),
+            script,
+            requests,
+            writes,
+            handle,
+            shutdown,
+        )
+    }
+
+    /// Serve one scripted request: record the request count, persist any
+    /// write target (by method+path, so a retried write overwrites and never
+    /// duplicates), then play back the next script step.
+    #[allow(clippy::type_complexity)]
+    async fn handle_scripted_req(
+        req: hyper::Request<hyper::body::Incoming>,
+        script: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<ScriptedStep>>>,
+        requests: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        writes: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    ) -> Result<hyper::Response<http_body_util::Full<hyper::body::Bytes>>, hyper::Error> {
+        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (parts, body) = req.into_parts();
+
+        // Persist write targets so tests can assert a retried write landed at
+        // most once per document (keyed by method + path).
+        if matches!(
+            parts.method,
+            hyper::Method::PUT | hyper::Method::POST | hyper::Method::DELETE
+        ) {
+            let collected = http_body_util::BodyExt::collect(body).await;
+            let body_bytes = collected.map(|b| b.to_bytes().to_vec()).unwrap_or_default();
+            if let Ok(mut w) = writes.lock() {
+                w.insert(
+                    format!("{:?} {}", parts.method, parts.uri),
+                    String::from_utf8_lossy(&body_bytes).to_string(),
+                );
+            }
+        }
+
+        let step = script.lock().map_or(None, |mut s| s.pop_front());
+        let (status, body_text, delay_ms) = match step {
+            Some(ScriptedStep::Respond { status, body }) => (status, body, 0),
+            Some(ScriptedStep::StallThen {
+                delay_ms,
+                status,
+                body,
+            }) => (status, body, delay_ms),
+            None => (200, String::new(), 0),
+        };
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+        let mut response = hyper::Response::new(http_body_util::Full::new(
+            hyper::body::Bytes::from(body_text),
+        ));
+        *response.status_mut() =
+            hyper::StatusCode::from_u16(status).unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
+        Ok(response)
+    }
+
+    /// A valid chunk document body served by the scripted fake couch.
+    fn scripted_chunk_body(chunk_id: &str) -> String {
+        format!(
+            r#"{{"_id":"{chunk_id}","_rev":"1-abc","data":"aGVsbG8=","type":"leaf","created_at":0}}"#
+        )
+    }
+
+    /// A valid file document body (with an explicit `_id`/`_rev`) served by the
+    /// scripted fake couch to the `couch_rs` client.
+    fn scripted_file_body(id: &str) -> String {
+        format!(
+            r#"{{"_id":"{id}","_rev":"1-abc","children":[],"path":"{id}","type":"plain","size":0}}"#
+        )
+    }
+
+    /// A `CouchDb` whose `couch_rs` client points at the scripted server's bare
+    /// address (so `get_file`/`fetch_metadata` hit it) with a real request
+    /// timeout on the direct reqwest client (so timeout retries are testable).
+    fn scripted_couchdb(base_db_url: &str, bare_addr: &str, timeout_seconds: u64) -> CouchDb {
+        scripted_couchdb_with_retries(base_db_url, bare_addr, timeout_seconds, 3)
+    }
+
+    /// Like [`scripted_couchdb`], with a caller-chosen retry limit.
+    fn scripted_couchdb_with_retries(
+        base_db_url: &str,
+        bare_addr: &str,
+        timeout_seconds: u64,
+        retry_attempts: u32,
+    ) -> CouchDb {
+        let client = Client::new_no_auth(bare_addr).unwrap();
+        let db = Database::new("test_db".to_string(), client.clone());
+        CouchDb {
+            client,
+            db,
+            http_client: HttpClient::builder()
+                .timeout(Duration::from_secs(timeout_seconds))
+                .build()
+                .expect("build scripted http client"),
+            base_db_url: base_db_url.to_string(),
+            db_name: DatabaseName::new("test_db"),
+            auth: None,
+            remote_path: RemotePath::new(String::new()),
+            timeout_seconds,
+            retry_attempts,
+            legacy_chunk_data: crate::models::LegacyChunkData::Base64,
+            test_state: None,
+            test_write_calls: std::sync::atomic::AtomicUsize::new(0),
+            test_backoff: Duration::from_millis(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_chunk_retries_500_503_429_then_succeeds() {
+        let (base_db_url, bare_addr, _script, requests, _writes, server, shutdown) =
+            spawn_scripted_couch(vec![
+                ScriptedStep::Respond {
+                    status: 500,
+                    body: String::new(),
+                },
+                ScriptedStep::Respond {
+                    status: 503,
+                    body: String::new(),
+                },
+                ScriptedStep::Respond {
+                    status: 429,
+                    body: String::new(),
+                },
+                ScriptedStep::Respond {
+                    status: 200,
+                    body: scripted_chunk_body("chunk1"),
+                },
+            ]);
+        let db = scripted_couchdb_with_retries(&base_db_url, &bare_addr, 30, 4);
+        let result = db.get_chunk("chunk1").await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("scripted couch join");
+        assert!(
+            matches!(result, Ok(Some(_))),
+            "transient 500/503/429 must retry to success: {result:?}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "three transient failures then success == 4 attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_chunk_does_not_retry_permanent_403() {
+        let (base_db_url, bare_addr, _script, requests, _writes, server, shutdown) =
+            spawn_scripted_couch(vec![ScriptedStep::Respond {
+                status: 403,
+                body: String::new(),
+            }]);
+        let db = scripted_couchdb(&base_db_url, &bare_addr, 30);
+        let result = db.get_chunk("chunk1").await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("scripted couch join");
+        assert!(
+            result.is_err(),
+            "permanent 403 must fail immediately: {result:?}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "permanent auth errors must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_chunk_404_returns_none() {
+        let (base_db_url, bare_addr, _script, requests, _writes, server, shutdown) =
+            spawn_scripted_couch(vec![ScriptedStep::Respond {
+                status: 404,
+                body: String::new(),
+            }]);
+        let db = scripted_couchdb(&base_db_url, &bare_addr, 30);
+        let result = db.get_chunk("chunk1").await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("scripted couch join");
+        assert!(
+            matches!(result, Ok(None)),
+            "a genuine 404 must mean absence: {result:?}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "404 is permanent and must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_chunk_retries_on_timeout() {
+        let (base_db_url, bare_addr, _script, requests, _writes, server, shutdown) =
+            spawn_scripted_couch(vec![
+                ScriptedStep::StallThen {
+                    delay_ms: 1500,
+                    status: 200,
+                    body: scripted_chunk_body("chunk1"),
+                },
+                ScriptedStep::Respond {
+                    status: 200,
+                    body: scripted_chunk_body("chunk1"),
+                },
+            ]);
+        // 1s request timeout: the first attempt stalls past it and times out,
+        // the retry succeeds.
+        let db = scripted_couchdb(&base_db_url, &bare_addr, 1);
+        let result = db.get_chunk("chunk1").await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("scripted couch join");
+        assert!(
+            matches!(result, Ok(Some(_))),
+            "a timeout must be retried to success: {result:?}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one timeout then success == 2 attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_file_404_means_absence_only() {
+        let (base_db_url, bare_addr, _script, requests, _writes, server, shutdown) =
+            spawn_scripted_couch(vec![ScriptedStep::Respond {
+                status: 404,
+                body: String::new(),
+            }]);
+        let db = scripted_couchdb(&base_db_url, &bare_addr, 30);
+        let result = db.get_file("notes/missing.md").await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("scripted couch join");
+        assert!(
+            matches!(result, Ok(None)),
+            "an actual 404 must mean absence: {result:?}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "404 is permanent and must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_file_transient_error_containing_404_in_path_is_not_absence() {
+        // Regression: the old substring check treated any error whose text
+        // contained "404" (e.g. a connection error mentioning the path
+        // "notes/404.md") as a missing document. A structured 500 must surface
+        // as an error (after retries), never as Ok(None).
+        let (base_db_url, bare_addr, _script, requests, _writes, server, shutdown) =
+            spawn_scripted_couch(vec![
+                ScriptedStep::Respond {
+                    status: 500,
+                    body: "boom for notes/404.md".to_string(),
+                },
+                ScriptedStep::Respond {
+                    status: 500,
+                    body: "boom for notes/404.md".to_string(),
+                },
+                ScriptedStep::Respond {
+                    status: 500,
+                    body: "boom for notes/404.md".to_string(),
+                },
+            ]);
+        let db = scripted_couchdb(&base_db_url, &bare_addr, 30);
+        let result = db.get_file("notes/404.md").await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("scripted couch join");
+        assert!(
+            result.is_err(),
+            "a 500 mentioning a 404 in the path must error, not look absent: {result:?}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "a 500 (transient) must retry up to retry_attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_file_present_doc_with_404_in_id_returns_some() {
+        let (base_db_url, bare_addr, _script, _requests, _writes, server, shutdown) =
+            spawn_scripted_couch(vec![ScriptedStep::Respond {
+                status: 200,
+                body: scripted_file_body("notes/404.md"),
+            }]);
+        let db = scripted_couchdb(&base_db_url, &bare_addr, 30);
+        let result = db.get_file("notes/404.md").await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("scripted couch join");
+        assert!(
+            matches!(result, Ok(Some(_))),
+            "a present doc whose id merely contains '404' must not be treated as absent: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_metadata_404_returns_none() {
+        let (base_db_url, bare_addr, _script, requests, _writes, server, shutdown) =
+            spawn_scripted_couch(vec![ScriptedStep::Respond {
+                status: 404,
+                body: String::new(),
+            }]);
+        let db = scripted_couchdb(&base_db_url, &bare_addr, 30);
+        let result = db.fetch_metadata("notes/missing.md").await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("scripted couch join");
+        assert!(
+            matches!(result, Ok(None)),
+            "an actual 404 must mean absence: {result:?}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "404 is permanent and must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_chunk_retries_on_503_then_succeeds() {
+        let (base_db_url, bare_addr, _script, requests, _writes, server, shutdown) =
+            spawn_scripted_couch(vec![
+                ScriptedStep::Respond {
+                    status: 503,
+                    body: String::new(),
+                },
+                ScriptedStep::Respond {
+                    status: 201,
+                    body: "{\"ok\":true}".to_string(),
+                },
+            ]);
+        let db = scripted_couchdb(&base_db_url, &bare_addr, 30);
+        let chunk = ChunkDoc::new_encoded("h:chunk1".to_string(), b"hello".to_vec());
+        let result = db.save_chunk(&chunk).await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("scripted couch join");
+        assert!(
+            result.is_ok(),
+            "transient 503 on save must retry to success: {result:?}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one transient failure then success == 2 attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_chunk_lost_response_retried_without_duplication() {
+        // Success-with-lost-response: the first PUT commits but its
+        // acknowledgement is lost (the server stalls past the client timeout,
+        // so the client sees a transport error). The retry re-PUTs the same
+        // chunk id/body, which is idempotent: the server ends with exactly one
+        // stored chunk document, never a duplicate.
+        let (base_db_url, bare_addr, _script, requests, writes, server, shutdown) =
+            spawn_scripted_couch(vec![
+                ScriptedStep::StallThen {
+                    delay_ms: 1500,
+                    status: 201,
+                    body: "{\"ok\":true}".to_string(),
+                },
+                ScriptedStep::Respond {
+                    status: 201,
+                    body: "{\"ok\":true}".to_string(),
+                },
+            ]);
+        let db = scripted_couchdb(&base_db_url, &bare_addr, 1);
+        let chunk = ChunkDoc::new_encoded("h:chunk1".to_string(), b"hello".to_vec());
+        let result = db.save_chunk(&chunk).await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("scripted couch join");
+        assert!(
+            result.is_ok(),
+            "a lost acknowledgement on save must be retried to success: {result:?}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one lost-ack then success == 2 attempts"
+        );
+        let put_count = {
+            let stored = writes.lock().expect("writes lock");
+            stored
+                .iter()
+                .filter(|(k, _)| k.starts_with("PUT ") && k.contains("h:chunk1"))
+                .count()
+        };
+        assert_eq!(
+            put_count, 1,
+            "an idempotent retry must leave exactly one chunk document"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_doc_retries_on_500_then_succeeds() {
+        let (base_db_url, bare_addr, _script, requests, _writes, server, shutdown) =
+            spawn_scripted_couch(vec![
+                ScriptedStep::Respond {
+                    status: 500,
+                    body: String::new(),
+                },
+                ScriptedStep::Respond {
+                    status: 200,
+                    body: "{\"ok\":true}".to_string(),
+                },
+            ]);
+        let db = scripted_couchdb(&base_db_url, &bare_addr, 30);
+        let result = db.delete_doc("notes/gone.md", "1-abc").await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("scripted couch join");
+        assert!(
+            result.is_ok(),
+            "a transient 500 on delete must retry to success: {result:?}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "delete_doc must now apply bounded retry (1 failure + 1 success)"
         );
     }
 
