@@ -70,6 +70,52 @@ fn invalid_enum_value_exits_nonzero() {
 }
 
 #[test]
+fn daemon_zero_cli_interval_exits_nonzero_before_startup() {
+    // A zero `--interval` must be rejected before the daemon starts its
+    // polling timer (which would otherwise panic), not after.
+    let dir = scratch_dir();
+    let out = Command::new(binary())
+        .current_dir(dir.path())
+        .args(["daemon", "--interval", "0"])
+        .output()
+        .expect("spawn binary");
+    assert!(
+        !out.status.success(),
+        "zero CLI interval must fail before daemon startup; status={:?}",
+        out.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.to_lowercase().contains("interval"),
+        "error must mention the interval; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn daemon_zero_config_poll_interval_exits_nonzero_before_startup() {
+    // A config `sync.poll_interval: 0` with no CLI `--interval` must also be
+    // rejected before the daemon starts its polling timer.
+    let dir = scratch_dir();
+    let cfg = dir.path().join("zero.yaml");
+    std::fs::write(&cfg, "sync:\n  poll_interval: 0\n").expect("write zero-interval config");
+    let out = Command::new(binary())
+        .current_dir(dir.path())
+        .args(["--config", cfg.to_str().unwrap(), "daemon"])
+        .output()
+        .expect("spawn binary");
+    assert!(
+        !out.status.success(),
+        "zero config poll interval must fail before daemon startup; status={:?}",
+        out.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.to_lowercase().contains("interval"),
+        "error must mention the interval; stderr: {stderr}"
+    );
+}
+
+#[test]
 fn missing_default_config_permits_defaults() {
     // Point HOME at an empty dir so no default config file exists, then `init`
     // a fresh path: config must fall back to defaults and the command must run.

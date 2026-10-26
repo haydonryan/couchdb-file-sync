@@ -1,23 +1,32 @@
 use crate::models::Conflict;
+use crate::notify::{ConflictNotifier, HttpSender, ReqwestSender};
 use anyhow::Result;
-use reqwest::Client;
+use std::pin::Pin;
+use std::sync::Arc;
 use tracing::{debug, warn};
 
 /// Telegram bot notifier
 pub struct TelegramNotifier {
     bot_token: String,
     chat_id: String,
-    client: Client,
+    sender: Arc<dyn HttpSender>,
 }
 
 impl TelegramNotifier {
-    /// Create a new Telegram notifier
+    /// Create a new Telegram notifier backed by a timed real HTTP transport.
     #[must_use]
     pub fn new(bot_token: String, chat_id: String) -> Self {
+        Self::with_sender(bot_token, chat_id, Arc::new(ReqwestSender::new()))
+    }
+
+    /// Create a notifier backed by an explicit HTTP transport (tests inject a
+    /// fake sender).
+    #[must_use]
+    pub fn with_sender(bot_token: String, chat_id: String, sender: Arc<dyn HttpSender>) -> Self {
         Self {
             bot_token,
             chat_id,
-            client: Client::new(),
+            sender,
         }
     }
 
@@ -88,11 +97,10 @@ impl TelegramNotifier {
             "disable_notification": false,
         });
 
-        let response = self.client.post(&url).json(&params).send().await?;
+        let response = self.sender.post_json(&url, &[], &params).await?;
 
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            anyhow::bail!("Telegram API error: {error_text}");
+        if !(200..300).contains(&response.status) {
+            anyhow::bail!("Telegram API error: {}", response.body);
         }
 
         Ok(())
@@ -106,13 +114,23 @@ impl TelegramNotifier {
     pub async fn test(&self) -> Result<bool> {
         let url = format!("https://api.telegram.org/bot{}/getMe", self.bot_token);
 
-        match self.client.get(&url).send().await {
-            Ok(response) => Ok(response.status().is_success()),
+        match self.sender.get(&url, &[]).await {
+            Ok(response) => Ok((200..300).contains(&response.status)),
             Err(e) => {
                 warn!("Telegram connection test failed: {}", e);
                 Ok(false)
             }
         }
+    }
+}
+
+impl ConflictNotifier for TelegramNotifier {
+    fn notify_new_conflicts<'a>(
+        &'a self,
+        conflicts: &'a [&'a Conflict],
+        sync_dir: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move { Self::notify_new_conflicts(self, conflicts, sync_dir).await })
     }
 }
 

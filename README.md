@@ -14,9 +14,9 @@ A Rust-based filesystem-to-CouchDB synchronization engine with bidirectional syn
 | ✅ | **Conflict Resolution** | CLI commands to resolve conflicts with multiple strategies |
 | ✅ | **Smart Ignore Patterns** | Gitignore-style `.sync-ignore` file support |
 | ✅ | **Authoritative Rebuilds** | Rebuild the remote from local or rebuild the local tree from remote |
-| ✅ | **Telegram Notifications** | Get notified when conflicts are detected |
+| ✅ | **Conflict Notifications** | Telegram and/or Matrix; each opted-in channel is notified once per root and conflict generation |
 | ⚠️ | **Flexible Configuration** | CLI args, YAML config, and environment variables |
-| ⚠️ | **Conflict File Preservation (optional)** | Keep-both resolution saves a unique, local-only `.filename.remote` copy |
+| ⚠️ | **Conflict File Preservation (optional)** | Keep-both resolution saves a unique, local-only copy (`.filename.remote`, or under `conflicts.conflict_dir` when configured) |
 | ❌ | **Live Mode** | Optional filesystem watcher + CouchDB changes feed for low-latency sync |
 | ⚠️ | **Detailed Sync Logs** | `sync` and `daemon` write detailed logs to `$XDG_STATE_HOME/couchdb-file-sync/couchdb-file-sync.log` by default (override via `logging.file`) |
 
@@ -187,12 +187,26 @@ paths:
     remote: "notes/"
 
 sync:
+  # Optional default sync root used when no CLI PATH and no `paths` entries
+  # are given. Omitted here, so a bare command falls back to the current
+  # directory.
+  # root_dir: "/absolute/or/relative/path"
   poll_interval: 60
   debounce_ms: 500
   # Live mode: how often (seconds) a bounded reconciliation rescan retries
   # local changes that failed to upload or were dropped when the file watcher
   # overflowed. 0 disables the periodic rescan. Default: 30
   rescan_interval_secs: 30
+  # Maximum number of queued changes applied per scheduling wave during a sync.
+  # Uploads/downloads are processed batch_size at a time, bounding the queue of
+  # work held in memory. Must be >= 1. Default: 100
+  batch_size: 100
+  # Whether per-file uploads/downloads may run in parallel during a sync.
+  # When false, files are applied strictly one at a time (serially). Default: true
+  parallel: true
+  # Maximum number of per-file uploads/downloads in flight at once when
+  # parallel is enabled. Must be >= 1 when parallel is true. Default: 4
+  max_parallel: 4
   # Soft-delete tombstones older than this many seconds are pruned so
   # get_all_files/get_changes do not grow unbounded. 0 disables pruning.
   tombstone_retention_secs: 604800
@@ -300,6 +314,15 @@ Run continuous sync daemon.
 couchdb-file-sync daemon ~/documents --interval 60
 ```
 
+`--interval` (or `-i`) is optional. When omitted, the daemon polls at the
+configured `sync.poll_interval` (default `60` seconds); an explicit
+`--interval` always takes precedence. A zero interval is rejected before the
+daemon starts, as are invalid poll intervals.
+
+When `PATH` is omitted, the daemon (and the other commands) sync every
+configured `paths` entry. If no `paths` are configured and no `PATH` is given,
+the command syncs `sync.root_dir` when set, otherwise the current directory.
+
 For live mode (watcher + changes feed):
 
 ```bash
@@ -332,19 +355,15 @@ couchdb-file-sync conflicts
 couchdb-file-sync conflicts --json
 ```
 
-### `couchdb-file-sync resolve <PATH> --strategy <STRATEGY>`
+### `couchdb-file-sync resolve [PATH]`
 
-Resolve a conflict.
+Resolve pending conflicts **interactively**. For each conflict you choose a
+strategy from a prompt; the prompt defaults to the configured
+`conflicts.default_strategy` (or keep-local when unset).
 
 ```bash
-# Keep local version
-couchdb-file-sync resolve docs/report.pdf --strategy keep-local
-
-# Keep remote version
-couchdb-file-sync resolve docs/report.pdf --strategy keep-remote
-
-# Keep both (saves remote as a unique, local-only .report.pdf.remote copy)
-couchdb-file-sync resolve docs/report.pdf --strategy keep-both
+couchdb-file-sync resolve
+couchdb-file-sync resolve docs/report.pdf   # only resolve conflicts under this path
 ```
 
 ### `couchdb-file-sync status [PATH]`
@@ -434,8 +453,8 @@ genuinely-new deletion is never discarded solely due to cross-host clock skew.
 Resolve conflicts with:
 
 ```bash
-couchdb-file-sync conflicts                    # List all conflicts
-couchdb-file-sync resolve <path> --strategy <strategy>
+couchdb-file-sync conflicts    # List all conflicts
+couchdb-file-sync resolve      # Resolve conflicts interactively (per-conflict prompt)
 ```
 
 ### Resolution Strategies
@@ -445,11 +464,22 @@ couchdb-file-sync resolve <path> --strategy <strategy>
 - **keep-remote**: Download remote version, overwriting local. If the remote
   was deleted (tombstone), the local file is deleted to match — it does not
   resurrect the tombstone's stale content.
-- **keep-both**: Save the remote version under a unique, dot-prefixed local-only
-  name (`.filename.remote`, `.filename.remote.1`, …), keeping the local file
-  as-is. The copy is excluded from sync, never clobbers an existing backup, and
-  never marks itself as a synced download. A remote tombstone has no content to
-  keep, so the local file is left untouched.
+- **keep-both**: Save the remote version as a unique, local-only copy while
+  keeping the local file as-is. By default the copy is written dot-prefixed
+  next to the original (`.filename.remote`, `.filename.remote.1`, …). If
+  `conflicts.conflict_dir` is configured, copies instead go under
+  `<sync-root>/<conflict_dir>/`, mirroring the original's subdirectory
+  (`.conflicts/docs/report.pdf.remote`, …). The preservation directory is
+  always excluded from sync, so copies never reenter a cycle accidentally; the
+  copy never clobbers an existing backup and never marks itself as a synced
+  download. A remote tombstone has no content to keep, so the local file is
+  left untouched.
+
+The configured `conflicts.default_strategy` (keep-local, keep-remote,
+keep-both, or skip) preselects the interactive prompt's default. The
+`conflicts.auto_resolve` option is **not supported**: the application does not
+perform automatic conflict resolution, so a config that enables it is rejected
+before any sync runs rather than silently ignoring it.
 
 Resolution is snapshot-aware: destructive strategies never overwrite a version
 that changed since the conflict was previewed. **keep-local** refuses (and
