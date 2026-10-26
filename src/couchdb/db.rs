@@ -6,6 +6,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::future::Future;
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -708,8 +709,9 @@ impl CouchDb {
     /// fresh client materializes pre-existing remote files. On subsequent runs
     /// it resumes the since-based `_changes` feed so only changes after the
     /// checkpoint are returned. The returned sequence is the scope-appropriate
-    /// resume point: the feed's `last_seq` for incremental runs, or the DB
-    /// `update_seq` captured for the bootstrap run.
+    /// resume point: the feed's `last_seq` for both incremental runs and the
+    /// bootstrap run (whose gap-free snapshot replays the feed from a
+    /// pre-listing cursor).
     ///
     /// # Errors
     ///
@@ -727,12 +729,21 @@ impl CouchDb {
         // a fresh client materializes pre-existing remote files, then checkpoint
         // the current DB sequence so later syncs are incremental.
         let Some(since) = since else {
+            // Build a gap-free first-sync snapshot. Capture the DB's update_seq
+            // as a *pre-snapshot* cursor BEFORE listing the existing files, then
+            // replay the `_changes` feed from that cursor. Any document
+            // created/updated/deleted after the snapshot is therefore either in
+            // the listing (it predates the listing read) or arrives via the
+            // replayed feed. Checkpointing the feed's `last_seq` (always ≥ the
+            // snapshot cursor) can never advance past a change we failed to
+            // materialize, so concurrent remote edits are not skipped.
+            let snapshot_seq = self.get_update_seq().await?;
             let all_files = self.get_all_files().await?;
             debug!(
                 "Bootstrap (no checkpoint): {} existing files in scope",
                 all_files.len()
             );
-            let changes: Vec<Change> = all_files
+            let listing_changes: Vec<Change> = all_files
                 .into_iter()
                 .map(|doc| {
                     let mtime = doc.modified_at();
@@ -750,7 +761,27 @@ impl CouchDb {
                     }
                 })
                 .collect();
-            let seq = self.get_update_seq().await?;
+
+            // Replay everything that changed after the pre-snapshot cursor so a
+            // create/update/delete racing the listing is not checkpointed over.
+            let (feed_entries, seq) = self
+                .get_changes_feed(&snapshot_seq, self.timeout_seconds.saturating_mul(1000))
+                .await?;
+            let feed_changes: Vec<Change> =
+                feed_entries.into_iter().map(|entry| entry.change).collect();
+
+            // Merge the replayed feed over the listing snapshot. The feed is read
+            // last, so its per-path state is the most recent — including deletions
+            // that the earlier listing would not reflect — while stable files that
+            // never changed after the snapshot appear only in the listing.
+            let mut changes = feed_changes;
+            let mut covered: HashSet<String> =
+                changes.iter().map(|c| c.path().to_string()).collect();
+            for change in listing_changes {
+                if covered.insert(change.path().to_string()) {
+                    changes.push(change);
+                }
+            }
             return Ok((changes, seq));
         };
 
@@ -1784,6 +1815,256 @@ mod tests {
             }
         }
         Ok(response)
+    }
+
+    /// Parameters for a stateful fake `CouchDB` that models writes landing
+    /// concurrently with a first-run bootstrap.
+    ///
+    /// Unlike the stateless [`spawn_fake_changes_couch`], the fixture can
+    /// return *different* state for the listing versus the sequence/feed,
+    /// simulating a document being created, edited or deleted between the
+    /// pre-snapshot cursor capture and the end of the bootstrap. `snapshot_seq`
+    /// is what `GET /test_db` returns when queried *before* the listing (the
+    /// pre-snapshot cursor); `after_seq` is what it returns when queried *after*
+    /// the listing — the original racy ordering that would checkpoint over the
+    /// intervening writes. `listing_docs` is the file set as of the listing
+    /// read; `feed` is the complete ordered change feed `(seq, doc)` from
+    /// sequence 0.
+    #[derive(Clone)]
+    struct RacingChanges {
+        snapshot_seq: String,
+        after_seq: String,
+        listing_docs: Vec<FileDoc>,
+        feed: Vec<(u64, FileDoc)>,
+    }
+
+    /// Spawn the stateful fake `CouchDB` described by [`RacingChanges`], tracking
+    /// whether the listing (`_all_docs`) has been requested so `GET /test_db`
+    /// can answer with the pre- or post-listing sequence as appropriate.
+    fn spawn_fake_changes_couch_racing(
+        state: RacingChanges,
+    ) -> (
+        String,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake racing couch");
+        let addr = listener.local_addr().expect("fake racing addr");
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listing_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_thread = shutdown.clone();
+        let state_thread = state;
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("fake racing runtime");
+            runtime.block_on(async move {
+                listener
+                    .set_nonblocking(true)
+                    .expect("set fake racing nonblocking");
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .expect("fake racing tokio listener");
+                loop {
+                    if shutdown_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    match tokio::time::timeout(Duration::from_millis(10), listener.accept()).await {
+                        Ok(Ok((stream, _))) => {
+                            let state = state_thread.clone();
+                            let listing_called = listing_called.clone();
+                            let service = hyper::service::service_fn(move |req| {
+                                handle_fake_changes_couch_racing_req(
+                                    req,
+                                    state.clone(),
+                                    listing_called.clone(),
+                                )
+                            });
+                            tokio::spawn(async move {
+                                let io = hyper_util::rt::TokioIo::new(stream);
+                                let _ = hyper::server::conn::http1::Builder::new()
+                                    .serve_connection(io, service)
+                                    .await;
+                            });
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_) => {}
+                    }
+                }
+            });
+        });
+        (format!("http://{addr}"), handle, shutdown)
+    }
+
+    /// Serve the three `CouchDB` endpoints used by `get_changes` against a
+    /// [`RacingChanges`] fixture (see [`spawn_fake_changes_couch_racing`]).
+    #[allow(clippy::unused_async)]
+    async fn handle_fake_changes_couch_racing_req(
+        req: hyper::Request<hyper::body::Incoming>,
+        state: RacingChanges,
+        listing_called: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<hyper::Response<http_body_util::Full<hyper::body::Bytes>>, hyper::Error> {
+        let (parts, _body) = req.into_parts();
+        let mut response =
+            hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::new()));
+        let method = parts.method.clone();
+        let path = parts.uri.path().to_string();
+        match (method, path.as_str()) {
+            // `couch_rs` percent-encodes the underscore in the db name, so match
+            // on the endpoint suffix rather than the exact path.
+            (hyper::Method::POST, p) if p.ends_with("_all_docs") => {
+                listing_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                let rows: Vec<serde_json::Value> = state
+                    .listing_docs
+                    .iter()
+                    .map(|d| {
+                        serde_json::json!({
+                            "id": d.id,
+                            "key": d.id,
+                            "value": { "rev": d.rev.clone().unwrap_or_default() },
+                            "doc": d,
+                        })
+                    })
+                    .collect();
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(
+                    serde_json::json!({ "total_rows": rows.len(), "offset": 0, "rows": rows })
+                        .to_string(),
+                ));
+            }
+            (hyper::Method::GET, p) if p.ends_with("_changes") => {
+                let since = parts
+                    .uri
+                    .query()
+                    .and_then(|q| {
+                        q.split('&').find_map(|kv| {
+                            let (k, v) = kv.split_once('=')?;
+                            (k == "since").then(|| v.to_string())
+                        })
+                    })
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let rows: Vec<serde_json::Value> = state
+                    .feed
+                    .iter()
+                    .filter(|(seq, _)| *seq > since)
+                    .map(|(seq, d)| {
+                        serde_json::json!({
+                            "seq": seq.to_string(),
+                            "id": d.id,
+                            "changes": [{ "rev": d.rev.clone().unwrap_or_default() }],
+                            "deleted": d.deleted,
+                            "doc": d,
+                        })
+                    })
+                    .collect();
+                let last_seq = state
+                    .feed
+                    .last()
+                    .map_or_else(|| "0".to_string(), |(seq, _)| seq.to_string());
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(
+                    serde_json::json!({ "results": rows, "last_seq": last_seq }).to_string(),
+                ));
+            }
+            (hyper::Method::GET, p) if p.ends_with("test_db") || p.ends_with("test%5Fdb") => {
+                // The pre-snapshot cursor is captured before the listing, so the
+                // fixture reports `snapshot_seq` unless the listing has already
+                // been requested (the racy ordering that would skip intervening
+                // writes).
+                let seq = if listing_called.load(std::sync::atomic::Ordering::SeqCst) {
+                    state.after_seq
+                } else {
+                    state.snapshot_seq
+                };
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(
+                    serde_json::json!({
+                        "cluster": { "q": 1, "n": 1, "w": 1, "r": 1 },
+                        "compact_running": false,
+                        "db_name": "test_db",
+                        "disk_format_version": 8,
+                        "doc_count": state.listing_docs.len(),
+                        "doc_del_count": 0,
+                        "instance_start_time": "0",
+                        "purge_seq": "0",
+                        "sizes": { "file": 0, "external": 0, "active": 0 },
+                        "update_seq": seq,
+                        "props": {},
+                    })
+                    .to_string(),
+                ));
+            }
+            _ => {
+                *response.status_mut() = hyper::StatusCode::NOT_FOUND;
+            }
+        }
+        Ok(response)
+    }
+
+    #[tokio::test]
+    async fn get_changes_bootstrap_applies_changes_racing_the_snapshot() {
+        // A first-run bootstrap must not skip a document created, edited or
+        // deleted between the pre-snapshot cursor capture and the end of the
+        // listing. The stateful fixture reports the pre-snapshot `update_seq`
+        // for the cursor (queried before the listing) while the feed replayed
+        // from that cursor carries the racing create/edit/delete.
+        let a_listed = changes_file_doc("notes/a.md", 1000); // state at listing time
+        let b_listed = changes_file_doc("notes/b.md", 2000);
+        let c_new = changes_file_doc("notes/c.md", 3000); // created after the snapshot
+        let a_new = changes_file_doc("notes/a.md", 4000); // edited after the snapshot
+        let mut b_deleted = changes_file_doc("notes/b.md", 2000); // deleted after the snapshot
+        b_deleted.deleted = true;
+        b_deleted.deleted_at = TimestampMillis::new(9000);
+
+        let state = RacingChanges {
+            snapshot_seq: "2".to_string(), // a@1, b@2 at snapshot time
+            after_seq: "5".to_string(),    // the racy post-listing sequence
+            listing_docs: vec![a_listed, b_listed],
+            feed: vec![
+                (1, changes_file_doc("notes/a.md", 1000)),
+                (2, changes_file_doc("notes/b.md", 2000)),
+                (3, c_new),
+                (4, a_new),
+                (5, b_deleted),
+            ],
+        };
+        let (addr, server, shutdown) = spawn_fake_changes_couch_racing(state);
+        let db = couchdb_at_full(&addr, "notes/");
+
+        let (changes, seq) = db
+            .get_changes(None)
+            .await
+            .expect("bootstrap should succeed");
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake racing couch join");
+
+        // The racing create is not skipped.
+        assert!(
+            changes.iter().any(|c| c.path() == "notes/c.md"),
+            "file created between snapshot and resume must be applied"
+        );
+        // The racing edit wins over the stale listing copy.
+        let a = changes
+            .iter()
+            .find(|c| c.path() == "notes/a.md")
+            .expect("edited file must be present");
+        assert_eq!(
+            a.mtime().map(chrono::DateTime::timestamp_millis),
+            Some(4000),
+            "racing edit must win over the listing snapshot"
+        );
+        // The racing delete is applied, not masked by the listing's live copy.
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c, crate::models::Change::RemoteDeleted { path, .. } if path == "notes/b.md")),
+            "racing delete must be applied"
+        );
+        // The resume point is the replayed feed's last_seq, never behind the
+        // snapshot cursor, so no intervening change can be skipped.
+        assert_eq!(
+            seq, "5",
+            "bootstrap resumes from the replayed feed's last_seq"
+        );
     }
 
     #[tokio::test]

@@ -22,7 +22,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -1150,8 +1150,22 @@ async fn daemon_sync(
     Ok(report)
 }
 
+/// Expected on-disk state for a path that the tool itself just installed,
+/// used to suppress the watcher's echo of that write without hiding a
+/// distinct user edit that lands in the same moment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExpectedState {
+    /// The tool successfully deleted the file. Only a matching delete echo is
+    /// suppressed; any recreated content (a real user edit) must propagate.
+    Absent,
+    /// The tool successfully wrote this exact content hash. Only a local
+    /// event whose on-disk bytes match is suppressed; different bytes are a
+    /// real edit and must sync.
+    Content(String),
+}
+
 struct TouchTracker {
-    entries: Vec<(String, i64)>,
+    entries: Vec<(String, ExpectedState)>,
 }
 
 impl TouchTracker {
@@ -1161,26 +1175,46 @@ impl TouchTracker {
         }
     }
 
-    fn mark(&mut self, path: &str, mtime: SystemTime) {
-        let bucket = Self::bucket(mtime);
-        self.entries.push((path.to_string(), bucket));
+    /// Record that the tool successfully installed `hash` at `path`. Only the
+    /// latest identity per path is kept so a fresh write supersedes an older
+    /// marker.
+    fn mark_content(&mut self, path: &str, hash: String) {
+        self.mark(path, ExpectedState::Content(hash));
+    }
+
+    /// Record that the tool successfully removed `path`.
+    fn mark_absent(&mut self, path: &str) {
+        self.mark(path, ExpectedState::Absent);
+    }
+
+    fn mark(&mut self, path: &str, state: ExpectedState) {
+        self.entries.retain(|(p, _)| p != path);
+        self.entries.push((path.to_string(), state));
         if self.entries.len() > 50 {
             let drain = self.entries.len() - 50;
             self.entries.drain(0..drain);
         }
     }
 
-    fn is_touched(&self, path: &str, mtime: SystemTime) -> bool {
-        let bucket = Self::bucket(mtime);
-        self.entries.iter().any(|(p, b)| p == path && *b == bucket)
+    /// Whether the tool may have just written `path`, so a caller knows a
+    /// content hash is worth computing before asking `is_touched`.
+    fn contains(&self, path: &str) -> bool {
+        self.entries.iter().any(|(p, _)| p == path)
     }
 
-    fn bucket(mtime: SystemTime) -> i64 {
-        let millis = mtime
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        i64::try_from(millis).unwrap_or(i64::MAX) / 5000
+    /// True when `path`'s current on-disk state matches the identity the tool
+    /// itself installed, i.e. this local change is an echo of our own write
+    /// rather than a distinct user edit.
+    fn is_touched(&self, path: &str, change_type: ChangeType, current_hash: Option<&str>) -> bool {
+        let Some((_, state)) = self.entries.iter().find(|(p, _)| p == path) else {
+            return false;
+        };
+        match state {
+            ExpectedState::Absent => change_type == ChangeType::Deleted,
+            ExpectedState::Content(written) => {
+                change_type != ChangeType::Deleted && current_hash == Some(written.as_str())
+            }
+        }
     }
 }
 
@@ -1825,8 +1859,19 @@ async fn handle_local_change(
     touched: &TouchTracker,
     change: &Change,
 ) -> Result<()> {
-    let mtime = local_mtime(engine.root_dir(), change.path()).await;
-    if touched.is_touched(change.path(), mtime) {
+    // Only hash paths the tool may have just written; ordinary user edits of
+    // arbitrary files skip the (potentially expensive) content check.
+    let current_hash = if touched.contains(change.path()) {
+        match change.change_type() {
+            ChangeType::Created | ChangeType::Modified => {
+                compute_file_hash(&engine.root_dir().join(change.path())).ok()
+            }
+            ChangeType::Deleted => None,
+        }
+    } else {
+        None
+    };
+    if touched.is_touched(change.path(), change.change_type(), current_hash.as_deref()) {
         return Ok(());
     }
 
@@ -1913,8 +1958,10 @@ async fn handle_remote_change(
                 local_content_matches,
             ) {
                 triage::RemoteDeleteVerdict::Apply => {
-                    touched.mark(&local_rel, SystemTime::now());
                     engine.apply_remote_change(&change).await?;
+                    // Only a successful delete leaves an "absent" marker, so a
+                    // failed/slow removal never suppresses a later user edit.
+                    touched.mark_absent(&local_rel);
                 }
                 triage::RemoteDeleteVerdict::Conflict => {
                     let local_state = match &state {
@@ -1947,52 +1994,62 @@ async fn handle_remote_change(
             }
         }
         ChangeType::Created | ChangeType::Modified => {
-            let file_path = engine.root_dir().join(&local_rel);
-            let local_meta = tokio::fs::metadata(&file_path).await.ok();
-            let local_exists = local_meta.is_some();
-            let local_mtime_val = local_meta
-                .and_then(|meta| meta.modified().ok())
-                .unwrap_or_else(SystemTime::now);
-            let local_mtime = DateTime::<Utc>::from(local_mtime_val);
-
-            // Arbitrate using the authoritative CouchDB revision (remote side)
-            // and the stored local sync state (same-machine mtime, immune to
-            // cross-host clock skew) rather than comparing local vs remote
-            // mtimes with a 1s tolerance.
-            let state = engine.get_file_state(&local_rel).await?;
-            let apply_remote = triage::live_should_apply_remote(
-                change.rev(),
-                state.as_ref(),
-                local_exists,
-                local_mtime,
-            );
-
-            if apply_remote {
-                touched.mark(&local_rel, SystemTime::now());
-                engine.apply_remote_change(&change).await?;
-            } else {
-                // Upload the local version to arbitrate. Carry the observed
-                // remote revision as the publication baseline so a further
-                // concurrent remote write landing during the upload is rejected
-                // (surfaced as an error) instead of silently overwritten.
-                let local_change = Change::local_modified(local_rel.clone(), String::new(), 0)
-                    .with_expected_rev(change.rev().map_or(ExpectedRemote::Force, |rev| {
-                        ExpectedRemote::At(rev.to_string())
-                    }));
-                engine.apply_local_change(&local_change).await?;
-            }
+            apply_live_remote_write(engine, touched, &local_rel, &change).await?;
         }
     }
 
     Ok(())
 }
 
-async fn local_mtime(root: &Path, relative_path: &str) -> SystemTime {
-    let file_path = root.join(relative_path);
-    tokio::fs::metadata(&file_path)
-        .await
-        .and_then(|meta| meta.modified())
-        .unwrap_or_else(|_| SystemTime::now())
+/// Apply a remote create/modify to the local tree, arbitrating against any
+/// concurrent local edit and recording the installed content identity only
+/// after a successful write.
+async fn apply_live_remote_write(
+    engine: &mut SyncEngine,
+    touched: &mut TouchTracker,
+    local_rel: &str,
+    change: &Change,
+) -> Result<()> {
+    let file_path = engine.root_dir().join(local_rel);
+    let local_meta = tokio::fs::metadata(&file_path).await.ok();
+    let local_exists = local_meta.is_some();
+    let local_mtime_val = local_meta
+        .and_then(|meta| meta.modified().ok())
+        .unwrap_or_else(SystemTime::now);
+    let local_mtime = DateTime::<Utc>::from(local_mtime_val);
+
+    // Arbitrate using the authoritative CouchDB revision (remote side)
+    // and the stored local sync state (same-machine mtime, immune to
+    // cross-host clock skew) rather than comparing local vs remote
+    // mtimes with a 1s tolerance.
+    let state = engine.get_file_state(local_rel).await?;
+    let apply_remote =
+        triage::live_should_apply_remote(change.rev(), state.as_ref(), local_exists, local_mtime);
+
+    if apply_remote {
+        engine.apply_remote_change(change).await?;
+        // Only a successful write records the installed content as the
+        // expected identity, so a failed/slow download never leaves a marker
+        // that would swallow a real user edit. The on-disk hash is
+        // authoritative: only bytes matching exactly what we wrote are treated
+        // as our own echo; same-bucket edits with different bytes (including
+        // mtime-preserving writes) sync.
+        if let Ok(hash) = compute_file_hash(&file_path) {
+            touched.mark_content(local_rel, hash);
+        }
+    } else {
+        // Upload the local version to arbitrate. Carry the observed remote
+        // revision as the publication baseline so a further concurrent remote
+        // write landing during the upload is rejected (surfaced as an error)
+        // instead of silently overwritten.
+        let local_change = Change::local_modified(local_rel.to_string(), String::new(), 0)
+            .with_expected_rev(change.rev().map_or(ExpectedRemote::Force, |rev| {
+                ExpectedRemote::At(rev.to_string())
+            }));
+        engine.apply_local_change(&local_change).await?;
+    }
+
+    Ok(())
 }
 
 /// List conflicts
@@ -2355,7 +2412,6 @@ mod tests {
     use super::*;
     use crate::couchdb::db::CannedCouch;
     use crate::models::{DownloadCount, FileDoc, UploadCount};
-    use std::time::SystemTime;
     use tempfile::TempDir;
 
     // ── resolve_sync_dir (CLI path resolution) ────────────────────────────
@@ -2643,41 +2699,6 @@ mod tests {
         assert_eq!(result, root.join(".couchdb-file-sync").join("state.db"));
     }
 
-    // ── local_mtime ───────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn test_local_mtime_file_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::write(root.join("test.txt"), "content").unwrap();
-        let mtime = local_mtime(root, "test.txt").await;
-        let now = SystemTime::now();
-        let diff = now.duration_since(mtime).unwrap_or_default();
-        assert!(diff.as_secs() < 5);
-    }
-
-    #[tokio::test]
-    async fn test_local_mtime_file_not_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let mtime = local_mtime(root, "nonexistent.txt").await;
-        let now = SystemTime::now();
-        let diff = now.duration_since(mtime).unwrap_or_default();
-        assert!(diff.as_secs() < 5);
-    }
-
-    #[tokio::test]
-    async fn test_local_mtime_nested_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join("subdir")).unwrap();
-        std::fs::write(root.join("subdir/file.txt"), "content").unwrap();
-        let mtime = local_mtime(root, "subdir/file.txt").await;
-        let now = SystemTime::now();
-        let diff = now.duration_since(mtime).unwrap_or_default();
-        assert!(diff.as_secs() < 5);
-    }
-
     // ── load_ignore_patterns ──────────────────────────────────────────────
 
     #[test]
@@ -2720,6 +2741,80 @@ mod tests {
         .unwrap();
         let matcher = load_ignore_patterns(root);
         assert!(matcher.is_empty());
+    }
+
+    // ── TouchTracker (content-identity echo suppression) ──────────────────
+
+    #[test]
+    fn touch_tracker_suppresses_matching_content_echo() {
+        let mut t = TouchTracker::new();
+        t.mark_content("a.txt", "hash-AAA".to_string());
+        // The watcher's echo of our own write carries the same bytes.
+        assert!(t.is_touched("a.txt", ChangeType::Modified, Some("hash-AAA")));
+        assert!(t.is_touched("a.txt", ChangeType::Created, Some("hash-AAA")));
+        // A different path is never suppressed.
+        assert!(!t.is_touched("b.txt", ChangeType::Modified, Some("hash-AAA")));
+    }
+
+    #[test]
+    fn touch_tracker_propagates_different_bytes_in_same_moment() {
+        let mut t = TouchTracker::new();
+        t.mark_content("a.txt", "hash-AAA".to_string());
+        // A real user edit lands with different bytes; even an instant later it
+        // must not be suppressed.
+        assert!(!t.is_touched("a.txt", ChangeType::Modified, Some("hash-BBB")));
+        // A deleted-echo check with content still present is not ours.
+        assert!(!t.is_touched("a.txt", ChangeType::Deleted, None));
+    }
+
+    #[test]
+    fn touch_tracker_propagates_mtime_preserving_edit() {
+        let mut t = TouchTracker::new();
+        t.mark_content("a.txt", "hash-AAA".to_string());
+        // A tool like `touch -r`/`cp -p` rewrites content while preserving the
+        // mtime; the differing bytes are a genuine edit and must sync.
+        assert!(!t.is_touched("a.txt", ChangeType::Modified, Some("hash-NEW")));
+    }
+
+    #[test]
+    fn touch_tracker_absent_suppresses_delete_echo_but_not_recreate() {
+        let mut t = TouchTracker::new();
+        t.mark_absent("gone.txt");
+        // The delete echo of our own removal is suppressed.
+        assert!(t.is_touched("gone.txt", ChangeType::Deleted, None));
+        // Recreating the file is a distinct user action and must propagate.
+        assert!(!t.is_touched("gone.txt", ChangeType::Created, Some("hash-NEW")));
+        assert!(!t.is_touched("gone.txt", ChangeType::Modified, Some("hash-NEW")));
+    }
+
+    #[test]
+    fn touch_tracker_unmarked_path_never_suppresses() {
+        // Simulates a failed/slow write that left no marker: no identity was
+        // recorded, so a subsequent user edit is never swallowed.
+        let t = TouchTracker::new();
+        assert!(!t.is_touched("a.txt", ChangeType::Modified, Some("hash-AAA")));
+        assert!(!t.is_touched("a.txt", ChangeType::Deleted, None));
+    }
+
+    #[test]
+    fn touch_tracker_latest_write_supersedes_older() {
+        let mut t = TouchTracker::new();
+        t.mark_content("a.txt", "hash-OLD".to_string());
+        // A newer install of different content replaces the prior identity.
+        t.mark_content("a.txt", "hash-NEW".to_string());
+        assert!(!t.is_touched("a.txt", ChangeType::Modified, Some("hash-OLD")));
+        assert!(t.is_touched("a.txt", ChangeType::Modified, Some("hash-NEW")));
+    }
+
+    #[test]
+    fn touch_tracker_is_bounded() {
+        let mut t = TouchTracker::new();
+        for i in 0..80 {
+            t.mark_content(&format!("f{i}.txt"), format!("hash-{i}"));
+        }
+        assert!(t.entries.len() <= 50);
+        // The oldest entries are evicted; the newest 50 remain effective.
+        assert!(t.is_touched("f79.txt", ChangeType::Modified, Some("hash-79")));
     }
 
     // ── RemoteFeedCursor (ordered-ack live cursor) ────────────────────────
