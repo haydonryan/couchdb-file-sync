@@ -3,6 +3,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tracing::info;
@@ -624,11 +625,90 @@ impl LocalDb {
             }),
         }
     }
+
+    /// Read the persisted record of an in-progress authoritative remote
+    /// rebuild, if one is pending. Returns `Ok(None)` when no rebuild is
+    /// incomplete.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata query or deserialization fails.
+    pub fn get_remote_rebuild_journal(&self) -> Result<Option<RemoteRebuildJournal>> {
+        let Some(raw) = self.get_meta(REMOTE_REBUILD_JOURNAL_KEY)? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_str(&raw)?))
+    }
+
+    /// Persist the declared plan/progress of an in-progress authoritative
+    /// remote rebuild. Written before the first upload and updated as
+    /// publication progresses, so an interrupted run leaves an accurate
+    /// journal that a later restart can resume or reconcile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the journal cannot be serialized or written.
+    pub fn set_remote_rebuild_journal(&self, journal: &RemoteRebuildJournal) -> Result<()> {
+        let raw = serde_json::to_string(journal)?;
+        self.set_meta(REMOTE_REBUILD_JOURNAL_KEY, &raw)
+    }
+
+    /// Clear the persisted remote-rebuild journal. Called only once remote
+    /// publication has completed and tracked state has been reset, so a
+    /// normal sync resumes normally.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the journal row cannot be deleted.
+    pub fn clear_remote_rebuild_journal(&self) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM sync_meta WHERE key = ?1",
+            params![REMOTE_REBUILD_JOURNAL_KEY],
+        )?;
+        Ok(())
+    }
 }
 
 /// Key in `sync_meta` storing the serialized [`SyncIdentity`] that local state
 /// is bound to.
 const SYNC_IDENTITY_KEY: &str = "sync_identity";
+
+/// Key in `sync_meta` storing the serialized [`RemoteRebuildJournal`] of an
+/// in-progress authoritative remote rebuild.
+const REMOTE_REBUILD_JOURNAL_KEY: &str = "remote_rebuild_journal";
+
+/// Persisted record of an in-progress (or interrupted) authoritative remote
+/// rebuild.
+///
+/// The journal is written with the full declared plan *before* the first
+/// upload and survives until publication completes. This keeps the previous
+/// baseline intact instead of clearing it up front: if an upload or delete
+/// fails partway, the journal and the pre-rebuild tracked state remain, so a
+/// restart can resume or reconcile the authoritative plan and a normal sync is
+/// refused rather than misclassifying surviving remote data as ordinary new
+/// edits or conflicts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteRebuildJournal {
+    /// Planned local uploads in publication order.
+    pub uploads: Vec<String>,
+    /// Planned remote deletes in publication order.
+    pub deletes: Vec<String>,
+    /// Uploads already published.
+    pub uploads_done: usize,
+    /// Remote deletes already published.
+    pub deletes_done: usize,
+}
+
+impl RemoteRebuildJournal {
+    /// Return a copy of the journal with publication progress advanced to the
+    /// given completed counts, for persisting an accurate checkpoint mid-run.
+    #[must_use]
+    pub const fn with_progress(mut self, uploads_done: usize, deletes_done: usize) -> Self {
+        self.uploads_done = uploads_done;
+        self.deletes_done = deletes_done;
+        self
+    }
+}
 
 /// Outcome of validating the current sync mapping against the stored identity.
 #[derive(Debug, Clone, PartialEq, Eq)]

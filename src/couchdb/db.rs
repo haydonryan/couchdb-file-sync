@@ -883,6 +883,16 @@ impl CouchDb {
     ///
     /// Returns an error if the `CouchDB` request fails.
     pub async fn get_all_files(&self) -> Result<Vec<FileDoc>> {
+        #[cfg(test)]
+        if let Some(state) = &self.test_state {
+            return Ok(state
+                .metadata
+                .values()
+                .filter(|d| d.is_file() && self.is_path_allowed(&d.id))
+                .cloned()
+                .collect());
+        }
+
         let collection = self
             .retry_transient(|| self.db.get_all::<FileDoc>())
             .await?;

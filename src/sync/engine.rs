@@ -1,5 +1,5 @@
 use crate::couchdb::CouchDb;
-use crate::local::{LocalDb, Scanner, compute_bytes_hash, compute_file_hash};
+use crate::local::{LocalDb, RemoteRebuildJournal, Scanner, compute_bytes_hash, compute_file_hash};
 use crate::models::{
     Change, ChangeType, Checkpoint, Conflict, CouchRev, DownloadCount, ExpectedRemote, FileDoc,
     FileState, IgnoreMatcher, RemoteState, ResolutionStrategy, SyncDirPath, UploadCount,
@@ -178,6 +178,22 @@ impl AsyncLocalDb {
 
     async fn reset_sync_state(&self) -> Result<()> {
         self.run(super::super::local::db::LocalDb::reset_sync_state)
+            .await
+    }
+
+    async fn get_remote_rebuild_journal(&self) -> Result<Option<RemoteRebuildJournal>> {
+        self.run(super::super::local::db::LocalDb::get_remote_rebuild_journal)
+            .await
+    }
+
+    async fn set_remote_rebuild_journal(&self, journal: &RemoteRebuildJournal) -> Result<()> {
+        let journal = journal.clone();
+        self.run(move |db| db.set_remote_rebuild_journal(&journal))
+            .await
+    }
+
+    async fn clear_remote_rebuild_journal(&self) -> Result<()> {
+        self.run(super::super::local::db::LocalDb::clear_remote_rebuild_journal)
             .await
     }
 
@@ -1080,6 +1096,26 @@ impl SyncEngine {
         // Fail fast on invalid apply/batch bounds before any work runs.
         self.validate_apply_settings()?;
 
+        // Refuse a real sync while an authoritative remote rebuild is
+        // incomplete. Publication may have failed partway, leaving the remote
+        // partially rebuilt while the previous local baseline is still
+        // authoritative; ordinary triage against that state would misclassify
+        // surviving remote data as new edits or conflicts. The user must
+        // resume (and the rebuild will reconcile) the declared plan via
+        // `rebuild-remote`. A dry-run is read-only and safe to inspect.
+        if !dry_run && let Some(journal) = self.local_db.get_remote_rebuild_journal().await? {
+            anyhow::bail!(
+                "A remote rebuild is incomplete ({}/{} uploads, {}/{} deletes \
+                 published). Run `couchdb-file-sync rebuild-remote` to resume or \
+                 reconcile the authoritative mirror before syncing; a normal sync \
+                 would misclassify surviving remote data as ordinary new edits.",
+                journal.uploads_done,
+                journal.uploads.len(),
+                journal.deletes_done,
+                journal.deletes.len()
+            );
+        }
+
         if dry_run {
             info!("========== DRY-RUN SYNC CYCLE STARTING ==========");
         } else {
@@ -1267,23 +1303,47 @@ impl SyncEngine {
         let (uploads, remote_deletes) =
             triage::plan_remote_rebuild(&local_states, &remote_docs, self.couchdb.remote_prefix());
 
-        self.local_db.reset_sync_state().await?;
+        // Record the declared authoritative plan BEFORE the first upload while
+        // keeping the existing baseline intact. If an upload or delete fails
+        // partway, the journal (and the pre-rebuild tracked state) survive, so
+        // a later restart can resume or reconcile the rebuild and a normal sync
+        // is refused rather than misclassifying surviving remote data as
+        // ordinary new edits. State is only reset once publication completes.
+        let mut journal = RemoteRebuildJournal {
+            uploads: uploads.clone(),
+            deletes: remote_deletes.clone(),
+            uploads_done: 0,
+            deletes_done: 0,
+        };
+        self.local_db.set_remote_rebuild_journal(&journal).await?;
 
         let mut report = SyncReport::default();
 
-        for local_path in uploads {
-            let remote_path = self.couchdb.get_remote_path(&local_path);
+        for local_path in &uploads {
+            let remote_path = self.couchdb.get_remote_path(local_path);
             // Remote rebuild is an explicit, unconditional mirror of local state
             // to remote: force-overwrite any remote doc regardless of its rev.
-            self.upload_local_file(&local_path, &remote_path, &ExpectedRemote::Force)
+            self.upload_local_file(local_path, &remote_path, &ExpectedRemote::Force)
                 .await?;
+            journal.uploads_done += 1;
             report.uploaded.0 += 1;
         }
+        // Persist upload progress so an interrupted run leaves an accurate
+        // journal for resumption/reconciliation.
+        self.local_db.set_remote_rebuild_journal(&journal).await?;
 
-        for remote_path in remote_deletes {
-            self.couchdb.delete_file(&remote_path).await?;
+        for remote_path in &remote_deletes {
+            self.couchdb.delete_file(remote_path).await?;
+            journal.deletes_done += 1;
             report.deleted_remote += 1;
         }
+        self.local_db.set_remote_rebuild_journal(&journal).await?;
+
+        // Publication is complete: the remote mirror now matches local
+        // authority. Only now is it safe to reset tracked state and clear the
+        // journal so a normal sync resumes normally.
+        self.local_db.reset_sync_state().await?;
+        self.local_db.clear_remote_rebuild_journal().await?;
 
         info!(
             "========== REMOTE REBUILD COMPLETE: {} uploaded, {} remote deletes ==========",
@@ -7370,6 +7430,264 @@ mod tests {
         assert!(
             !root.as_path().join(".sync-ignore").exists(),
             ".sync-ignore must stay protected under negation"
+        );
+    }
+
+    fn is_effective_root() -> bool {
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+    }
+
+    // ── Recoverable remote rebuild baseline (#6370) ────────────────────────
+
+    #[tokio::test]
+    async fn rebuild_upload_failure_retains_baseline_and_refuses_sync_until_resumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(root.as_path().join("up.txt"), b"local content").unwrap();
+
+        // The FIRST save of the planned upload fails transiently.
+        let canned = CannedCouch {
+            save_errors_once: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::from(["prefix/up.txt".to_string()]),
+            )),
+            ..CannedCouch::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+        // Baseline: prior tracked state that a rebuild would normally clear.
+        engine
+            .local_db
+            .save_file_state(&FileState::new(
+                "up.txt".to_string(),
+                "deadbeef".to_string(),
+                3,
+                Utc::now() - Duration::days(1),
+            ))
+            .await
+            .unwrap();
+
+        // The first publication attempt fails after the plan is journaled but
+        // before the baseline is cleared.
+        let err = engine
+            .rebuild_remote_from_local()
+            .await
+            .expect_err("transient upload failure must abort the rebuild");
+        assert!(
+            err.to_string().contains("simulated transient save failure"),
+            "unexpected error: {err}"
+        );
+
+        // The baseline is retained: prior tracked state survives a failed
+        // rebuild instead of being cleared up front.
+        assert!(
+            engine.get_file_state("up.txt").await.unwrap().is_some(),
+            "a failed rebuild must retain the previous baseline, not clear it"
+        );
+
+        // The declared plan is journaled with progress so a restart can resume.
+        let journal = engine
+            .local_db
+            .get_remote_rebuild_journal()
+            .await
+            .unwrap()
+            .expect("a failed rebuild must leave a journal");
+        assert_eq!(journal.uploads, vec!["up.txt".to_string()]);
+        assert_eq!(
+            journal.uploads_done, 0,
+            "first upload failed before any progress"
+        );
+
+        // A normal sync is refused rather than misclassifying surviving remote
+        // data as ordinary new edits or conflicts.
+        let sync_err = engine
+            .sync()
+            .await
+            .expect_err("normal sync must be refused while a rebuild is pending");
+        assert!(
+            sync_err
+                .to_string()
+                .contains("remote rebuild is incomplete"),
+            "unexpected sync error: {sync_err}"
+        );
+
+        // Re-running the rebuild resumes/reconciles: the transient failure is
+        // consumed, publication completes, the journal is cleared, and state is
+        // reset so a normal sync resumes normally.
+        let retry = engine
+            .rebuild_remote_from_local()
+            .await
+            .expect("retry must complete the rebuild");
+        assert_eq!(retry.uploaded.0, 1);
+        assert_eq!(
+            engine.local_db.get_remote_rebuild_journal().await.unwrap(),
+            None,
+            "a completed rebuild must clear the journal"
+        );
+        assert!(
+            engine.get_file_state("up.txt").await.unwrap().is_none(),
+            "a completed rebuild must reset tracked state"
+        );
+        engine
+            .sync()
+            .await
+            .expect("normal sync resumes after rebuild");
+    }
+
+    #[tokio::test]
+    async fn rebuild_delete_failure_retains_baseline_and_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(root.as_path().join("keep.txt"), b"keep").unwrap();
+
+        // A remote orphan would be deleted by the rebuild; its delete fails once.
+        let canned = CannedCouch {
+            metadata: std::collections::HashMap::from([(
+                "prefix/old.txt".to_string(),
+                remote_doc_at("prefix/old.txt", "1-abc", Vec::new()),
+            )]),
+            delete_errors_once: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::from(["prefix/old.txt".to_string()]),
+            )),
+            ..CannedCouch::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+        // Baseline: prior tracked state that a rebuild would normally clear.
+        engine
+            .local_db
+            .save_file_state(&FileState::new(
+                "keep.txt".to_string(),
+                "cafe".to_string(),
+                4,
+                Utc::now() - Duration::days(1),
+            ))
+            .await
+            .unwrap();
+
+        let err = engine
+            .rebuild_remote_from_local()
+            .await
+            .expect_err("transient delete failure must abort the rebuild");
+        assert!(
+            err.to_string()
+                .contains("simulated transient delete failure"),
+            "unexpected error: {err}"
+        );
+
+        // The upload completed before the failed delete; the baseline is kept.
+        let journal = engine
+            .local_db
+            .get_remote_rebuild_journal()
+            .await
+            .unwrap()
+            .expect("delete failure must leave a journal");
+        assert_eq!(
+            journal.uploads_done, 1,
+            "upload completed before the failed delete"
+        );
+        assert_eq!(journal.deletes_done, 0, "delete failed before progress");
+        assert_eq!(journal.deletes, vec!["prefix/old.txt".to_string()]);
+        assert!(
+            engine.get_file_state("keep.txt").await.unwrap().is_some(),
+            "a failed rebuild must retain the previous baseline"
+        );
+
+        // Retry completes: the delete succeeds now, the journal is cleared, and
+        // state is reset so a normal sync resumes normally.
+        let retry = engine
+            .rebuild_remote_from_local()
+            .await
+            .expect("retry must complete the rebuild");
+        assert_eq!(retry.uploaded.0, 1);
+        assert_eq!(retry.deleted_remote, 1);
+        assert_eq!(
+            engine.local_db.get_remote_rebuild_journal().await.unwrap(),
+            None
+        );
+        assert!(
+            engine.get_file_state("keep.txt").await.unwrap().is_none(),
+            "a completed rebuild must reset tracked state"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_incomplete_scan_aborts_without_journal_or_remote_deletion() {
+        if is_effective_root() {
+            return; // root bypasses permission checks; the test is void.
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("visible.txt"), b"keep").unwrap();
+        let locked_dir = dir.path().join("locked");
+        std::fs::create_dir_all(&locked_dir).unwrap();
+        std::fs::write(locked_dir.join("hidden.txt"), b"secret").unwrap();
+        let mut perms = std::fs::metadata(&locked_dir).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
+        std::fs::set_permissions(&locked_dir, perms).unwrap();
+
+        let root = SyncDirPath::new(dir.path()).unwrap();
+
+        // A remote orphan that WOULD be deleted if the rebuild ran.
+        let canned = CannedCouch {
+            metadata: std::collections::HashMap::from([(
+                "prefix/old.txt".to_string(),
+                remote_doc_at("prefix/old.txt", "1-abc", Vec::new()),
+            )]),
+            ..CannedCouch::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+        // Baseline: prior tracked state that a rebuild would normally clear.
+        engine
+            .local_db
+            .save_file_state(&FileState::new(
+                "visible.txt".to_string(),
+                "deadbeef".to_string(),
+                4,
+                Utc::now() - Duration::days(1),
+            ))
+            .await
+            .unwrap();
+
+        let err = engine
+            .rebuild_remote_from_local()
+            .await
+            .expect_err("incomplete scan must abort the rebuild");
+        assert!(
+            err.to_string().contains("scan is incomplete"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            engine.local_db.get_remote_rebuild_journal().await.unwrap(),
+            None,
+            "an aborted rebuild must not leave a journal"
+        );
+        assert!(
+            engine
+                .get_file_state("visible.txt")
+                .await
+                .unwrap()
+                .is_some(),
+            "an aborted rebuild must retain the baseline"
+        );
+        assert_eq!(
+            engine.couchdb.test_write_calls(),
+            0,
+            "no remote mutation may happen on an incomplete scan"
         );
     }
 }

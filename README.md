@@ -338,6 +338,17 @@ Replace the remote scope with the current local filesystem for that path. Every 
 couchdb-file-sync rebuild-remote ~/documents
 ```
 
+A rebuild is **resumable and safe to retry**. The declared plan is journaled
+and your existing tracked state is kept until publication completes, so an
+interrupted run (a failed upload/delete or a stopped process) never discards
+the previous baseline. Re-running `rebuild-remote` reconciles the plan to
+completion. While a rebuild is incomplete, a normal `sync`/`daemon` is refused
+rather than misclassifying the partially-published remote as ordinary edits —
+run `rebuild-remote` again to finish the authoritative mirror first. A rebuild
+also refuses to run at all when the local scan is incomplete (an unreadable
+subtree or missing/unmounted sync root), so it never tombstones remote files
+it could not see.
+
 ### `couchdb-file-sync rebuild-local [PATH]`
 
 Replace the local filesystem with the current remote scope for that path. Existing non-ignored local files are removed first, then live remote files are downloaded.
