@@ -26,6 +26,23 @@ pub enum ChangeSource {
     Remote,
 }
 
+/// Remote revision a local publication is authorized against.
+///
+/// Carried from the planning/triage decision into metadata publication so a
+/// stale baseline is rejected instead of overwriting a concurrent writer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExpectedRemote {
+    /// The remote doc should not exist yet (create). Presence of a doc is a
+    /// concurrent-creation race and must not be overwritten.
+    Absent,
+    /// The remote doc should be at exactly this revision (conditional
+    /// overwrite). Any other revision means a concurrent write happened.
+    At(String),
+    /// No expectation: overwrite whatever is on the remote. Only set by
+    /// explicit force paths (conflict resolution, remote rebuild).
+    Force,
+}
+
 /// A change record for sync operations - per-variant sum type preventing invalid combinations
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Change {
@@ -33,11 +50,13 @@ pub enum Change {
         path: String,
         hash: String,
         size: u64,
+        expected_rev: ExpectedRemote,
     },
     LocalModified {
         path: String,
         hash: String,
         size: u64,
+        expected_rev: ExpectedRemote,
     },
     LocalDeleted {
         path: String,
@@ -59,6 +78,12 @@ pub enum Change {
     RemoteDeleted {
         path: String,
         mtime: Option<DateTime<Utc>>,
+        /// The `CouchDB` revision of the deletion (soft-delete tombstone or the
+        /// hard-delete row's winning rev), when available. Carrying the
+        /// monotonic server-assigned revision lets delete ordering be judged
+        /// independently of cross-host wall-clock skew, and is absent only for
+        /// legacy/external tombstones or hard deletes without a parseable rev.
+        rev: Option<String>,
     },
 }
 
@@ -133,21 +158,31 @@ impl Change {
     pub fn rev(&self) -> Option<&str> {
         match self {
             Self::RemoteCreated { rev, .. } | Self::RemoteModified { rev, .. } => Some(rev),
-            Self::LocalCreated { .. }
-            | Self::LocalModified { .. }
-            | Self::LocalDeleted { .. }
-            | Self::RemoteDeleted { .. } => None,
+            Self::RemoteDeleted { rev, .. } => rev.as_deref(),
+            Self::LocalCreated { .. } | Self::LocalModified { .. } | Self::LocalDeleted { .. } => {
+                None
+            }
         }
     }
 
     #[must_use]
     pub const fn local_created(path: String, hash: String, size: u64) -> Self {
-        Self::LocalCreated { path, hash, size }
+        Self::LocalCreated {
+            path,
+            hash,
+            size,
+            expected_rev: ExpectedRemote::Force,
+        }
     }
 
     #[must_use]
     pub const fn local_modified(path: String, hash: String, size: u64) -> Self {
-        Self::LocalModified { path, hash, size }
+        Self::LocalModified {
+            path,
+            hash,
+            size,
+            expected_rev: ExpectedRemote::Force,
+        }
     }
 
     #[must_use]
@@ -190,8 +225,42 @@ impl Change {
     }
 
     #[must_use]
-    pub const fn remote_deleted(path: String, mtime: Option<DateTime<Utc>>) -> Self {
-        Self::RemoteDeleted { path, mtime }
+    pub const fn remote_deleted(
+        path: String,
+        mtime: Option<DateTime<Utc>>,
+        rev: Option<String>,
+    ) -> Self {
+        Self::RemoteDeleted { path, mtime, rev }
+    }
+
+    /// The expected remote revision carried by a local upload decision. Only
+    /// local create/modify changes carry a real expectation; every other
+    /// change (deletes, remote-origin changes) has no publication baseline and
+    /// defaults to [`ExpectedRemote::Force`].
+    #[must_use]
+    pub fn expected_rev(&self) -> ExpectedRemote {
+        match self {
+            Self::LocalCreated { expected_rev, .. } | Self::LocalModified { expected_rev, .. } => {
+                expected_rev.clone()
+            }
+            _ => ExpectedRemote::Force,
+        }
+    }
+
+    /// Override the expected remote revision for this local upload decision.
+    /// No-op for changes that are not local create/modify.
+    #[must_use]
+    pub fn with_expected_rev(mut self, expected_rev: ExpectedRemote) -> Self {
+        match &mut self {
+            Self::LocalCreated {
+                expected_rev: slot, ..
+            }
+            | Self::LocalModified {
+                expected_rev: slot, ..
+            } => *slot = expected_rev,
+            _ => {}
+        }
+        self
     }
 }
 
@@ -337,7 +406,7 @@ mod tests {
 
     #[test]
     fn test_change_remote_deleted() {
-        let c = Change::remote_deleted("/remote/path.txt".into(), None);
+        let c = Change::remote_deleted("/remote/path.txt".into(), None, None);
         assert_eq!(c.path(), "/remote/path.txt");
         assert_eq!(c.change_type(), ChangeType::Deleted);
         assert_eq!(c.source(), ChangeSource::Remote);
@@ -358,7 +427,7 @@ mod tests {
     fn test_change_batch_push_and_len() {
         let mut batch = ChangeBatch::new();
         batch.push(Change::local_created("a.txt".into(), "h1".into(), 100));
-        batch.push(Change::remote_deleted("b.txt".into(), None));
+        batch.push(Change::remote_deleted("b.txt".into(), None, None));
         assert!(!batch.is_empty());
         assert_eq!(batch.len(), 2);
     }
@@ -367,7 +436,7 @@ mod tests {
     fn test_change_batch_local_changes_filter() {
         let mut batch = ChangeBatch::new();
         batch.push(Change::local_created("a.txt".into(), "h1".into(), 100));
-        batch.push(Change::remote_deleted("b.txt".into(), None));
+        batch.push(Change::remote_deleted("b.txt".into(), None, None));
         batch.push(Change::local_deleted("c.txt".into()));
         let locals = batch.local_changes();
         assert_eq!(locals.len(), 2);
@@ -378,7 +447,7 @@ mod tests {
     fn test_change_batch_remote_changes_filter() {
         let mut batch = ChangeBatch::new();
         batch.push(Change::local_created("a.txt".into(), "h1".into(), 100));
-        batch.push(Change::remote_deleted("b.txt".into(), None));
+        batch.push(Change::remote_deleted("b.txt".into(), None, None));
         batch.push(Change::remote_created(
             "c.txt".into(),
             "h2".into(),

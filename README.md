@@ -327,11 +327,16 @@ secret-config.toml
 
 ## Conflict Resolution
 
-When a file is modified on both sides, CouchDB File Sync:
+When a file is modified on both sides — or one side is edited while the
+other side deletes it — CouchDB File Sync:
 
-1. Detects the conflict
+1. Detects the conflict (including local-delete/remote-edit and
+   remote-delete/local-edit races)
 2. Records the conflict in the database
 3. Sends Telegram notification (if configured)
+
+Deletion ordering uses the monotonic CouchDB revision when available, so a
+genuinely-new deletion is never discarded solely due to cross-host clock skew.
 
 Resolve conflicts with:
 
@@ -342,9 +347,13 @@ couchdb-file-sync resolve <path> --strategy <strategy>
 
 ### Resolution Strategies
 
-- **keep-local**: Upload local version to CouchDB
-- **keep-remote**: Download remote version, overwriting local
-- **keep-both**: Save remote as `.remote`, keep local as-is
+- **keep-local**: Upload local version to CouchDB. If the local file was
+  deleted, the deletion is propagated to the remote instead.
+- **keep-remote**: Download remote version, overwriting local. If the remote
+  was deleted (tombstone), the local file is deleted to match — it does not
+  resurrect the tombstone's stale content.
+- **keep-both**: Save remote as `.remote`, keep local as-is. A remote tombstone
+  has no content to keep, so the local file is left untouched.
 
 ## Project Structure
 
