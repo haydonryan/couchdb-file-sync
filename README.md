@@ -429,6 +429,27 @@ couchdb-file-sync/
 └─────────────────────────────────────────────────────────────┘
 ```
 
+### Chunked content storage
+
+File content is not stored as a single CouchDB document. `CouchDB` enforces a
+per-document transport limit (the default `max_document_size` is 8 MiB) and
+rejects any single document whose *encoded* JSON exceeds it with
+`413 document_too_large` — a 9 MiB upload fails even though the file-size limit
+is far larger. To stay within that bound:
+
+- Content is split into ordered chunks of at most **2 MiB** of raw bytes each
+  (`MAX_CHUNK_DATA_BYTES` in `src/couchdb/db.rs`).
+- Each chunk's `data` is base64-encoded on the wire (4 bytes per 3 raw bytes,
+  ~33% expansion), so a 2 MiB chunk encodes to roughly 2.8 MiB of JSON —
+  comfortably inside the 8 MiB document limit with headroom for the surrounding
+  `_id`/`type`/`created_at` fields.
+- A file's `children` field holds its chunk IDs in order, so a file is
+  reconstructed byte-for-byte by concatenating the chunks in `children` order.
+- An empty file stores **no** chunks (an empty `children` list). If a chunk save
+  fails partway through an upload, the error is propagated and no partial chunk
+  set is recorded as the file's `children`; the orphan-written leading chunks
+  are reclaimed by orphan chunk collection after `orphan_chunk_grace_secs`.
+
 ## Development
 
 ### Running Tests
