@@ -22,7 +22,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -1102,6 +1102,228 @@ impl RemoteFeedCursor {
     }
 }
 
+/// Bounded reconciliation state for the live sync loop.
+///
+/// Local changes can fail to apply (transient upload errors) or be lost when
+/// the file watcher's internal event channel overflows (a burst larger than
+/// its capacity). Neither case must strand a local edit until the next user
+/// edit or daemon restart, so the live loop coalesces the affected paths into
+/// `dirty` (and sets `full_rescan` when the watcher dropped events of unknown
+/// scope) and re-runs a full sync cycle as reconciliation. The rescan is
+/// bounded: it only runs when something is pending, and never more often than
+/// `interval`.
+struct Reconcile {
+    /// Coalesced paths whose local apply failed and must be retried.
+    dirty: HashSet<String>,
+    /// Set when the watcher overflowed and dropped events of unknown scope;
+    /// forces a full reconciliation rescan rather than a path-scoped retry.
+    full_rescan: bool,
+    /// When the last reconciliation pass ran (cooldown for boundedness).
+    last: Instant,
+    /// Minimum time between reconciliation passes.
+    interval: Duration,
+}
+
+impl Reconcile {
+    fn new(interval: Duration) -> Self {
+        Self {
+            dirty: HashSet::new(),
+            full_rescan: false,
+            last: Instant::now(),
+            interval,
+        }
+    }
+
+    /// Record that `path` failed to apply and must be retried.
+    fn mark_dirty(&mut self, path: &str) {
+        self.dirty.insert(path.to_string());
+    }
+
+    /// Record that the watcher overflowed and dropped events of unknown scope.
+    const fn mark_full_rescan(&mut self) {
+        self.full_rescan = true;
+    }
+
+    /// Whether any reconciliation work is pending.
+    // `HashSet::is_empty` is not `const`, so this cannot be a `const fn`
+    // despite clippy's `missing_const_for_fn` suggestion.
+    #[allow(clippy::missing_const_for_fn)]
+    fn pending(&self) -> bool {
+        self.full_rescan || !self.dirty.is_empty()
+    }
+
+    /// Whether a reconciliation pass may run now (bounded by `interval`).
+    fn due(&self) -> bool {
+        self.last.elapsed() >= self.interval
+    }
+
+    /// Clear pending state after a successful reconciliation pass.
+    fn reset(&mut self) {
+        self.dirty.clear();
+        self.full_rescan = false;
+        self.last = Instant::now();
+    }
+}
+
+/// Apply one remote changes-feed entry under ordered application
+/// acknowledgement: apply the change, advance the durable cursor only when the
+/// contiguous prefix is fully applied, and report the cursor back to the
+/// producer. Returns `true` when the live loop should stop (the producer is
+/// gone).
+#[allow(clippy::too_many_arguments)] // single cohesive per-entry apply; bundled state would be opaque
+async fn apply_live_remote_entry(
+    engine: &mut SyncEngine,
+    touched: &mut TouchTracker,
+    ignore_matcher: &IgnoreMatcher,
+    entry: ChangeFeedEntry,
+    remote_cursor: &mut RemoteFeedCursor,
+    ack_tx: &mpsc::Sender<String>,
+    config: &AppConfig,
+    path: &Path,
+) -> Result<bool> {
+    let seq = entry.seq.clone();
+    match handle_remote_change(engine, touched, ignore_matcher, entry).await {
+        Ok(()) => {
+            // A failed persistence leaves the durable cursor behind (safe:
+            // nothing is skipped); a restart re-applies the entry idempotently.
+            if let Some(advance_to) = remote_cursor.applied(&seq)
+                && let Err(e) = engine.save_checkpoint(&advance_to).await
+            {
+                warn!("Failed to persist live checkpoint at {advance_to}: {e}");
+            }
+        }
+        Err(e) => {
+            remote_cursor.failed(&seq);
+            warn!("Live remote change error: {}", e);
+            notify_sync_error_telegram(
+                config,
+                Some(path),
+                &format!("Live remote change error: {e}"),
+            )
+            .await;
+            notify_sync_error_matrix(
+                config,
+                Some(path),
+                &format!("Live remote change error: {e}"),
+            )
+            .await;
+        }
+    }
+    // Acknowledge the durable cursor back to the producer after every entry
+    // (success or failure) so the feed resumes from the highest
+    // contiguously-applied sequence.
+    if ack_tx
+        .send(remote_cursor.checkpoint().to_string())
+        .await
+        .is_err()
+    {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Recover from an invalid remote resume cursor by running a full
+/// reconciliation and reporting the fresh checkpoint back to the producer, so
+/// the feed resumes from a known-good position instead of jumping to "now".
+/// Returns `true` when the live loop should stop (the producer is gone).
+async fn reconcile_live_remote_cursor(
+    engine: &mut SyncEngine,
+    ack_tx: &mpsc::Sender<String>,
+    remote_cursor: &mut RemoteFeedCursor,
+) -> Result<bool> {
+    if let Err(e) = engine.sync().await {
+        warn!("Live reconciliation failed: {}", e);
+    }
+    let seq = engine
+        .get_checkpoint()
+        .await
+        .ok()
+        .flatten()
+        .map_or_else(|| remote_cursor.checkpoint().to_string(), |cp| cp.last_seq);
+    *remote_cursor = RemoteFeedCursor::new(seq.clone());
+    if ack_tx.send(seq).await.is_err() {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Apply one local watcher change; a transient apply failure is coalesced into
+/// the bounded reconciliation set so it is retried on the rescan cadence.
+async fn apply_live_local_change(
+    engine: &mut SyncEngine,
+    reconcile: Option<&mut Reconcile>,
+    touched: &TouchTracker,
+    change: &Change,
+    config: &AppConfig,
+    path: &Path,
+) {
+    if let Err(e) = handle_local_change(engine, reconcile, touched, change).await {
+        warn!("Live local change error for {}: {}", change.path(), e);
+        notify_sync_error_telegram(
+            config,
+            Some(path),
+            &format!("Live local change error for {}: {}", change.path(), e),
+        )
+        .await;
+        notify_sync_error_matrix(
+            config,
+            Some(path),
+            &format!("Live local change error for {}: {}", change.path(), e),
+        )
+        .await;
+    }
+}
+
+/// Run a bounded reconciliation rescan when pending local work exists and the
+/// cooldown has elapsed. A full sync cycle re-scans the filesystem and retries
+/// every failed/dropped local change; it also heals remote divergence.
+async fn attempt_live_reconciliation(
+    engine: &mut SyncEngine,
+    reconcile: Option<&mut Reconcile>,
+    config: &AppConfig,
+    path: &Path,
+) {
+    let Some(r) = reconcile else { return };
+    if !(r.pending() && r.due()) {
+        return;
+    }
+    match engine.sync().await {
+        Ok(report) => {
+            if !report.errors.is_empty() {
+                // Some changes still failed; surface them and retry on the
+                // next cadence.
+                let summary = format_sync_error_summary(&report.errors);
+                warn!(
+                    "Live reconciliation left {} error(s): {}",
+                    report.errors.len(),
+                    summary
+                );
+                notify_sync_error_telegram(config, Some(path), &summary).await;
+                notify_sync_error_matrix(config, Some(path), &summary).await;
+            }
+            r.reset();
+        }
+        Err(e) => {
+            // Fatal sync failure: notify the supervisor and back off before the
+            // next retry.
+            warn!("Live reconciliation failed: {}", e);
+            notify_sync_error_telegram(
+                config,
+                Some(path),
+                &format!("Live reconciliation failed: {e}"),
+            )
+            .await;
+            notify_sync_error_matrix(
+                config,
+                Some(path),
+                &format!("Live reconciliation failed: {e}"),
+            )
+            .await;
+            r.last = Instant::now();
+        }
+    }
+}
+
 async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
     info!("Starting live sync in: {}", path.display());
 
@@ -1112,6 +1334,7 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
         mut remote_rx,
         ack_tx,
         mut reconcile_rx,
+        mut overflow_rx,
     } = spawn_live_change_sources(
         config.clone(),
         &path,
@@ -1122,82 +1345,67 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
     let mut touched = TouchTracker::new();
     let mut remote_cursor = RemoteFeedCursor::new(initial_since);
 
+    // Bounded reconciliation: a local apply that fails transiently or a watcher
+    // event that is dropped on overflow must still reach remote without another
+    // user edit or daemon restart. Pending work is coalesced and retried on the
+    // rescan cadence (`0` disables the periodic rescan).
+    let mut reconcile = (config.sync.rescan_interval_secs > 0)
+        .then(|| Reconcile::new(Duration::from_secs(config.sync.rescan_interval_secs)));
+    let mut rescan_timer =
+        tokio::time::interval(Duration::from_secs(config.sync.rescan_interval_secs.max(1)));
+    // The first `interval` tick fires immediately; consume it so the cooldown
+    // drives the cadence rather than running a spurious first pass.
+    rescan_timer.tick().await;
+
     loop {
         tokio::select! {
             Some(change) = local_rx.recv() => {
-                if let Err(e) = handle_local_change(&mut engine, &touched, &change).await {
-                    warn!("Live local change error for {}: {}", change.path(), e);
-                    notify_sync_error_telegram(
-                        &config,
-                        Some(&path),
-                        &format!("Live local change error for {}: {}", change.path(), e),
-                    )
-                    .await;
-                    notify_sync_error_matrix(
-                        &config,
-                        Some(&path),
-                        &format!("Live local change error for {}: {}", change.path(), e),
-                    )
-                    .await;
-                }
+                apply_live_local_change(
+                    &mut engine,
+                    reconcile.as_mut(),
+                    &touched,
+                    &change,
+                    &config,
+                    &path,
+                )
+                .await;
             }
             Some(entry) = remote_rx.recv() => {
-                let seq = entry.seq.clone();
-                match handle_remote_change(&mut engine, &mut touched, &ignore_matcher, entry).await {
-                    Ok(()) => {
-                        // A failed persistence leaves the durable cursor behind
-                        // (safe: nothing is skipped); a restart re-applies the
-                        // entry idempotently.
-                        if let Some(advance_to) = remote_cursor.applied(&seq)
-                            && let Err(e) = engine.save_checkpoint(&advance_to).await
-                        {
-                            warn!("Failed to persist live checkpoint at {advance_to}: {e}");
-                        }
-                    }
-                    Err(e) => {
-                        remote_cursor.failed(&seq);
-                        warn!("Live remote change error: {}", e);
-                        notify_sync_error_telegram(
-                            &config,
-                            Some(&path),
-                            &format!("Live remote change error: {e}"),
-                        )
-                        .await;
-                        notify_sync_error_matrix(
-                            &config,
-                            Some(&path),
-                            &format!("Live remote change error: {e}"),
-                        )
-                        .await;
-                    }
-                }
-                // Acknowledge the durable cursor back to the producer after every
-                // entry (success or failure) so the feed resumes from the highest
-                // contiguously-applied sequence.
-                if ack_tx.send(remote_cursor.checkpoint().to_string()).await.is_err() {
+                if apply_live_remote_entry(
+                    &mut engine,
+                    &mut touched,
+                    &ignore_matcher,
+                    entry,
+                    &mut remote_cursor,
+                    &ack_tx,
+                    &config,
+                    &path,
+                )
+                .await?
+                {
                     return Ok(());
                 }
             }
             Some(()) = reconcile_rx.recv() => {
-                // The producer hit an invalid resume cursor. Run a full
-                // reconciliation to rebuild a valid checkpoint, then report the
-                // fresh cursor so the feed resumes from a known-good position
-                // instead of jumping to "now".
-                if let Err(e) = engine.sync().await {
-                    warn!("Live reconciliation failed: {}", e);
-                }
-                let seq = engine
-                    .get_checkpoint()
-                    .await
-                    .ok()
-                    .flatten()
-                    .map_or_else(|| remote_cursor.checkpoint().to_string(), |cp| cp.last_seq);
-                remote_cursor = RemoteFeedCursor::new(seq.clone());
-                if ack_tx.send(seq).await.is_err() {
+                // The producer hit an invalid resume cursor; reconcile from a
+                // known-good position instead of jumping to "now".
+                if reconcile_live_remote_cursor(&mut engine, &ack_tx, &mut remote_cursor).await? {
                     return Ok(());
                 }
             }
+            Some(()) = overflow_rx.recv() => {
+                if let Some(r) = reconcile.as_mut() {
+                    r.mark_full_rescan();
+                }
+            }
+            _ = rescan_timer.tick(), if reconcile.is_some() => {
+                // Periodic cadence tick; reconciliation attempt below.
+            }
         }
+
+        // Attempt a bounded reconciliation whenever work is pending and the
+        // cooldown has elapsed (runs after any event, and on each timer tick).
+        attempt_live_reconciliation(&mut engine, reconcile.as_mut(), &config, &path).await;
     }
 }
 
@@ -1274,6 +1482,7 @@ struct LiveChangeChannels {
     remote_rx: mpsc::Receiver<ChangeFeedEntry>,
     ack_tx: mpsc::Sender<String>,
     reconcile_rx: mpsc::Receiver<()>,
+    overflow_rx: mpsc::Receiver<()>,
 }
 
 fn spawn_live_change_sources(
@@ -1289,14 +1498,24 @@ fn spawn_live_change_sources(
     // when the producer hits an invalid resume cursor.
     let (ack_tx, ack_rx) = mpsc::channel::<String>(256);
     let (reconcile_tx, reconcile_rx) = mpsc::channel::<()>(1);
+    // Capacity-1 notice signalled by the watcher when its internal event
+    // channel overflows and drops events, so the live loop schedules a bounded
+    // reconciliation rescan (coalesced: a burst yields one pending notice).
+    let (overflow_tx, overflow_rx) = mpsc::channel::<()>(1);
 
     let watcher_root = resolve_sync_dir(path)?;
     let watcher_ignore = ignore_matcher;
     let debounce_ms = config.sync.debounce_ms;
     let watcher_config = config.clone();
     tokio::spawn(async move {
-        if let Err(e) =
-            run_local_watcher(watcher_root.clone(), watcher_ignore, debounce_ms, local_tx).await
+        if let Err(e) = run_local_watcher(
+            watcher_root.clone(),
+            watcher_ignore,
+            debounce_ms,
+            local_tx,
+            overflow_tx,
+        )
+        .await
         {
             error!("Local watcher error: {}", e);
             notify_sync_error_telegram(
@@ -1348,6 +1567,7 @@ fn spawn_live_change_sources(
         remote_rx,
         ack_tx,
         reconcile_rx,
+        overflow_rx,
     })
 }
 
@@ -1356,9 +1576,14 @@ async fn run_local_watcher(
     ignore_matcher: Arc<IgnoreMatcher>,
     debounce_ms: u64,
     tx: mpsc::Sender<Change>,
+    overflow_tx: mpsc::Sender<()>,
 ) -> Result<()> {
-    let mut watcher =
-        AsyncFileWatcher::start(root.clone(), (*ignore_matcher).clone(), debounce_ms)?;
+    let mut watcher = AsyncFileWatcher::start(
+        root.clone(),
+        (*ignore_matcher).clone(),
+        debounce_ms,
+        overflow_tx,
+    )?;
 
     loop {
         if let Some(event) = watcher.next_event().await
@@ -1451,6 +1676,7 @@ async fn run_remote_changes(
 
 async fn handle_local_change(
     engine: &mut SyncEngine,
+    reconcile: Option<&mut Reconcile>,
     touched: &TouchTracker,
     change: &Change,
 ) -> Result<()> {
@@ -1473,6 +1699,12 @@ async fn handle_local_change(
         ChangeType::Created | ChangeType::Modified | ChangeType::Deleted => {
             if let Err(e) = engine.apply_local_change(change).await {
                 warn!("Failed to apply local change {}: {}", change.path(), e);
+                // Coalesce the failed path so the bounded reconciliation rescan
+                // retries it and the error reaches the supervisor.
+                if let Some(r) = reconcile {
+                    r.mark_dirty(change.path());
+                }
+                return Err(e);
             }
         }
     }
@@ -2571,6 +2803,176 @@ mod tests {
         assert!(
             result.is_err(),
             "bootstrap with no durable checkpoint must error, never start from 'now'"
+        );
+    }
+
+    // ── Live reconciliation after transient failure / watcher overflow (#6347) ─
+
+    /// Build a live engine against a canned `CouchDB` that fails the first
+    /// `save_file`/`delete_file` for the given remote path(s), so the live apply
+    /// fails transiently but a reconciliation retry succeeds.
+    fn live_engine_with_transient_failures(
+        local: LocalDb,
+        root: SyncDirPath,
+        save_once: Vec<String>,
+        delete_once: Vec<String>,
+    ) -> SyncEngine {
+        use crate::couchdb::db::CannedCouch;
+        let canned = CannedCouch {
+            save_errors_once: Arc::new(std::sync::Mutex::new(HashSet::from_iter(save_once))),
+            delete_errors_once: Arc::new(std::sync::Mutex::new(HashSet::from_iter(delete_once))),
+            ..Default::default()
+        };
+        SyncEngine::new(
+            CouchDb::for_test_with_canned("prefix/", canned),
+            local,
+            root,
+        )
+    }
+
+    #[tokio::test]
+    async fn live_transient_create_failure_marks_dirty_and_converges() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(dir.path().join("new.txt"), "hello").unwrap();
+
+        let mut engine = live_engine_with_transient_failures(
+            LocalDb::open_in_memory().expect("in-memory LocalDb"),
+            root.clone(),
+            vec!["prefix/new.txt".to_string()],
+            Vec::new(),
+        );
+        let mut reconcile = Reconcile::new(Duration::from_secs(30));
+        let touched = TouchTracker::new();
+        let change = Change::local_created("new.txt".to_string(), String::new(), 0);
+
+        // The live apply fails transiently; the path must be queued for
+        // reconciliation and the error must reach the caller (supervisor).
+        handle_local_change(&mut engine, Some(&mut reconcile), &touched, &change)
+            .await
+            .expect_err("transient upload failure must surface as an error");
+        assert!(reconcile.pending(), "failed path must be queued");
+        assert!(reconcile.dirty.contains("new.txt"));
+
+        // The reconciliation rescan retries the failed upload and converges.
+        let report = engine.sync().await.expect("reconciliation sync");
+        assert!(report.errors.is_empty(), "reconcile must not leave errors");
+        assert!(report.uploaded.0 >= 1, "the failed create must be retried");
+    }
+
+    #[tokio::test]
+    async fn live_transient_edit_failure_marks_dirty_and_converges() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(dir.path().join("edit.txt"), "v1").unwrap();
+        // Seed a tracked state, then edit the file so triage sees a change.
+        let local = LocalDb::open_in_memory().expect("in-memory LocalDb");
+        local
+            .save_file_state(&FileState::new(
+                "edit.txt".to_string(),
+                "stale-hash".to_string(),
+                2,
+                Utc::now(),
+            ))
+            .expect("seed state");
+        std::fs::write(dir.path().join("edit.txt"), "v2").unwrap();
+
+        let mut engine = live_engine_with_transient_failures(
+            local,
+            root.clone(),
+            vec!["prefix/edit.txt".to_string()],
+            Vec::new(),
+        );
+
+        let mut reconcile = Reconcile::new(Duration::from_secs(30));
+        let touched = TouchTracker::new();
+        let change = Change::local_modified("edit.txt".to_string(), String::new(), 0);
+
+        handle_local_change(&mut engine, Some(&mut reconcile), &touched, &change)
+            .await
+            .expect_err("transient upload failure must surface as an error");
+        assert!(reconcile.dirty.contains("edit.txt"));
+
+        let report = engine.sync().await.expect("reconciliation sync");
+        assert!(report.errors.is_empty(), "reconcile must not leave errors");
+        assert!(report.uploaded.0 >= 1, "the failed edit must be retried");
+    }
+
+    #[tokio::test]
+    async fn live_transient_delete_failure_marks_dirty_and_converges() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(dir.path().join("del.txt"), "data").unwrap();
+        let local = LocalDb::open_in_memory().expect("in-memory LocalDb");
+        local
+            .save_file_state(&FileState::new(
+                "del.txt".to_string(),
+                "stale-hash".to_string(),
+                4,
+                Utc::now(),
+            ))
+            .expect("seed state");
+        let mut engine = live_engine_with_transient_failures(
+            local,
+            root.clone(),
+            Vec::new(),
+            vec!["prefix/del.txt".to_string()],
+        );
+
+        let mut reconcile = Reconcile::new(Duration::from_secs(30));
+        let touched = TouchTracker::new();
+        std::fs::remove_file(dir.path().join("del.txt")).unwrap();
+        let change = Change::local_deleted("del.txt".to_string());
+
+        handle_local_change(&mut engine, Some(&mut reconcile), &touched, &change)
+            .await
+            .expect_err("transient delete failure must surface as an error");
+        assert!(reconcile.dirty.contains("del.txt"));
+
+        let report = engine.sync().await.expect("reconciliation sync");
+        assert!(report.errors.is_empty(), "reconcile must not leave errors");
+        assert!(
+            report.deleted_remote >= 1,
+            "the failed delete must be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn watcher_overflow_schedules_full_rescan_that_converges() {
+        // A file is created but its watcher event is lost to overflow (a burst
+        // larger than the channel capacity). The overflow notice sets
+        // `full_rescan`, and the bounded reconciliation converges the untracked
+        // file without another user edit.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(dir.path().join("burst.txt"), "data").unwrap();
+
+        let mut engine = live_engine_with_transient_failures(
+            LocalDb::open_in_memory().expect("in-memory LocalDb"),
+            root.clone(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut reconcile = Reconcile::new(Duration::from_secs(30));
+
+        // Watcher overflow notice consumed by the live loop.
+        reconcile.mark_full_rescan();
+        assert!(reconcile.pending(), "overflow must schedule reconciliation");
+        assert!(
+            !reconcile.dirty.contains("burst.txt"),
+            "overflow marks a full rescan, not a specific path"
+        );
+
+        let report = engine.sync().await.expect("reconciliation sync");
+        assert!(report.errors.is_empty());
+        assert!(
+            report.uploaded.0 >= 1,
+            "overflow-dropped create must converge"
+        );
+        reconcile.reset();
+        assert!(
+            !reconcile.pending(),
+            "reconciliation must clear pending work"
         );
     }
 }

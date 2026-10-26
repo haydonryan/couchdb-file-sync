@@ -154,6 +154,17 @@ impl AsyncLocalDb {
         self.run(super::super::local::db::LocalDb::reset_sync_state)
             .await
     }
+
+    async fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        let key = key.to_string();
+        self.run(move |db| db.get_meta(&key)).await
+    }
+
+    async fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        let key = key.to_string();
+        let value = value.to_string();
+        self.run(move |db| db.set_meta(&key, &value)).await
+    }
 }
 
 /// Owned handle to the per-file apply state used by the bounded-concurrency
@@ -1019,26 +1030,76 @@ impl SyncEngine {
         Ok(report)
     }
 
+    /// One-time, versioned, conservative migration that repairs historical
+    /// state entries polluted by the remote prefix.
+    ///
+    /// This replaces the old lexical prefix purge in [`Self::scan_local_changes`]
+    /// (which deleted any path starting with the remote prefix and so destroyed
+    /// legitimate local subtrees sharing the prefix's name). It runs at most
+    /// once per remote scope (persisted in `sync_meta`) and only removes an
+    /// entry that is unambiguously a phantom: its on-disk prefixed path does
+    /// not exist while its prefix-stripped local path does (the real file lives
+    /// at the stripped path). Valid baselines and ambiguous entries are never
+    /// touched.
+    async fn migrate_historical_pollution(
+        &self,
+        stored_states: &[FileState],
+        remote_prefix: &str,
+    ) -> Result<()> {
+        if remote_prefix.is_empty() {
+            return Ok(());
+        }
+        let marker_key = format!("polluted_migration:{remote_prefix}");
+        if self.local_db.get_meta(&marker_key).await?.is_some() {
+            return Ok(());
+        }
+
+        let repairs = triage::polluted_state_repairs(
+            stored_states,
+            remote_prefix,
+            |p| self.root_dir.as_path().join(p).exists(),
+            |p| self.root_dir.as_path().join(p).exists(),
+        );
+        for path in &repairs {
+            warn!(
+                "Migrating historically polluted state entry for {path}: the real \
+                 file lives at its prefix-stripped path; removing phantom prefixed entry"
+            );
+            self.local_db.delete_file_state(path).await?;
+        }
+        // Record the migration as run even when nothing was repaired so it is
+        // not re-attempted (and re-stat'ed) every cycle.
+        self.local_db.set_meta(&marker_key, "done").await?;
+        Ok(())
+    }
+
     /// Scan for local changes.
     ///
     /// In dry-run mode the scan still detects changes, but the state-DB
-    /// cleanups (removing polluted/ignored entries and re-saving unchanged
-    /// states) are skipped so that nothing is written to the state DB.
+    /// cleanups (removing ignored entries, running the one-time pollution
+    /// migration, and re-saving unchanged states) are skipped so that nothing
+    /// is written to the state DB.
     async fn scan_local_changes(&self, dry_run: bool) -> Result<Vec<Change>> {
         let stored_states = self.local_db.get_all_file_states().await?;
         let remote_prefix = self.couchdb.remote_prefix();
         let mut valid_stored_states = Vec::with_capacity(stored_states.len());
 
+        // One-time versioned migration replacing the old lexical prefix purge.
+        // The old code deleted ANY state whose path started with the remote
+        // prefix, which wrongly destroyed legitimate local subtrees that happen
+        // to share the prefix's name (e.g. a local notes/a.txt under a remote
+        // notes/ scope) — losing the baseline so the file's later deletion
+        // stopped propagating. The replacement only repairs entries with
+        // explicit filesystem evidence of pollution, never a valid baseline.
+        // Skipped in dry-run so the migration is a real (written) change only
+        // when state DB writes are actually permitted.
+        if !dry_run {
+            self.migrate_historical_pollution(&stored_states, remote_prefix)
+                .await?;
+        }
+
         for state in stored_states {
-            if triage::is_polluted_state_path(&state.path, remote_prefix) {
-                warn!(
-                    "Removing invalid state entry for {}: local state includes remote prefix {}",
-                    state.path, remote_prefix
-                );
-                if !dry_run {
-                    self.local_db.delete_file_state(&state.path).await?;
-                }
-            } else if self
+            if self
                 .ignore_matcher
                 .should_ignore(std::path::Path::new(&state.path))
             {
@@ -1057,8 +1118,7 @@ impl SyncEngine {
         // Scan the tree against the valid stored states so unchanged files
         // (mtime AND size equal, not racily clean) reuse their stored hash
         // instead of re-reading and re-hashing every file on every sync.
-        // Polluted/ignored states are excluded above, so their hashes are never
-        // reused.
+        // Ignored states are excluded above, so their hashes are never reused.
         let stored_states = Arc::new(valid_stored_states);
         let outcome = self
             .scanner
@@ -2267,6 +2327,91 @@ mod tests {
         );
         // Local file untouched
         assert!(root.as_path().join("new.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn prefix_named_nested_path_survives_cycles_and_deletion_propagates() {
+        // A legitimate local subtree whose name coincides with the remote prefix
+        // (local notes/a.txt under a remote notes/ scope) must remain tracked
+        // across modification and restart, and its deletion must propagate.
+        // The old lexical prefix purge deleted any state whose path started with
+        // the prefix, dropping the baseline so a later local deletion was never
+        // detected (it failed to propagate). Regression for story #6342.
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        // Keep the state DB outside the sync root so the scanner never sees it.
+        let state_db = db_dir.path().join("state.db");
+        let notes = root.as_path().join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        let file = notes.join("a.txt");
+        std::fs::write(&file, "v1").unwrap();
+
+        let remote_prefix = "notes/";
+        let make_engine = |local: LocalDb| {
+            let canned = CannedCouch {
+                changes: Vec::new(),
+                last_seq: "0".to_string(),
+                ..Default::default()
+            };
+            SyncEngine::with_ignore(
+                test_canned_couch(remote_prefix, canned),
+                local,
+                root.clone(),
+                IgnoreMatcher::empty(),
+            )
+        };
+
+        // Cycle 1: the new prefix-named file is created and tracked.
+        {
+            let mut engine = make_engine(LocalDb::open(&state_db).unwrap());
+            let report = engine.sync().await.expect("sync cycle 1");
+            assert_eq!(report.uploaded.0, 1, "new prefix-named file uploaded");
+            assert_eq!(report.deleted_remote, 0);
+        }
+
+        // Restart: a fresh engine over the same DB + disk sees no change — the
+        // prefix-named state is retained, not purged and re-uploaded.
+        {
+            let mut engine = make_engine(LocalDb::open(&state_db).unwrap());
+            let report = engine.sync().await.expect("sync cycle 2 (restart)");
+            assert_eq!(
+                report.uploaded.0, 0,
+                "unchanged prefix-named file must not be re-uploaded after restart"
+            );
+            assert_eq!(
+                report.deleted_remote, 0,
+                "must not infer a remote deletion from the prefix-named path"
+            );
+            assert!(
+                engine
+                    .get_file_state("notes/a.txt")
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "prefix-named state must be retained across restart"
+            );
+        }
+
+        // Modify the file → the change propagates as an upload.
+        std::fs::write(&file, "a-longer-content-v2").unwrap();
+        {
+            let mut engine = make_engine(LocalDb::open(&state_db).unwrap());
+            let report = engine.sync().await.expect("sync cycle 3 (modify)");
+            assert_eq!(report.uploaded.0, 1, "modification propagates");
+        }
+
+        // Delete the file → the deletion propagates to the remote scope. With the
+        // old purge the baseline had been dropped, so this reported 0 deletions.
+        std::fs::remove_file(&file).unwrap();
+        {
+            let mut engine = make_engine(LocalDb::open(&state_db).unwrap());
+            let report = engine.sync().await.expect("sync cycle 4 (delete)");
+            assert_eq!(
+                report.deleted_remote, 1,
+                "deletion of the prefix-named file must propagate"
+            );
+        }
     }
 
     #[tokio::test]

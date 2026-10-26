@@ -71,29 +71,47 @@ impl RateLimitedWarn {
 /// Couples the debounced-event channel with the rate-limited drop warning so
 /// every `try_send` failure in `process_event` routes through a single,
 /// rate-limited warning point instead of being silently discarded.
+///
+/// When the internal event channel is full (a burst larger than its capacity),
+/// the event is dropped AND an overflow notice is signalled on `overflow_tx`.
+/// The live sync loop consumes that notice and schedules a bounded
+/// reconciliation rescan, so the dropped events are not lost to sync forever.
 struct EventSender {
     tx: mpsc::Sender<WatcherEvent>,
+    /// Capacity-1 overflow notice consumed by the live loop to trigger a
+    /// reconciliation rescan after an event burst drops watcher events.
+    overflow_tx: mpsc::Sender<()>,
     drop_warn: RateLimitedWarn,
 }
 
 impl EventSender {
-    const fn new(tx: mpsc::Sender<WatcherEvent>, warn_interval: Duration) -> Self {
+    const fn new(
+        tx: mpsc::Sender<WatcherEvent>,
+        overflow_tx: mpsc::Sender<()>,
+        warn_interval: Duration,
+    ) -> Self {
         Self {
             tx,
+            overflow_tx,
             drop_warn: RateLimitedWarn::new(warn_interval),
         }
     }
 
-    /// Try to enqueue `event`; on failure log a rate-limited warning rather
-    /// than silently dropping the event (which would be lost to sync).
+    /// Try to enqueue `event`; on failure log a rate-limited warning and signal
+    /// an overflow notice rather than silently dropping the event (which would
+    /// otherwise be lost to sync).
     fn send(&self, event: WatcherEvent) {
-        if let Err(err) = self.tx.try_send(event)
-            && self.drop_warn.should_emit()
-        {
-            warn!(
-                error = %err,
-                "dropped file-watcher event: internal event channel is full; event will not be synced"
-            );
+        if let Err(err) = self.tx.try_send(event) {
+            if self.drop_warn.should_emit() {
+                warn!(
+                    error = %err,
+                    "dropped file-watcher event: internal event channel is full; scheduling reconciliation to recover the lost change"
+                );
+            }
+            // Signal overflow so the live loop schedules a bounded rescan that
+            // recovers the dropped change(s). `try_send` on the capacity-1
+            // notice coalesces a burst into a single pending reconciliation.
+            let _ = self.overflow_tx.try_send(());
         }
     }
 }
@@ -108,12 +126,13 @@ impl FileWatcher {
         root_dir: SyncDirPath,
         ignore_matcher: IgnoreMatcher,
         debounce_ms: u64,
+        overflow_tx: mpsc::Sender<()>,
     ) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::channel(100);
         let ignore_matcher = Arc::new(ignore_matcher);
         let closure_matcher = ignore_matcher;
         let root = root_dir.clone();
-        let sender = EventSender::new(event_tx, DROP_WARN_INTERVAL);
+        let sender = EventSender::new(event_tx, overflow_tx, DROP_WARN_INTERVAL);
         let mut debouncer = new_debouncer(
             Duration::from_millis(debounce_ms),
             None,
@@ -308,8 +327,9 @@ impl AsyncFileWatcher {
         root_dir: SyncDirPath,
         ignore_matcher: IgnoreMatcher,
         debounce_ms: u64,
+        overflow_tx: mpsc::Sender<()>,
     ) -> Result<Self> {
-        let inner = FileWatcher::new(root_dir, ignore_matcher, debounce_ms)?;
+        let inner = FileWatcher::new(root_dir, ignore_matcher, debounce_ms, overflow_tx)?;
         Ok(Self { inner })
     }
 
@@ -539,7 +559,7 @@ mod tests {
     #[test]
     fn test_process_event_create_sends_file_created() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-        let sender = EventSender::new(tx, Duration::from_secs(1));
+        let sender = EventSender::new(tx, tokio::sync::mpsc::channel(1).0, Duration::from_secs(1));
         let matcher = IgnoreMatcher::empty();
         let root = Path::new("/root");
 
@@ -560,7 +580,7 @@ mod tests {
     #[test]
     fn test_process_event_create_ignored_path_skipped() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-        let sender = EventSender::new(tx, Duration::from_secs(1));
+        let sender = EventSender::new(tx, tokio::sync::mpsc::channel(1).0, Duration::from_secs(1));
         let matcher = IgnoreMatcher::from_content("*.tmp");
         let root = Path::new("/root");
 
@@ -577,7 +597,7 @@ mod tests {
     #[test]
     fn test_process_event_create_path_outside_root_skipped() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-        let sender = EventSender::new(tx, Duration::from_secs(1));
+        let sender = EventSender::new(tx, tokio::sync::mpsc::channel(1).0, Duration::from_secs(1));
         let matcher = IgnoreMatcher::empty();
         let root = Path::new("/root");
 
@@ -597,7 +617,7 @@ mod tests {
     #[test]
     fn test_process_event_modify_data_sends_file_modified() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-        let sender = EventSender::new(tx, Duration::from_secs(1));
+        let sender = EventSender::new(tx, tokio::sync::mpsc::channel(1).0, Duration::from_secs(1));
         let matcher = IgnoreMatcher::empty();
         let root = Path::new("/root");
 
@@ -618,7 +638,7 @@ mod tests {
     #[test]
     fn test_process_event_modify_any_sends_file_modified() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-        let sender = EventSender::new(tx, Duration::from_secs(1));
+        let sender = EventSender::new(tx, tokio::sync::mpsc::channel(1).0, Duration::from_secs(1));
         let matcher = IgnoreMatcher::empty();
         let root = Path::new("/root");
 
@@ -642,7 +662,7 @@ mod tests {
     #[test]
     fn test_process_event_rename_from_sends_file_deleted() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-        let sender = EventSender::new(tx, Duration::from_secs(1));
+        let sender = EventSender::new(tx, tokio::sync::mpsc::channel(1).0, Duration::from_secs(1));
         let matcher = IgnoreMatcher::empty();
         let root = Path::new("/root");
 
@@ -663,7 +683,7 @@ mod tests {
     #[test]
     fn test_process_event_rename_to_sends_file_created() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-        let sender = EventSender::new(tx, Duration::from_secs(1));
+        let sender = EventSender::new(tx, tokio::sync::mpsc::channel(1).0, Duration::from_secs(1));
         let matcher = IgnoreMatcher::empty();
         let root = Path::new("/root");
 
@@ -684,7 +704,7 @@ mod tests {
     #[test]
     fn test_process_event_rename_both_sends_delete_and_create() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-        let sender = EventSender::new(tx, Duration::from_secs(1));
+        let sender = EventSender::new(tx, tokio::sync::mpsc::channel(1).0, Duration::from_secs(1));
         let matcher = IgnoreMatcher::empty();
         let root = Path::new("/root");
 
@@ -721,7 +741,7 @@ mod tests {
     #[test]
     fn test_process_event_rename_both_single_path_does_nothing() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-        let sender = EventSender::new(tx, Duration::from_secs(1));
+        let sender = EventSender::new(tx, tokio::sync::mpsc::channel(1).0, Duration::from_secs(1));
         let matcher = IgnoreMatcher::empty();
         let root = Path::new("/root");
 
@@ -743,7 +763,7 @@ mod tests {
     #[test]
     fn test_process_event_remove_sends_file_deleted() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-        let sender = EventSender::new(tx, Duration::from_secs(1));
+        let sender = EventSender::new(tx, tokio::sync::mpsc::channel(1).0, Duration::from_secs(1));
         let matcher = IgnoreMatcher::empty();
         let root = Path::new("/root");
 
@@ -767,7 +787,7 @@ mod tests {
     #[test]
     fn test_process_event_rename_from_ignored_path_skipped() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-        let sender = EventSender::new(tx, Duration::from_secs(1));
+        let sender = EventSender::new(tx, tokio::sync::mpsc::channel(1).0, Duration::from_secs(1));
         let matcher = IgnoreMatcher::from_content("*.old");
         let root = Path::new("/root");
 
@@ -784,7 +804,7 @@ mod tests {
     #[test]
     fn test_process_event_remove_ignored_path_skipped() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-        let sender = EventSender::new(tx, Duration::from_secs(1));
+        let sender = EventSender::new(tx, tokio::sync::mpsc::channel(1).0, Duration::from_secs(1));
         let matcher = IgnoreMatcher::from_content("*.swp");
         let root = Path::new("/root");
 
@@ -810,10 +830,12 @@ mod tests {
         // would stop compiling; if a watcher were constructed without owning
         // the debouncer, this assertion would fail at runtime.
         let tmp = tempfile::tempdir().expect("temporary dir");
+        let (_overflow_tx, _overflow_rx) = tokio::sync::mpsc::channel(1);
         let watcher = FileWatcher::new(
             SyncDirPath::new(tmp.path()).expect("valid test root"),
             IgnoreMatcher::empty(),
             100,
+            _overflow_tx,
         )
         .expect("watcher starts");
 
@@ -865,7 +887,8 @@ mod tests {
 
         with_default(subscriber, || {
             let (tx, _rx) = tokio::sync::mpsc::channel(100);
-            let sender = EventSender::new(tx, Duration::ZERO);
+            let (overflow_tx, _overflow_rx) = tokio::sync::mpsc::channel(1);
+            let sender = EventSender::new(tx, overflow_tx, Duration::ZERO);
             let path = PathBuf::from("/root/dropped.txt");
 
             // Fill the 100-capacity channel so the next send is dropped.
@@ -898,7 +921,8 @@ mod tests {
 
         with_default(subscriber, || {
             let (tx, _rx) = tokio::sync::mpsc::channel(100);
-            let sender = EventSender::new(tx, Duration::from_mins(1));
+            let (overflow_tx, _overflow_rx) = tokio::sync::mpsc::channel(1);
+            let sender = EventSender::new(tx, overflow_tx, Duration::from_mins(1));
             let path = PathBuf::from("/root/burst.txt");
 
             for _ in 0..100 {
@@ -922,6 +946,39 @@ mod tests {
         assert_eq!(
             warn_count, 1,
             "expected a single rate-limited warning, got {warn_count} in: {output}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Event overflow signals reconciliation (story #6347)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_send_after_full_channel_signals_overflow() {
+        // When the internal 100-slot event channel fills, `EventSender` must
+        // signal the overflow notice (coalesced into one) so the live loop can
+        // schedule a reconciliation rescan instead of losing the change forever.
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        let (overflow_tx, mut overflow_rx) = tokio::sync::mpsc::channel(1);
+        let sender = EventSender::new(tx, overflow_tx, Duration::ZERO);
+        let path = PathBuf::from("/root/burst.txt");
+
+        // Fill the 100-capacity channel, then overflow it.
+        for _ in 0..100 {
+            sender.send(WatcherEvent::FileCreated(path.clone()));
+        }
+        for _ in 0..10 {
+            sender.send(WatcherEvent::FileCreated(path.clone()));
+        }
+
+        // The overflow notice must be delivered (coalesced: a burst yields one
+        // pending notice because the channel has capacity 1).
+        assert!(
+            overflow_rx.try_recv().is_ok(),
+            "overflow must signal a reconciliation notice after events are dropped"
+        );
+        assert!(
+            overflow_rx.try_recv().is_err(),
+            "a burst must coalesce into a single pending overflow notice"
         );
     }
     // -----------------------------------------------------------------------
