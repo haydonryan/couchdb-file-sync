@@ -165,6 +165,10 @@ struct ApplyWorker {
     couchdb: Arc<CouchDb>,
     local_db: AsyncLocalDb,
     root_dir: SyncDirPath,
+    /// Incoming-path policy used as a defensive guard at write/delete
+    /// boundaries so ignored or internal paths are never written or removed
+    /// locally even if they slipped past triage.
+    ignore_matcher: IgnoreMatcher,
 }
 
 impl ApplyWorker {
@@ -354,6 +358,21 @@ impl ApplyWorker {
         let remote_path = change.path();
         let local_path = self.couchdb.get_local_path(remote_path);
         let file_path = self.root_dir.join_contained(&local_path)?;
+
+        // Defensive guard at the incoming write/delete boundary: never create,
+        // overwrite, or delete an ignored/internal local path, even if it
+        // slipped past triage (e.g. a live-applied remote change that was not
+        // routed through the pre-triage filter).
+        if self
+            .ignore_matcher
+            .should_ignore(std::path::Path::new(&local_path))
+        {
+            debug!(
+                "Skipping ignored remote change at write/delete boundary: {}",
+                local_path
+            );
+            return Ok(());
+        }
 
         debug!("[DOWNLOAD] Remote is newer, downloading chunked file");
         debug!("[DOWNLOAD] {} -> {}", remote_path, local_path);
@@ -592,6 +611,7 @@ impl SyncEngine {
             couchdb: self.couchdb.clone(),
             local_db: self.local_db.clone(),
             root_dir: self.root_dir.clone(),
+            ignore_matcher: self.ignore_matcher.clone(),
         }
     }
 
@@ -642,6 +662,26 @@ impl SyncEngine {
         // 2. Get remote changes
         let (remote_changes, last_seq) = self.fetch_remote_changes().await?;
         info!("Remote files fetched: {}", remote_changes.len());
+
+        // Apply the effective incoming path policy BEFORE remote triage so
+        // ignored or internal remote files are never downloaded, deleted, or
+        // conflicted. Skipping them here (rather than counting them as errors)
+        // is the ignored-change checkpoint behavior: the sync cycle advances
+        // the remote change-feed checkpoint past them, so an ignored file is
+        // not retried every cycle.
+        let remote_changes: Vec<Change> = remote_changes
+            .into_iter()
+            .filter(|change| {
+                let local_path = self.couchdb.get_local_path(change.path());
+                if self.incoming_path_is_ignored(&local_path) {
+                    info!("Skipping ignored remote change: {}", change.path());
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+
         for change in &remote_changes {
             debug!(
                 "  [REMOTE] {} - rev: {:?}, mtime: {:?}",
@@ -788,6 +828,15 @@ impl SyncEngine {
         let mut report = SyncReport::default();
 
         for local_path in local_deletes {
+            // Defensive guard: never delete an ignored/internal local path
+            // during a local rebuild.
+            if self.incoming_path_is_ignored(&local_path) {
+                debug!(
+                    "Skipping ignored local path during rebuild delete: {}",
+                    local_path
+                );
+                continue;
+            }
             let file_path = self.root_dir.join_contained(&local_path)?;
             if file_path.exists() {
                 tokio::fs::remove_file(&file_path).await?;
@@ -797,6 +846,15 @@ impl SyncEngine {
 
         for remote_path in remote_downloads {
             let local_path = self.couchdb.get_local_path(&remote_path);
+            // Defensive guard: never download an ignored/internal remote path
+            // during a local rebuild.
+            if self.incoming_path_is_ignored(&local_path) {
+                debug!(
+                    "Skipping ignored remote path during rebuild download: {}",
+                    remote_path
+                );
+                continue;
+            }
             if self
                 .download_remote_file(&remote_path, &local_path, true)
                 .await?
@@ -1407,6 +1465,19 @@ impl SyncEngine {
     #[must_use]
     pub const fn ignore_matcher(&self) -> &IgnoreMatcher {
         &self.ignore_matcher
+    }
+
+    /// The effective incoming path policy: whether an incoming remote path
+    /// (expressed as its local-side path) must be excluded from being applied
+    /// locally. This is the single source of truth for incoming exclusions —
+    /// it delegates to [`IgnoreMatcher::should_ignore`], which applies the
+    /// configured patterns AND unconditionally protects the internal state
+    /// paths (`.couchdb-file-sync`, `.couchfs`, `.sync-ignore`) even when a
+    /// negation pattern would otherwise re-include them.
+    #[must_use]
+    fn incoming_path_is_ignored(&self, local_path: &str) -> bool {
+        self.ignore_matcher
+            .should_ignore(std::path::Path::new(local_path))
     }
 
     /// Resolve a conflict
@@ -3224,5 +3295,274 @@ mod tests {
             .unwrap();
 
         assert!(to_apply.is_empty(), "stale remote delete is skipped");
+    }
+
+    // ── Incoming ignore / internal-path policy ─────────────────────────
+
+    #[tokio::test]
+    async fn dry_run_skips_ignored_and_internal_remote_changes_before_triage() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let local = test_local_db();
+        local.save_checkpoint("100-before").unwrap();
+
+        let remote_prefix = "prefix/";
+        let canned = CannedCouch {
+            changes: vec![
+                // Ignored by the configured pattern (*.log)
+                Change::remote_created(
+                    format!("{remote_prefix}debug.log"),
+                    "hash".to_string(),
+                    9,
+                    Utc::now(),
+                    "1-a".to_string(),
+                ),
+                // Internal state path — unconditionally protected
+                Change::remote_created(
+                    format!("{remote_prefix}.couchdb-file-sync/injected.txt"),
+                    "hash".to_string(),
+                    3,
+                    Utc::now(),
+                    "1-b".to_string(),
+                ),
+                // .sync-ignore — unconditionally protected
+                Change::remote_created(
+                    format!("{remote_prefix}.sync-ignore"),
+                    "hash".to_string(),
+                    3,
+                    Utc::now(),
+                    "1-c".to_string(),
+                ),
+                // Normal file — must still be triaged as a download
+                Change::remote_created(
+                    format!("{remote_prefix}ok.txt"),
+                    "hash".to_string(),
+                    6,
+                    Utc::now(),
+                    "1-d".to_string(),
+                ),
+            ],
+            last_seq: "200-after".to_string(),
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch(remote_prefix, canned),
+            local,
+            root.clone(),
+            IgnoreMatcher::from_content("*.log"),
+        );
+
+        let report = engine.sync_dry_run().await.expect("dry run");
+
+        assert_eq!(
+            report.downloaded.0, 1,
+            "only ok.txt should be queued for download"
+        );
+        assert_eq!(report.errors, [] as [String; 0]);
+        assert_eq!(report.conflicts, 0);
+        assert!(!root.as_path().join("debug.log").exists());
+        assert!(
+            !root
+                .as_path()
+                .join(".couchdb-file-sync/injected.txt")
+                .exists()
+        );
+        assert!(!root.as_path().join(".sync-ignore").exists());
+    }
+
+    #[tokio::test]
+    async fn sync_skips_ignored_remote_change_and_advances_checkpoint_past_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let local = test_local_db();
+        local.save_checkpoint("100-before").unwrap();
+
+        let remote_prefix = "prefix/";
+        let ok_path = format!("{remote_prefix}ok.txt");
+        let canned = CannedCouch {
+            changes: vec![
+                Change::remote_created(
+                    format!("{remote_prefix}debug.log"),
+                    "hash".to_string(),
+                    9,
+                    Utc::now(),
+                    "1-a".to_string(),
+                ),
+                Change::remote_created(
+                    ok_path.clone(),
+                    "hash".to_string(),
+                    6,
+                    Utc::now(),
+                    "1-b".to_string(),
+                ),
+            ],
+            last_seq: "200-after".to_string(),
+            metadata: std::collections::HashMap::from([(
+                ok_path.clone(),
+                FileDoc::new(ok_path.clone(), String::new(), 6),
+            )]),
+            contents: std::collections::HashMap::from([(ok_path, b"ok.txt".to_vec())]),
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch(remote_prefix, canned),
+            local,
+            root.clone(),
+            IgnoreMatcher::from_content("*.log"),
+        );
+
+        let report = engine.sync().await.expect("sync");
+
+        assert_eq!(report.downloaded.0, 1, "only ok.txt downloads");
+        assert!(root.as_path().join("ok.txt").exists());
+        assert!(
+            !root.as_path().join("debug.log").exists(),
+            "ignored remote file must never be written"
+        );
+        // The ignored change is skipped (not an error), so the checkpoint
+        // advances past it instead of retrying forever.
+        assert_eq!(
+            engine.get_checkpoint().await.unwrap().unwrap().last_seq,
+            "200-after"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_apply_refuses_ignored_and_internal_remote_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", CannedCouch::default()),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::from_content("*.log"),
+        );
+
+        // Ignored by pattern.
+        engine
+            .apply_remote_change(&Change::remote_created(
+                "prefix/debug.log".to_string(),
+                "hash".to_string(),
+                9,
+                Utc::now(),
+                "1-a".to_string(),
+            ))
+            .await
+            .expect("apply ignored change");
+        assert!(
+            !root.as_path().join("debug.log").exists(),
+            "ignored remote change must not be applied live"
+        );
+
+        // Internal state path — must hold even though *.log doesn't match.
+        engine
+            .apply_remote_change(&Change::remote_created(
+                "prefix/.couchdb-file-sync/injected.txt".to_string(),
+                "hash".to_string(),
+                3,
+                Utc::now(),
+                "1-b".to_string(),
+            ))
+            .await
+            .expect("apply internal change");
+        assert!(
+            !root
+                .as_path()
+                .join(".couchdb-file-sync/injected.txt")
+                .exists(),
+            "internal remote change must not be applied live"
+        );
+
+        // .sync-ignore internal filename.
+        engine
+            .apply_remote_change(&Change::remote_created(
+                "prefix/.sync-ignore".to_string(),
+                "hash".to_string(),
+                3,
+                Utc::now(),
+                "1-c".to_string(),
+            ))
+            .await
+            .expect("apply .sync-ignore change");
+        assert!(
+            !root.as_path().join(".sync-ignore").exists(),
+            ".sync-ignore remote change must not be applied live"
+        );
+
+        // A remote delete of an ignored path must not remove anything.
+        std::fs::write(root.as_path().join("keep.log"), "data").unwrap();
+        engine
+            .apply_remote_change(&Change::remote_deleted(
+                "prefix/keep.log".to_string(),
+                Some(Utc::now()),
+            ))
+            .await
+            .expect("apply ignored delete");
+        assert!(
+            root.as_path().join("keep.log").exists(),
+            "ignored remote delete must not remove the local file"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_paths_stay_protected_even_with_negation_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        // A negation attempts to re-include the internal state paths.
+        let matcher =
+            IgnoreMatcher::from_content("!.couchdb-file-sync/**\n!.couchfs/**\n!.sync-ignore");
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", CannedCouch::default()),
+            test_local_db(),
+            root.clone(),
+            matcher,
+        );
+
+        engine
+            .apply_remote_change(&Change::remote_created(
+                "prefix/.couchdb-file-sync/injected.txt".to_string(),
+                "hash".to_string(),
+                3,
+                Utc::now(),
+                "1-a".to_string(),
+            ))
+            .await
+            .expect("apply internal change under negation");
+        engine
+            .apply_remote_change(&Change::remote_created(
+                "prefix/.couchfs/state.db".to_string(),
+                "hash".to_string(),
+                3,
+                Utc::now(),
+                "1-b".to_string(),
+            ))
+            .await
+            .expect("apply .couchfs change under negation");
+        engine
+            .apply_remote_change(&Change::remote_created(
+                "prefix/.sync-ignore".to_string(),
+                "hash".to_string(),
+                3,
+                Utc::now(),
+                "1-c".to_string(),
+            ))
+            .await
+            .expect("apply .sync-ignore under negation");
+
+        assert!(
+            !root
+                .as_path()
+                .join(".couchdb-file-sync/injected.txt")
+                .exists(),
+            "internal path must stay protected under negation"
+        );
+        assert!(
+            !root.as_path().join(".couchfs/state.db").exists(),
+            ".couchfs must stay protected under negation"
+        );
+        assert!(
+            !root.as_path().join(".sync-ignore").exists(),
+            ".sync-ignore must stay protected under negation"
+        );
     }
 }
