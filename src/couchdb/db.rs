@@ -2452,6 +2452,7 @@ mod tests {
             remote_path: RemotePath::new(String::new()),
             timeout_seconds,
             retry_attempts,
+            create_db: true,
             legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             test_state: None,
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),
