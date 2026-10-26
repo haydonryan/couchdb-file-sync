@@ -324,6 +324,31 @@ impl ApplyWorker {
         };
 
         let file_path = self.root_dir.join_contained(local_path)?;
+        // Filesystem type transition: an incoming remote file arriving where a
+        // directory currently exists (a remote directory replaced by a file, or
+        // a leftover empty directory from a move). Remove an empty directory so
+        // the file can be installed; preserve a nonempty directory because its
+        // untracked local content must never be destroyed by a download.
+        if file_path.is_dir() {
+            let empty = tokio::fs::read_dir(&file_path)
+                .await?
+                .next_entry()
+                .await?
+                .is_none();
+            if empty {
+                debug!(
+                    "[DOWNLOAD] Replacing empty local directory {:?} with remote file {}",
+                    file_path, remote_path
+                );
+                tokio::fs::remove_dir(&file_path).await?;
+            } else {
+                warn!(
+                    "Preserving nonempty local directory {:?} for incoming remote file {} (untracked content must not be removed)",
+                    file_path, remote_path
+                );
+                return Ok(None);
+            }
+        }
         if let Some(parent) = file_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -498,7 +523,26 @@ impl ApplyWorker {
                     "[LOCAL DELETE] Remote: {}, Local: {:?}",
                     remote_path, file_path
                 );
-                if file_path.exists() {
+                if file_path.is_dir() {
+                    // Directory-to-file transition on the delete side: a remote
+                    // file was replaced such that only an empty leftover local
+                    // directory remains. Remove it to converge; preserve a
+                    // nonempty directory because its untracked local content
+                    // must never be destroyed.
+                    let empty = tokio::fs::read_dir(&file_path)
+                        .await?
+                        .next_entry()
+                        .await?
+                        .is_none();
+                    if empty {
+                        tokio::fs::remove_dir(&file_path).await?;
+                    } else {
+                        warn!(
+                            "Preserving nonempty local directory {:?} for remote delete of {} (untracked content must not be removed)",
+                            file_path, remote_path
+                        );
+                    }
+                } else if file_path.is_file() {
                     tokio::fs::remove_file(&file_path).await?;
                 }
                 self.local_db.delete_file_state(&local_path).await?;
@@ -1875,6 +1919,38 @@ impl SyncEngine {
         self.record_conflict(&Conflict::new(local_path.to_string(), state, remote_state))
             .await?;
         Ok(true)
+    }
+
+    /// Whether a local watcher change targets a directory rather than a single
+    /// tracked file.
+    ///
+    /// A rename/move-in/move-out of a populated directory surfaces from the
+    /// watcher as events for the top-level directory path only — never for its
+    /// children. Such an event cannot be applied as a single file (an upload
+    /// would try to read the directory and fail), so the live loop routes it
+    /// into the bounded full reconciliation rescan, which expands it into a
+    /// tracked subtree reconciliation (removing old remote child paths and
+    /// uploading new ones) and safely orders filesystem type transitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the local path cannot be resolved against the root.
+    pub(crate) async fn is_directory_scoped(&self, change: &Change) -> Result<bool> {
+        match change.change_type() {
+            ChangeType::Created | ChangeType::Modified => {
+                Ok(self.root_dir.join_contained(change.path())?.is_dir())
+            }
+            ChangeType::Deleted => {
+                // A tracked file delete is a normal single-file event. A path
+                // that is neither tracked nor present as a file is a
+                // directory-scoped event (a directory move-out or delete): the
+                // directory itself is never tracked as a file, and the top-level
+                // path no longer exists on disk after the move.
+                let tracked = self.get_file_state(change.path()).await?.is_some();
+                let on_disk = self.root_dir.join_contained(change.path())?.is_file();
+                Ok(!tracked && !on_disk)
+            }
+        }
     }
 
     /// Apply a local change immediately (live sync)
@@ -3787,6 +3863,230 @@ mod tests {
         assert_eq!(
             stored.hash, stored_hash,
             "FileState hash must equal the verified remote hash"
+        );
+    }
+
+    /// A local create/modify change for a path that is a directory on disk is
+    /// directory-scoped: it must be routed to subtree reconciliation, not
+    /// applied as a single file.
+    #[tokio::test]
+    async fn is_directory_scoped_created_directory_is_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::create_dir_all(root.as_path().join("moved")).unwrap();
+
+        let engine = SyncEngine::new(test_couchdb(), test_local_db(), root);
+        assert!(
+            engine
+                .is_directory_scoped(&Change::local_created("moved".into(), String::new(), 0))
+                .await
+                .unwrap(),
+            "a created directory must be directory-scoped"
+        );
+    }
+
+    /// A local create/modify change for a path that is a real file is a normal
+    /// single-file event and must not be routed to reconciliation.
+    #[tokio::test]
+    async fn is_directory_scoped_created_file_is_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(root.as_path().join("f.txt"), b"content").unwrap();
+
+        let engine = SyncEngine::new(test_couchdb(), test_local_db(), root);
+        assert!(
+            !engine
+                .is_directory_scoped(&Change::local_created("f.txt".into(), String::new(), 0))
+                .await
+                .unwrap(),
+            "a created file must not be directory-scoped"
+        );
+    }
+
+    /// A local delete of a tracked file is a normal single-file event.
+    #[tokio::test]
+    async fn is_directory_scoped_deleted_tracked_file_is_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let local = test_local_db();
+        let stored = FileState::new("gone.txt".to_string(), "h".to_string(), 3, Utc::now());
+        local.save_file_state(&stored).unwrap();
+
+        let engine = SyncEngine::new(test_couchdb(), local, root);
+        assert!(
+            !engine
+                .is_directory_scoped(&Change::local_deleted("gone.txt".into()))
+                .await
+                .unwrap(),
+            "a tracked file delete must not be directory-scoped"
+        );
+    }
+
+    /// A local delete of a path that is neither tracked nor present as a file
+    /// is a directory-scoped event (a directory move-out or delete).
+    #[tokio::test]
+    async fn is_directory_scoped_deleted_missing_path_is_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+
+        let engine = SyncEngine::new(test_couchdb(), test_local_db(), root);
+        assert!(
+            engine
+                .is_directory_scoped(&Change::local_deleted("moved".into()))
+                .await
+                .unwrap(),
+            "a deleted untracked/missing path must be directory-scoped"
+        );
+    }
+
+    /// Downloading a remote file onto an existing empty local directory must
+    /// remove the leftover directory and install the file (directory-to-file
+    /// transition converges).
+    #[tokio::test]
+    async fn download_replaces_empty_local_directory_with_remote_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::create_dir_all(root.as_path().join("dl.txt")).unwrap();
+
+        let remote_path = "prefix/dl.txt";
+        let content: Vec<u8> = b"file replaces dir".to_vec();
+        let mut remote_doc =
+            FileDoc::new(remote_path.to_string(), String::new(), content.len() as u64);
+        remote_doc.rev = Some("1-abc".to_string());
+        remote_doc.path = remote_path.to_string();
+
+        let canned = CannedCouch {
+            changes: Vec::new(),
+            last_seq: "1".to_string(),
+            metadata: std::collections::HashMap::from([(remote_path.to_string(), remote_doc)]),
+            contents: std::collections::HashMap::from([(remote_path.to_string(), content.clone())]),
+            content_errors: std::collections::HashSet::new(),
+            ..CannedCouch::default()
+        };
+        let engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let bytes = engine
+            .download_remote_file(remote_path, "dl.txt", true, true)
+            .await
+            .expect("download should succeed")
+            .expect("download should write content");
+
+        assert_eq!(bytes, content.len());
+        assert!(
+            root.as_path().join("dl.txt").is_file(),
+            "the empty directory must be replaced by the downloaded file"
+        );
+        assert_eq!(
+            std::fs::read(root.as_path().join("dl.txt")).unwrap(),
+            content,
+            "downloaded file must hold the remote content"
+        );
+    }
+
+    /// Downloading a remote file onto a nonempty local directory must preserve
+    /// the directory and its untracked content, not destroy it.
+    #[tokio::test]
+    async fn download_preserves_nonempty_local_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::create_dir_all(root.as_path().join("dl.txt")).unwrap();
+        std::fs::write(root.as_path().join("dl.txt/child.txt"), b"untracked").unwrap();
+
+        let remote_path = "prefix/dl.txt";
+        let content: Vec<u8> = b"file replaces dir".to_vec();
+        let mut remote_doc =
+            FileDoc::new(remote_path.to_string(), String::new(), content.len() as u64);
+        remote_doc.rev = Some("1-abc".to_string());
+        remote_doc.path = remote_path.to_string();
+
+        let canned = CannedCouch {
+            changes: Vec::new(),
+            last_seq: "1".to_string(),
+            metadata: std::collections::HashMap::from([(remote_path.to_string(), remote_doc)]),
+            contents: std::collections::HashMap::from([(remote_path.to_string(), content)]),
+            content_errors: std::collections::HashSet::new(),
+            ..CannedCouch::default()
+        };
+        let engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let result = engine
+            .download_remote_file(remote_path, "dl.txt", true, true)
+            .await
+            .expect("preserving a nonempty directory must not error");
+
+        assert!(result.is_none(), "nothing should be written");
+        assert!(
+            root.as_path().join("dl.txt").is_dir(),
+            "the nonempty directory must be preserved"
+        );
+        assert_eq!(
+            std::fs::read(root.as_path().join("dl.txt/child.txt")).unwrap(),
+            b"untracked",
+            "untracked content inside the directory must survive"
+        );
+    }
+
+    /// A remote delete converging onto an empty leftover local directory must
+    /// remove it (directory-to-file transition on the delete side).
+    #[tokio::test]
+    async fn remote_delete_removes_empty_local_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::create_dir_all(root.as_path().join("gone")).unwrap();
+
+        let mut engine = SyncEngine::new(test_couchdb(), test_local_db(), root.clone());
+        engine
+            .apply_remote_change(&Change::remote_deleted(
+                "gone".into(),
+                None,
+                Some("2-abc".into()),
+            ))
+            .await
+            .expect("delete of an empty directory should succeed");
+
+        assert!(
+            !root.as_path().join("gone").exists(),
+            "the empty leftover directory must be removed"
+        );
+    }
+
+    /// A remote delete converging onto a nonempty local directory must preserve
+    /// the directory and its untracked content.
+    #[tokio::test]
+    async fn remote_delete_preserves_nonempty_local_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::create_dir_all(root.as_path().join("gone")).unwrap();
+        std::fs::write(root.as_path().join("gone/child.txt"), b"untracked").unwrap();
+
+        let mut engine = SyncEngine::new(test_couchdb(), test_local_db(), root.clone());
+        engine
+            .apply_remote_change(&Change::remote_deleted(
+                "gone".into(),
+                None,
+                Some("2-abc".into()),
+            ))
+            .await
+            .expect("delete over a nonempty directory should not error");
+
+        assert!(
+            root.as_path().join("gone").is_dir(),
+            "the nonempty directory must be preserved"
+        );
+        assert_eq!(
+            std::fs::read(root.as_path().join("gone/child.txt")).unwrap(),
+            b"untracked",
+            "untracked content must survive the delete"
         );
     }
 

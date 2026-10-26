@@ -493,15 +493,19 @@ pub fn triage_changes<S: std::hash::BuildHasher>(
         // Remote change not in local changes — check if it should be downloaded
         let should_download = stored_state.map_or_else(
             || {
-                // No local state — check if file exists on disk (resolved
-                // against the sync root, not the process CWD).
+                // No local state — check if a real file exists on disk
+                // (resolved against the sync root, not the process CWD). Only
+                // an actual file counts as "untracked local content to
+                // preserve"; an existing directory is a leftover/transition
+                // that must converge to the remote file (directory-to-file
+                // transition), so it is downloaded rather than skipped.
                 let relative_path = local_path.trim_start_matches('/');
                 let file_path = root_dir.join(relative_path);
-                if file_path.exists() {
-                    // File exists but not tracked — skip
+                if file_path.is_file() {
+                    // Real untracked local file exists — preserve it, skip
                     false
                 } else {
-                    // New file on remote — download
+                    // No local file (or a directory that must transition) — download
                     true
                 }
             },
@@ -1334,6 +1338,32 @@ mod tests {
             result.downloads.is_empty(),
             "existing local file must not be downloaded"
         );
+    }
+
+    #[test]
+    fn remote_new_file_downloads_over_existing_empty_directory() {
+        // A remote file whose local counterpart is an existing (leftover/empty)
+        // directory is a directory-to-file transition: it must be downloaded,
+        // not silently skipped as if it were an untracked local file. The old
+        // `exists()` check wrongly treated the directory as a file and skipped
+        // it, leaving the remote file permanently unsynced.
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp_dir.path().join("f.txt")).unwrap();
+
+        let remote = vec![remote_change(
+            "f.txt",
+            ChangeType::Created,
+            Some(utc("2026-07-28 12:00:00")),
+            Some("1-abc"),
+        )];
+        let result = triage_changes(&[], &remote, &HashMap::new(), "", temp_dir.path());
+
+        assert_eq!(
+            result.downloads.len(),
+            1,
+            "a remote file over an existing directory must be downloaded for transition"
+        );
+        assert_eq!(result.downloads[0].path(), "f.txt");
     }
 
     #[test]
