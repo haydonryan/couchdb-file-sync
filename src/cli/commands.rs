@@ -1,9 +1,10 @@
 use crate::config::{AppConfig, SyncPath, default_user_config_file};
 use crate::couchdb::{ChangeFeedEntry, CouchDb};
-use crate::local::{AsyncFileWatcher, LocalDb};
+use crate::local::{AsyncFileWatcher, LocalDb, compute_file_hash};
 use crate::matrix::MatrixNotifier;
 use crate::models::{
-    Change, ChangeType, DatabaseName, IgnoreMatcher, RemotePath, ResolutionStrategy, SyncDirPath,
+    Change, ChangeType, Conflict, CouchRev, DatabaseName, ExpectedRemote, FileState, IgnoreMatcher,
+    RemotePath, RemoteState, ResolutionStrategy, SyncDirPath,
 };
 use crate::sync::{SyncEngine, SyncReport, triage};
 use crate::telegram::TelegramNotifier;
@@ -1287,6 +1288,16 @@ async fn handle_local_change(
         return Ok(());
     }
 
+    // A local delete racing a remote edit is an edit/delete conflict: do not
+    // blindly upload (which would destroy the remote edit). Arbitrate against
+    // the live remote using the monotonic revision, like the periodic and
+    // live-remote paths.
+    if change.change_type() == ChangeType::Deleted
+        && engine.arbitrate_local_delete(change.path()).await?
+    {
+        return Ok(());
+    }
+
     match change.change_type() {
         ChangeType::Created | ChangeType::Modified | ChangeType::Deleted => {
             if let Err(e) = engine.apply_local_change(change).await {
@@ -1325,8 +1336,65 @@ async fn handle_remote_change(
 
     match change.change_type() {
         ChangeType::Deleted => {
-            touched.mark(&local_rel, SystemTime::now());
-            engine.apply_remote_change(&change).await?;
+            // Arbitrate a remote delete against the local state exactly like
+            // the periodic path: protect local edits and untracked files, and
+            // only propagate the deletion when the local file is unchanged and
+            // the deletion is newer than our last sync. A delete/edit race
+            // becomes a recorded conflict instead of silently deleting the
+            // local edit.
+            let state = engine.get_file_state(&local_rel).await?;
+            let file_path = engine.root_dir().join(&local_rel);
+            let local_meta = tokio::fs::metadata(&file_path).await.ok();
+            let local_mtime = local_meta
+                .as_ref()
+                .and_then(|meta| meta.modified().ok())
+                .map(Into::into);
+            // Same-mtime content edits must be protected even when the mtime
+            // matches the stored sync-time mtime.
+            let local_content_matches = match (&state, local_meta.as_ref()) {
+                (Some(s), Some(_)) => compute_file_hash(&file_path)? == s.hash,
+                _ => true,
+            };
+            match triage::arbitrate_remote_delete(
+                state.as_ref(),
+                change.rev(),
+                change.mtime().copied(),
+                local_mtime,
+                local_content_matches,
+            ) {
+                triage::RemoteDeleteVerdict::Apply => {
+                    touched.mark(&local_rel, SystemTime::now());
+                    engine.apply_remote_change(&change).await?;
+                }
+                triage::RemoteDeleteVerdict::Conflict => {
+                    let local_state = match &state {
+                        Some(s) => s.clone(),
+                        None => FileState {
+                            path: local_rel.clone(),
+                            hash: compute_file_hash(&file_path)?,
+                            size: file_path.metadata().map_or(0, |m| m.len()),
+                            modified_at: local_mtime.unwrap_or_else(Utc::now),
+                            couch_rev: None,
+                            last_sync_at: Utc::now(),
+                        },
+                    };
+                    let remote_state = RemoteState {
+                        hash: String::new(),
+                        size: 0,
+                        modified_at: change.mtime().copied().unwrap_or_else(Utc::now),
+                        couch_rev: change.rev().and_then(CouchRev::new).unwrap_or_default(),
+                        deleted: true,
+                    };
+                    engine
+                        .record_conflict(&Conflict::new(
+                            local_rel.clone(),
+                            local_state,
+                            remote_state,
+                        ))
+                        .await?;
+                }
+                triage::RemoteDeleteVerdict::Skip => {}
+            }
         }
         ChangeType::Created | ChangeType::Modified => {
             let file_path = engine.root_dir().join(&local_rel);
@@ -1353,7 +1421,14 @@ async fn handle_remote_change(
                 touched.mark(&local_rel, SystemTime::now());
                 engine.apply_remote_change(&change).await?;
             } else {
-                let local_change = Change::local_modified(local_rel.clone(), String::new(), 0);
+                // Upload the local version to arbitrate. Carry the observed
+                // remote revision as the publication baseline so a further
+                // concurrent remote write landing during the upload is rejected
+                // (surfaced as an error) instead of silently overwritten.
+                let local_change = Change::local_modified(local_rel.clone(), String::new(), 0)
+                    .with_expected_rev(change.rev().map_or(ExpectedRemote::Force, |rev| {
+                        ExpectedRemote::At(rev.to_string())
+                    }));
                 engine.apply_local_change(&local_change).await?;
             }
         }

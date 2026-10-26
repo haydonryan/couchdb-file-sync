@@ -1,4 +1,4 @@
-use crate::models::{Change, ChangeType, FileState};
+use crate::models::{Change, ChangeType, ExpectedRemote, FileState};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
@@ -69,40 +69,94 @@ pub fn is_polluted_state_path(path: &str, remote_prefix: &str) -> bool {
                 .is_some_and(|r| r.starts_with('/')))
 }
 
-/// Determine whether a remote delete should be applied locally.
-///
-/// * `stored_state` — last tracked local state (its `last_sync_at` and
-///   `modified_at` record the last sync).
-/// * `remote_delete_time` — the tombstone's authoritative deletion time (see
-///   [`crate::models::FileDoc::delete_time`]), not the deleted file's own
-///   mtime, which may be stale/preserved.
-/// * `local_mtime` — the current on-disk local file mtime, when it exists.
-///
-/// Returns `true` (apply the delete locally) when the file is tracked, has not
-/// been edited locally since the last sync, and the remote deletion is newer
-/// than the last sync — regardless of the deleted file's own mtime.
+/// Parse the generation number from a `CouchDB` revision (`N-hash`).
 #[must_use]
-pub fn should_apply_remote_delete(
-    stored_state: Option<&FileState>,
+pub fn rev_generation(rev: &str) -> Option<u64> {
+    rev.split('-').next().and_then(|g| g.parse().ok())
+}
+
+/// Whether a remote deletion is newer than our last sync.
+///
+/// Ordered first by the monotonic `CouchDB` revision (immune to cross-host
+/// clock skew), falling back to the tombstone's wall-clock delete time only
+/// when no revision is available (legacy/external tombstones or hard deletes
+/// without a parseable rev).
+#[must_use]
+pub fn remote_delete_is_new(
+    remote_rev: Option<&str>,
     remote_delete_time: Option<DateTime<Utc>>,
-    local_mtime: Option<DateTime<Utc>>,
+    stored_state: Option<&FileState>,
 ) -> bool {
     let Some(state) = stored_state else {
-        // Untracked local file: never delete it on the strength of a remote
-        // tombstone alone.
         return false;
     };
-    // Protect a locally-edited file: if the on-disk mtime differs from the
-    // last-synced mtime, the file changed locally since the last sync and the
-    // local edit wins over the remote delete.
-    if let Some(local_mtime) = local_mtime
-        && local_mtime != state.modified_at
+    // Revision evidence is authoritative and clock-skew-free when both sides
+    // carry a parseable generation: a tombstone rev newer than the rev we last
+    // stored means the deletion happened after our last sync, regardless of
+    // wall clocks. This keeps a genuinely-new deletion from being discarded
+    // merely because the deleting host's clock lags ours.
+    if let (Some(remote_rev), Some(stored_rev)) = (remote_rev, state.couch_rev.as_deref())
+        && let (Some(remote_gen), Some(stored_gen)) =
+            (rev_generation(remote_rev), rev_generation(stored_rev))
     {
-        return false;
+        return remote_gen > stored_gen;
     }
-    // Otherwise apply the delete when the remote deletion is newer than the
-    // last sync.
+    // Fall back to wall-clock delete time vs last sync.
     remote_delete_time.is_none_or(|t| t > state.last_sync_at)
+}
+
+/// Verdict for arbitrating a remote deletion against the local file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteDeleteVerdict {
+    /// Propagate the remote deletion locally.
+    Apply,
+    /// The deletion races a local change (edit or untracked file); surface a
+    /// conflict so the local change is not silently destroyed.
+    Conflict,
+    /// Stale deletion or nothing to do.
+    Skip,
+}
+
+/// Arbitrate a remote deletion against the local file as a versioned
+/// three-way change. Used identically by the periodic, live, and resolution
+/// paths so deletion ordering is consistent everywhere.
+///
+/// * `stored_state` — last tracked local state, if any.
+/// * `remote_rev` — the deletion's `CouchDB` revision, when available.
+/// * `remote_delete_time` — the tombstone's authoritative deletion time.
+/// * `local_mtime` — the current on-disk local mtime, when the file exists.
+/// * `local_content_matches` — whether the on-disk content hash equals the
+///   stored hash (protects same-mtime/preserved-mtime content edits).
+#[must_use]
+pub fn arbitrate_remote_delete(
+    stored_state: Option<&FileState>,
+    remote_rev: Option<&str>,
+    remote_delete_time: Option<DateTime<Utc>>,
+    local_mtime: Option<DateTime<Utc>>,
+    local_content_matches: bool,
+) -> RemoteDeleteVerdict {
+    let Some(state) = stored_state else {
+        // Untracked local file: no base state to prove it unchanged, so a
+        // remote tombstone must never delete it silently. A file on disk is a
+        // delete/untracked conflict; nothing on disk is a no-op.
+        return if local_mtime.is_some() {
+            RemoteDeleteVerdict::Conflict
+        } else {
+            RemoteDeleteVerdict::Skip
+        };
+    };
+    // A locally-edited file (mtime changed OR a same-mtime content edit) is
+    // protected: the deletion races the local edit → conflict.
+    if local_mtime.is_some_and(|m| m != state.modified_at) || !local_content_matches {
+        return RemoteDeleteVerdict::Conflict;
+    }
+    // Local file unchanged since last sync: apply the delete only when it is
+    // newer than our last sync.
+    if remote_delete_is_new(remote_rev, remote_delete_time, Some(state)) {
+        RemoteDeleteVerdict::Apply
+    } else {
+        RemoteDeleteVerdict::Skip
+    }
 }
 
 /// Check whether the remote has changed compared to a stored local state.
@@ -179,6 +233,98 @@ pub fn live_should_apply_remote(
     local_mtime == state.modified_at
 }
 
+/// Triage a local-delete change as a versioned three-way change.
+///
+/// The deletion uploads (propagates) only when the remote side is absent, also
+/// deleted, or unchanged since our last sync. A local delete racing a remote
+/// edit is an edit/delete conflict and must not blindly upload (which would
+/// destroy the remote edit); it is surfaced for comparison instead.
+fn triage_local_delete<S: std::hash::BuildHasher>(
+    lc: &Change,
+    remote_path: &str,
+    remote_map: &HashMap<&str, &Change>,
+    stored_states: &HashMap<String, FileState, S>,
+    result: &mut TriageResult,
+) {
+    let stored_state = stored_states.get(lc.path());
+    let remote_side_changed = match remote_map.get(remote_path) {
+        // Both sides deleted → nothing to do, skip the upload.
+        Some(rc) if rc.change_type() == ChangeType::Deleted => false,
+        Some(rc) => rc.rev().map_or_else(
+            || remote_is_newer(rc.mtime().copied(), stored_state),
+            |remote_rev| {
+                remote_revision_changed(
+                    Some(remote_rev),
+                    stored_state.and_then(|s| s.couch_rev.as_deref()),
+                )
+            },
+        ),
+        None => false,
+    };
+    if remote_side_changed && stored_state.is_some() {
+        // Local delete racing a remote edit, with a tracked local base:
+        // record an edit/delete conflict instead of uploading the delete.
+        result.needs_comparison.push(TriageDecision {
+            path: lc.path().to_string(),
+            outcome: TriageOutcome::NeedsComparison,
+            local_change: Some(lc.clone()),
+            remote_change: remote_map.get(remote_path).copied().cloned(),
+        });
+    } else {
+        result.uploads.push(lc.clone());
+    }
+}
+
+/// Triage a remote-delete change as a versioned three-way change.
+///
+/// The existence/mtime check resolves against the sync root, not the process
+/// CWD (which differs whenever the daemon is launched from elsewhere),
+/// otherwise the wrong tree is inspected. Content is not available here (pure
+/// function), so same-mtime edits are re-verified by the engine with a hash
+/// comparison.
+fn triage_remote_delete(
+    rc: &Change,
+    local_path: String,
+    root_dir: &std::path::Path,
+    stored_state: Option<&FileState>,
+    result: &mut TriageResult,
+) {
+    let relative_path = local_path.trim_start_matches('/');
+    let file_path = root_dir.join(relative_path);
+    let local_mtime = file_path
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(Into::into);
+    match arbitrate_remote_delete(
+        stored_state,
+        rc.rev(),
+        rc.mtime().copied(),
+        local_mtime,
+        true,
+    ) {
+        RemoteDeleteVerdict::Apply => result.remote_deletes.push(rc.clone()),
+        RemoteDeleteVerdict::Conflict => {
+            // Remote-delete racing a locally-edited or untracked file: surface
+            // it for the engine to record as a conflict.
+            result.needs_comparison.push(TriageDecision {
+                path: local_path,
+                outcome: TriageOutcome::NeedsComparison,
+                local_change: None,
+                remote_change: Some(rc.clone()),
+            });
+        }
+        RemoteDeleteVerdict::Skip => {
+            result.skipped.push(TriageDecision {
+                path: local_path,
+                outcome: TriageOutcome::Skip,
+                local_change: None,
+                remote_change: Some(rc.clone()),
+            });
+        }
+    }
+}
+
 /// Triage local and remote changes to determine what actions are needed.
 ///
 /// This is a pure function with no I/O or `CouchDB` dependencies. The caller is
@@ -220,9 +366,8 @@ pub fn triage_changes<S: std::hash::BuildHasher>(
             format!("{}{}", remote_prefix, lc.path())
         };
 
-        // Local delete → always upload (no content comparison needed)
         if lc.change_type() == ChangeType::Deleted {
-            result.uploads.push(lc.clone());
+            triage_local_delete(lc, &remote_path, &remote_map, stored_states, &mut result);
             continue;
         }
 
@@ -256,12 +401,25 @@ pub fn triage_changes<S: std::hash::BuildHasher>(
                         remote_change: Some((*rc).clone()),
                     });
                 } else {
-                    // Remote unchanged → upload local change
-                    result.uploads.push(lc.clone());
+                    // Remote unchanged → upload local change. Carry the
+                    // observed remote revision as the publication baseline so a
+                    // concurrent writer that lands between this decision and
+                    // the metadata save is rejected instead of overwritten. If
+                    // the remote change carries no revision (older/external
+                    // client), we cannot condition on one and fall back to an
+                    // unconditional overwrite.
+                    let expected = rc
+                        .rev()
+                        .map_or(ExpectedRemote::Force, |r| ExpectedRemote::At(r.to_string()));
+                    result.uploads.push(lc.clone().with_expected_rev(expected));
                 }
             }
-            // Remote absent → upload local change
-            None => result.uploads.push(lc.clone()),
+            // Remote absent → upload local change (create). The remote is
+            // expected to stay absent; a doc appearing between this decision
+            // and the metadata save is a concurrent-creation race.
+            None => result
+                .uploads
+                .push(lc.clone().with_expected_rev(ExpectedRemote::Absent)),
         }
     }
 
@@ -277,27 +435,7 @@ pub fn triage_changes<S: std::hash::BuildHasher>(
         let stored_state = stored_states.get(&local_path);
 
         if rc.change_type() == ChangeType::Deleted {
-            // Remote delete — check if it should be applied locally. The
-            // existence/mtime check must resolve against the sync root, not the
-            // process CWD (which differs whenever the daemon is launched from
-            // elsewhere), otherwise the wrong tree is inspected.
-            let relative_path = local_path.trim_start_matches('/');
-            let file_path = root_dir.join(relative_path);
-            let local_mtime = file_path
-                .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .map(Into::into);
-            if should_apply_remote_delete(stored_state, rc.mtime().copied(), local_mtime) {
-                result.remote_deletes.push(rc.clone());
-            } else {
-                result.skipped.push(TriageDecision {
-                    path: local_path,
-                    outcome: TriageOutcome::Skip,
-                    local_change: None,
-                    remote_change: Some(rc.clone()),
-                });
-            }
+            triage_remote_delete(rc, local_path, root_dir, stored_state, &mut result);
             continue;
         }
 
@@ -441,7 +579,7 @@ mod tests {
                 mtime.unwrap_or_else(Utc::now),
                 rev.unwrap_or("").to_string(),
             ),
-            ChangeType::Deleted => Change::remote_deleted(path.to_string(), mtime),
+            ChangeType::Deleted => Change::remote_deleted(path.to_string(), mtime, None),
         }
     }
 
@@ -467,76 +605,189 @@ mod tests {
         assert!(!is_polluted_state_path("Agentsmith/profile.md", "Agents/"));
     }
 
-    // ── should_apply_remote_delete ──────────────────────────────────
+    // ── remote_delete_is_new ────────────────────────────────────────
 
     #[test]
-    fn remote_delete_predating_last_sync_is_not_applied() {
+    fn delete_time_predating_last_sync_is_not_new() {
         // The tombstone's authoritative delete time predates our last sync, so
         // we already synced after the deletion and must not remove the file.
         let last_sync = utc("2026-03-23 17:12:33");
         let remote_delete = last_sync - Duration::days(6);
         let state = make_state("f", last_sync);
 
-        assert!(!should_apply_remote_delete(
-            Some(&state),
+        assert!(!remote_delete_is_new(
+            None,
             Some(remote_delete),
-            Some(state.modified_at), // local file unchanged since last sync
+            Some(&state)
         ));
     }
 
     #[test]
-    fn remote_delete_with_stale_file_mtime_still_propagates() {
-        // The deleted remote file's own mtime may be arbitrarily old (cp -p,
-        // rsync -t, touch -t preserve mtime), but the tombstone carries the
-        // authoritative deletion time. A delete newer than the last sync must
-        // propagate regardless of the preserved file mtime.
+    fn delete_newer_than_last_sync_is_new() {
         let last_sync = utc("2026-03-23 17:12:33");
         let remote_delete = last_sync + Duration::seconds(1);
         let state = make_state("f", last_sync);
 
-        assert!(should_apply_remote_delete(
-            Some(&state),
+        assert!(remote_delete_is_new(
+            None,
             Some(remote_delete),
-            Some(state.modified_at), // local file unchanged since last sync
+            Some(&state)
         ));
     }
 
     #[test]
-    fn locally_edited_file_is_protected_from_remote_delete() {
+    fn rev_evidence_overrides_clock_skew() {
+        // A genuinely-new deletion on a remote host whose clock LAGS ours:
+        // the tombstone's wall-clock delete time predates our last_sync_at,
+        // which would wrongly discard it — but the monotonic revision proves
+        // it happened after our last sync. The deletion is new.
+        let last_sync = utc("2026-03-23 17:12:33");
+        // Our last stored rev is generation 3; the tombstone is generation 4.
+        let mut state = make_state("f", last_sync);
+        state.couch_rev = Some(CouchRev::new("3-abc").unwrap());
+        // Remote clock is ~2 days behind ours → delete_time looks stale.
+        let skewed_delete_time = last_sync - Duration::days(2);
+
+        assert!(remote_delete_is_new(
+            Some("4-def"),
+            Some(skewed_delete_time),
+            Some(&state),
+        ));
+    }
+
+    #[test]
+    fn stale_delete_with_older_or_equal_rev_is_not_new() {
+        // A tombstone whose revision is not ahead of our stored revision is
+        // stale even if its wall-clock time looks "new" (the reverse skew).
+        let last_sync = utc("2026-03-23 17:12:33");
+        let mut state = make_state("f", last_sync);
+        state.couch_rev = Some(CouchRev::new("3-abc").unwrap());
+        let future_delete_time = last_sync + Duration::days(2);
+
+        assert!(!remote_delete_is_new(
+            Some("3-abc"), // same generation → not newer
+            Some(future_delete_time),
+            Some(&state),
+        ));
+        assert!(!remote_delete_is_new(
+            Some("2-old"), // older generation → not newer
+            Some(future_delete_time),
+            Some(&state),
+        ));
+    }
+
+    // ── arbitrate_remote_delete ─────────────────────────────────────
+
+    #[test]
+    fn unchanged_local_file_propagates_new_delete() {
+        // Local file unchanged since last sync + new deletion → apply.
+        let last_sync = utc("2026-03-23 17:12:33");
+        let state = make_state("f", last_sync);
+        let remote_delete = last_sync + Duration::seconds(1);
+
+        assert_eq!(
+            arbitrate_remote_delete(
+                Some(&state),
+                None,
+                Some(remote_delete),
+                Some(state.modified_at),
+                true,
+            ),
+            RemoteDeleteVerdict::Apply
+        );
+    }
+
+    #[test]
+    fn missing_local_file_with_new_delete_is_applied() {
+        // No local file on disk (nothing to protect) and the delete is newer
+        // than the last sync → apply it (a no-op locally, but recorded).
+        let last_sync = utc("2026-03-23 17:12:33");
+        let state = make_state("f", last_sync);
+        let remote_delete = last_sync + Duration::seconds(1);
+
+        assert_eq!(
+            arbitrate_remote_delete(Some(&state), None, Some(remote_delete), None, true,),
+            RemoteDeleteVerdict::Apply
+        );
+    }
+
+    #[test]
+    fn locally_edited_file_conflicts_with_remote_delete() {
         // The remote delete is newer than the last sync, but the local file was
-        // edited since the last sync (on-disk mtime differs from stored), so the
-        // local edit wins and the delete is not applied.
+        // edited since the last sync (on-disk mtime differs from stored), so
+        // the deletion races a local edit → conflict.
         let last_sync = utc("2026-03-23 17:12:33");
         let remote_delete = last_sync + Duration::seconds(1);
         let state = make_state("f", last_sync);
         let edited_local = state.modified_at + Duration::hours(1);
 
-        assert!(!should_apply_remote_delete(
-            Some(&state),
-            Some(remote_delete),
-            Some(edited_local),
-        ));
+        assert_eq!(
+            arbitrate_remote_delete(
+                Some(&state),
+                None,
+                Some(remote_delete),
+                Some(edited_local),
+                true,
+            ),
+            RemoteDeleteVerdict::Conflict
+        );
     }
 
     #[test]
-    fn untracked_local_file_is_not_deleted_by_remote_tombstone() {
-        let remote_delete = utc("2026-03-23 17:12:33");
-        assert!(!should_apply_remote_delete(None, Some(remote_delete), None));
-    }
-
-    #[test]
-    fn missing_local_file_with_new_remote_delete_is_applied() {
-        // No local file on disk (nothing to protect) and the delete is newer
-        // than the last sync → apply it (a no-op locally, but recorded).
+    fn same_mtime_content_edit_conflicts_with_remote_delete() {
+        // The local mtime matches the stored sync-time mtime (cp -p, rsync -t,
+        // touch -r preserved it) but the content differs → the same-mtime edit
+        // must be protected from the remote delete.
         let last_sync = utc("2026-03-23 17:12:33");
         let remote_delete = last_sync + Duration::seconds(1);
         let state = make_state("f", last_sync);
 
-        assert!(should_apply_remote_delete(
-            Some(&state),
-            Some(remote_delete),
-            None,
-        ));
+        assert_eq!(
+            arbitrate_remote_delete(
+                Some(&state),
+                None,
+                Some(remote_delete),
+                Some(state.modified_at), // mtime matches
+                false,                   // ...but content differs
+            ),
+            RemoteDeleteVerdict::Conflict
+        );
+    }
+
+    #[test]
+    fn untracked_local_file_conflicts_with_remote_delete() {
+        // No stored state for an existing local file: the tombstone cannot be
+        // trusted to delete it → conflict (preserve the untracked file).
+        let remote_delete = utc("2026-03-23 17:12:33");
+
+        assert_eq!(
+            arbitrate_remote_delete(None, None, Some(remote_delete), Some(remote_delete), true),
+            RemoteDeleteVerdict::Conflict
+        );
+        // No stored state and no local file → nothing to do.
+        assert_eq!(
+            arbitrate_remote_delete(None, None, Some(remote_delete), None, true),
+            RemoteDeleteVerdict::Skip
+        );
+    }
+
+    #[test]
+    fn stale_delete_with_unchanged_local_is_skipped() {
+        // Local unchanged but the deletion predates our last sync → skip.
+        let last_sync = utc("2026-03-23 17:12:33");
+        let remote_delete = last_sync - Duration::days(6);
+        let state = make_state("f", last_sync);
+
+        assert_eq!(
+            arbitrate_remote_delete(
+                Some(&state),
+                None,
+                Some(remote_delete),
+                Some(state.modified_at),
+                true,
+            ),
+            RemoteDeleteVerdict::Skip
+        );
     }
 
     // ── remote_is_newer ─────────────────────────────────────────────
@@ -697,6 +948,103 @@ mod tests {
         assert!(result.downloads.is_empty());
     }
 
+    #[test]
+    fn local_delete_racing_remote_edit_needs_comparison() {
+        // Local-delete / remote-edit is an edit/delete conflict: the local
+        // delete must not blindly upload (which would destroy the remote edit).
+        // It is surfaced for comparison instead.
+        let last_sync = utc("2026-07-28 10:00:00");
+        let remote = vec![remote_change(
+            "f.txt",
+            ChangeType::Modified,
+            Some(last_sync + Duration::hours(1)),
+            Some("2-def"), // remote revision advanced past stored "1-abc"
+        )];
+        let mut states = HashMap::new();
+        states.insert("f.txt".to_string(), make_state("f.txt", last_sync));
+
+        let local = vec![local_change("f.txt", ChangeType::Deleted)];
+        let result = triage_changes(&local, &remote, &states, "", std::path::Path::new(""));
+
+        assert!(
+            result.uploads.is_empty(),
+            "local delete racing a remote edit must not upload"
+        );
+        assert_eq!(result.needs_comparison.len(), 1);
+        assert_eq!(result.needs_comparison[0].path, "f.txt");
+    }
+
+    #[test]
+    fn local_delete_with_unchanged_remote_uploads() {
+        // Remote revision matches what we stored (no remote change) → the local
+        // delete propagates normally.
+        let last_sync = utc("2026-07-28 10:00:00");
+        let remote = vec![remote_change(
+            "f.txt",
+            ChangeType::Modified,
+            Some(last_sync - Duration::hours(1)),
+            Some("1-abc"), // same revision as stored
+        )];
+        let mut states = HashMap::new();
+        states.insert("f.txt".to_string(), make_state("f.txt", last_sync));
+
+        let local = vec![local_change("f.txt", ChangeType::Deleted)];
+        let result = triage_changes(&local, &remote, &states, "", std::path::Path::new(""));
+
+        assert_eq!(result.uploads.len(), 1);
+        assert_eq!(result.uploads[0].path(), "f.txt");
+        assert!(result.needs_comparison.is_empty());
+    }
+
+    #[test]
+    fn local_delete_with_remote_also_deleted_uploads_idempotently() {
+        // Both sides deleted: the local delete is an idempotent no-op against
+        // the already-deleted remote and cleans up the local state row. It must
+        // NOT be surfaced as an edit/delete conflict.
+        let last_sync = utc("2026-07-28 10:00:00");
+        let remote = vec![remote_change(
+            "f.txt",
+            ChangeType::Deleted,
+            Some(last_sync + Duration::hours(1)),
+            None,
+        )];
+        let mut states = HashMap::new();
+        states.insert("f.txt".to_string(), make_state("f.txt", last_sync));
+
+        let local = vec![local_change("f.txt", ChangeType::Deleted)];
+        let result = triage_changes(&local, &remote, &states, "", std::path::Path::new(""));
+
+        assert_eq!(result.uploads.len(), 1);
+        assert_eq!(result.uploads[0].path(), "f.txt");
+        assert!(result.needs_comparison.is_empty());
+    }
+
+    #[test]
+    fn local_delete_racing_remote_edit_without_stored_state_uploads() {
+        // No tracked local base to arbitrate against: the local delete of an
+        // untracked file propagates (the remote edit is treated as independent).
+        let last_sync = utc("2026-07-28 10:00:00");
+        let remote = vec![remote_change(
+            "f.txt",
+            ChangeType::Modified,
+            Some(last_sync + Duration::hours(1)),
+            Some("2-def"),
+        )];
+
+        let local = vec![local_change("f.txt", ChangeType::Deleted)];
+        let result = triage_changes(
+            &local,
+            &remote,
+            &HashMap::new(),
+            "",
+            std::path::Path::new(""),
+        );
+
+        assert_eq!(result.uploads.len(), 1);
+        assert_eq!(result.uploads[0].path(), "f.txt");
+        assert!(result.needs_comparison.is_empty());
+    }
+
     // ── triage_changes: upload when remote unchanged ────────────────
 
     #[test]
@@ -706,6 +1054,9 @@ mod tests {
 
         assert_eq!(result.uploads.len(), 1);
         assert_eq!(result.uploads[0].path(), "f.txt");
+        // Create is planned against an absent remote; a doc appearing before
+        // publication is a concurrent-creation race, not a license to overwrite.
+        assert_eq!(result.uploads[0].expected_rev(), ExpectedRemote::Absent);
     }
 
     #[test]
@@ -724,6 +1075,12 @@ mod tests {
         let result = triage_changes(&local, &remote, &states, "", std::path::Path::new(""));
 
         assert_eq!(result.uploads.len(), 1);
+        // Overwrite is planned against the observed remote revision; a remote
+        // edit landing between planning and publication must be rejected.
+        assert_eq!(
+            result.uploads[0].expected_rev(),
+            ExpectedRemote::At("1-abc".to_string())
+        );
     }
 
     // ── triage_changes: needs comparison when both changed ──────────

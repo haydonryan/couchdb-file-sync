@@ -143,6 +143,16 @@ struct ChangeRow<T> {
     seq: Value,
     deleted: Option<bool>,
     doc: Option<T>,
+    /// `changes` carries the revision(s) of the update. For a hard-deleted row
+    /// (no body) this is the only place the deletion's revision is available.
+    #[serde(default)]
+    changes: Vec<ChangeRev>,
+}
+
+/// A single `{ "rev": "…" }` entry from a `_changes` row's `changes` array.
+#[derive(Debug, Deserialize)]
+struct ChangeRev {
+    rev: String,
 }
 
 fn seq_to_string(value: &Value) -> String {
@@ -335,7 +345,11 @@ impl CouchDb {
                     continue;
                 }
                 entries.push(ChangeFeedEntry {
-                    change: Change::remote_deleted(row.id, None),
+                    change: Change::remote_deleted(
+                        row.id,
+                        None,
+                        row.changes.first().map(|c| c.rev.clone()),
+                    ),
                     seq: seq_to_string(&row.seq),
                 });
                 continue;
@@ -351,7 +365,11 @@ impl CouchDb {
 
             if doc.deleted {
                 entries.push(ChangeFeedEntry {
-                    change: Change::remote_deleted(doc.id.clone(), Some(doc.delete_time())),
+                    change: Change::remote_deleted(
+                        doc.id.clone(),
+                        Some(doc.delete_time()),
+                        doc.rev.clone(),
+                    ),
                     seq: seq_to_string(&row.seq),
                 });
                 continue;
@@ -658,11 +676,17 @@ impl CouchDb {
                 .into_iter()
                 .map(|doc| {
                     let mtime = doc.modified_at();
-                    let rev = doc.rev.clone().unwrap_or_default();
+                    let rev = doc.rev.clone();
                     if doc.deleted {
-                        Change::remote_deleted(doc.id.clone(), Some(doc.delete_time()))
+                        Change::remote_deleted(doc.id.clone(), Some(doc.delete_time()), rev)
                     } else {
-                        Change::remote_modified(doc.id, String::new(), doc.size, mtime, rev)
+                        Change::remote_modified(
+                            doc.id,
+                            String::new(),
+                            doc.size,
+                            mtime,
+                            rev.unwrap_or_default(),
+                        )
                     }
                 })
                 .collect();

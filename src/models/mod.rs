@@ -5,7 +5,7 @@ pub mod ignore;
 pub mod path;
 pub mod primitives;
 
-pub use change::{Change, ChangeBatch, ChangeSource, ChangeType};
+pub use change::{Change, ChangeBatch, ChangeSource, ChangeType, ExpectedRemote};
 pub use conflict::{Conflict, ConflictStats, NotificationMode, ResolutionStrategy};
 pub use file::{ChunkDoc, CouchRev, DocType, FileDoc, FileState, RemoteState, TimestampMillis};
 pub use ignore::IgnoreMatcher;
