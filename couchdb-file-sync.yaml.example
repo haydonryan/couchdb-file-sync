@@ -31,14 +31,19 @@ sync:
   # watcher overflowed. 0 disables the periodic rescan. Default: 30
   rescan_interval_secs: 30
   
-  # Batch size for bulk operations
+  # Maximum number of queued changes applied per scheduling wave during a sync.
+  # Uploads/downloads are processed batch_size at a time, bounding the queue of
+  # work held in memory. Must be >= 1. Default: 100
   batch_size: 100
   
   # Maximum file size to sync (in bytes, 0 = unlimited)
   max_file_size: 1073741824  # 1GB
   
-  # Enable parallel uploads/downloads
+  # Enable parallel per-file uploads/downloads. When false, files are applied
+  # strictly one at a time (serially). Default: true
   parallel: true
+  # Maximum number of per-file uploads/downloads in flight at once when
+  # parallel is enabled. Must be >= 1 when parallel is true. Default: 4
   max_parallel: 4
 
   # How long (seconds) a soft-delete tombstone is kept before it is pruned so

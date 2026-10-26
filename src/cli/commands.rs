@@ -574,7 +574,12 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
             orphan_grace,
             u64::try_from(config.sync.batch_size).unwrap_or(1000),
         )
-        .with_max_file_size(size_limit(&config));
+        .with_max_file_size(size_limit(&config))
+        .with_apply_settings(
+            config.sync.parallel,
+            config.sync.max_parallel,
+            config.sync.batch_size,
+        );
     let report = if dry_run {
         engine.sync_dry_run().await?
     } else {
@@ -1151,7 +1156,12 @@ async fn daemon_sync(path: &Path, config: &AppConfig) -> Result<SyncReport> {
             orphan_grace,
             u64::try_from(config.sync.batch_size).unwrap_or(1000),
         )
-        .with_max_file_size(size_limit(config));
+        .with_max_file_size(size_limit(config))
+        .with_apply_settings(
+            config.sync.parallel,
+            config.sync.max_parallel,
+            config.sync.batch_size,
+        );
     let report = engine.sync().await?;
 
     print_sync_report(&report, false);
@@ -1861,7 +1871,12 @@ async fn build_live_sync_engine(
                 .then(|| std::time::Duration::from_secs(config.sync.orphan_chunk_grace_secs)),
             u64::try_from(config.sync.batch_size).unwrap_or(1000),
         )
-        .with_max_file_size(size_limit(config));
+        .with_max_file_size(size_limit(config))
+        .with_apply_settings(
+            config.sync.parallel,
+            config.sync.max_parallel,
+            config.sync.batch_size,
+        );
 
     Ok((ignore_policy, engine))
 }
