@@ -447,9 +447,20 @@ async fn sync_identity_for(
 ///
 /// A database with no recorded identity (fresh or legacy) is conservatively
 /// bound to the current mapping and its state kept; a mapping change errors
-/// out, requiring an explicit reset/rebuild.
-fn validate_sync_mapping(local_db: &LocalDb, identity: &SyncIdentity) -> Result<()> {
-    match local_db.validate_sync_identity(identity)? {
+/// out, requiring an explicit reset/rebuild. When `persist_bind` is false
+/// (dry-run, against a read-only/ephemeral baseline) the conservative bind is
+/// NOT written to state, honoring the no-write contract.
+fn validate_sync_mapping(
+    local_db: &LocalDb,
+    identity: &SyncIdentity,
+    persist_bind: bool,
+) -> Result<()> {
+    let check = if persist_bind {
+        local_db.validate_sync_identity(identity)?
+    } else {
+        local_db.validate_sync_identity_read_only(identity)?
+    };
+    match check {
         SyncIdentityCheck::Matched => {}
         SyncIdentityCheck::Bound => {
             info!(
@@ -524,6 +535,7 @@ pub fn validate_unique_mappings(paths: &[SyncPath]) -> Result<()> {
 ///
 /// Returns an error if the local state DB cannot be opened, the `CouchDB`
 /// connection cannot be established, or the sync pipeline fails.
+#[allow(clippy::too_many_lines)] // single cohesive setup + cycle + reporting flow
 pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<SyncReport> {
     info!("Running sync in: {}", path.display());
 
@@ -534,25 +546,52 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
     // Load ignore patterns
     let ignore_matcher = load_ignore_patterns(&path, &config)?;
 
-    // Open local database
+    // Local state: dry-run must neither create nor migrate state. Use an
+    // existing baseline strictly read-only, or an ephemeral in-memory baseline
+    // when none exists, so the pipeline walks against state without ever
+    // touching the filesystem.
     let db_path = state_db_path(&path);
-    let local_db = LocalDb::open(&db_path)?;
+    let local_db = if dry_run {
+        if db_path.exists() {
+            LocalDb::open_read_only(&db_path)?
+        } else {
+            LocalDb::open_in_memory()?
+        }
+    } else {
+        LocalDb::open(&db_path)?
+    };
 
-    // Connect to CouchDB
-    let couchdb = CouchDb::new(
-        &config.couchdb.url,
-        config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
-        config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
-        &DatabaseName::new(&config.couchdb.database),
-        &RemotePath::new(&config.couchdb.remote_path),
-        config.couchdb.timeout_seconds,
-        config.couchdb.retry_attempts,
-    )
-    .await?
+    // Connect to CouchDB. Dry-run connects read-only so a missing remote
+    // database is never created (it surfaces as an explicit error instead).
+    let couchdb = if dry_run {
+        CouchDb::new_read_only(
+            &config.couchdb.url,
+            config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
+            config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
+            &DatabaseName::new(&config.couchdb.database),
+            &RemotePath::new(&config.couchdb.remote_path),
+            config.couchdb.timeout_seconds,
+            config.couchdb.retry_attempts,
+        )
+        .await?
+    } else {
+        CouchDb::new(
+            &config.couchdb.url,
+            config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
+            config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
+            &DatabaseName::new(&config.couchdb.database),
+            &RemotePath::new(&config.couchdb.remote_path),
+            config.couchdb.timeout_seconds,
+            config.couchdb.retry_attempts,
+        )
+        .await?
+    }
     .with_legacy_chunk_data(config.sync.legacy_chunk_data);
 
     // Validate that the stored state belongs to the current mapping before
-    // reusing it (conservatively binding fresh/legacy state).
+    // reusing it (conservatively binding fresh/legacy state). In dry-run the
+    // baseline is read-only/ephemeral, so the conservative bind is validated
+    // but not persisted (the no-write contract).
     let root = resolve_sync_dir(&path)?;
     let identity = sync_identity_for(
         &couchdb,
@@ -561,7 +600,7 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
         &config.couchdb.remote_path,
     )
     .await?;
-    validate_sync_mapping(&local_db, &identity)?;
+    validate_sync_mapping(&local_db, &identity, !dry_run)?;
 
     // Run sync (dry-run walks the pipeline without writing)
     let retention = (config.sync.tombstone_retention_secs > 0)
@@ -1143,7 +1182,7 @@ async fn daemon_sync(path: &Path, config: &AppConfig) -> Result<SyncReport> {
         &config.couchdb.remote_path,
     )
     .await?;
-    validate_sync_mapping(&local_db, &identity)?;
+    validate_sync_mapping(&local_db, &identity, true)?;
 
     // Run sync
     let retention = (config.sync.tombstone_retention_secs > 0)
@@ -1855,7 +1894,7 @@ async fn build_live_sync_engine(
         &config.couchdb.remote_path,
     )
     .await?;
-    validate_sync_mapping(&local_db, &identity)?;
+    validate_sync_mapping(&local_db, &identity, true)?;
 
     let initial_policy = ignore_policy
         .read()
@@ -2367,17 +2406,27 @@ async fn apply_live_remote_write(
     Ok(())
 }
 
-/// List conflicts
+/// Load the conflict list for a single root without rendering it.
+///
+/// Shared by the `conflicts` command and the multi-root JSON aggregator in the
+/// binary.
+///
+/// # Errors
+///
+/// Returns an error if the local state DB cannot be opened or read.
+pub fn conflicts_for(path: &Path) -> Result<Vec<Conflict>> {
+    let db_path = state_db_path(path);
+    let local_db = LocalDb::open(&db_path)?;
+    local_db.get_conflicts()
+}
+
 /// List conflicts for a sync directory.
 ///
 /// # Errors
 ///
 /// Returns an error if the local state DB cannot be opened or read.
 pub fn conflicts(path: &Path, json: bool) -> Result<()> {
-    let db_path = state_db_path(path);
-    let local_db = LocalDb::open(&db_path)?;
-
-    let conflicts = local_db.get_conflicts()?;
+    let conflicts = conflicts_for(path)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&conflicts)?);
@@ -2444,7 +2493,7 @@ pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
         &config.couchdb.remote_path,
     )
     .await?;
-    validate_sync_mapping(&local_db, &identity)?;
+    validate_sync_mapping(&local_db, &identity, true)?;
 
     let mut engine = SyncEngine::new(couchdb, local_db, root)
         .with_conflict_dir(config.conflicts.conflict_dir.clone());
@@ -2612,8 +2661,42 @@ fn truncate_str(s: &str, max_width: usize) -> String {
 ///
 /// # Errors
 ///
+/// Machine-readable sync status for a single root.
+///
+/// Exposed so the binary can aggregate per-root results into one JSON document
+/// for multi-root output while the single-root `status` command keeps its
+/// documented shape.
+#[derive(Clone, Debug)]
+pub struct StatusSummary {
+    pub sync_directory: PathBuf,
+    pub tracked_files: usize,
+    pub local_files: usize,
+    pub pending_conflicts: usize,
+    pub last_sync: Option<DateTime<Utc>>,
+    pub last_seq: Option<String>,
+}
+
+impl StatusSummary {
+    /// Render the single-root status document. The shape mirrors the previous
+    /// `status --json` output exactly so one-root compatibility is preserved.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "sync_directory": self.sync_directory,
+            "tracked_files": self.tracked_files,
+            "local_files": self.local_files,
+            "pending_conflicts": self.pending_conflicts,
+            "last_sync": self.last_sync,
+        })
+    }
+}
+
+/// Compute the status summary for a single root without rendering it.
+///
+/// # Errors
+///
 /// Returns an error if the local state DB cannot be opened or read.
-pub fn status(path: &Path, json: bool, _config: &AppConfig) -> Result<()> {
+pub fn status_summary(path: &Path) -> Result<StatusSummary> {
     let db_path = state_db_path(path);
     let local_db = LocalDb::open(&db_path)?;
 
@@ -2628,36 +2711,49 @@ pub fn status(path: &Path, json: bool, _config: &AppConfig) -> Result<()> {
         .filter(|e| e.file_type().is_file())
         .count();
 
+    Ok(StatusSummary {
+        sync_directory: path.to_path_buf(),
+        tracked_files: file_states.len(),
+        local_files: file_count,
+        pending_conflicts: conflicts.len(),
+        last_sync: checkpoint.as_ref().map(|cp| cp.last_sync_at),
+        last_seq: checkpoint.as_ref().map(|cp| cp.last_seq.clone()),
+    })
+}
+
+/// List the sync status for a sync directory.
+///
+/// # Errors
+///
+/// Returns an error if the local state DB cannot be opened or read.
+pub fn status(path: &Path, json: bool, _config: &AppConfig) -> Result<()> {
+    let summary = status_summary(path)?;
+
     if json {
-        let status = serde_json::json!({
-            "sync_directory": path,
-            "tracked_files": file_states.len(),
-            "local_files": file_count,
-            "pending_conflicts": conflicts.len(),
-            "last_sync": checkpoint.as_ref().map(|cp| cp.last_sync_at),
-        });
-        println!("{}", serde_json::to_string_pretty(&status)?);
+        println!("{}", serde_json::to_string_pretty(&summary.to_json())?);
     } else {
         println!("CouchDB File Sync Status");
         println!("==============");
-        println!("Sync directory: {}", path.display());
-        println!("Local files:    {file_count}");
-        println!("Tracked files:  {}", file_states.len());
-        println!("Pending conflicts: {}", conflicts.len());
+        println!("Sync directory: {}", summary.sync_directory.display());
+        println!("Local files:    {}", summary.local_files);
+        println!("Tracked files:  {}", summary.tracked_files);
+        println!("Pending conflicts: {}", summary.pending_conflicts);
 
-        if let Some(cp) = &checkpoint {
-            println!(
-                "Last sync:      {}",
-                cp.last_sync_at.format("%Y-%m-%d %H:%M:%S UTC")
-            );
-            println!("Last sequence:  {}", cp.last_seq);
+        if let Some(cp) = &summary.last_sync {
+            println!("Last sync:      {}", cp.format("%Y-%m-%d %H:%M:%S UTC"));
+            if let Some(seq) = &summary.last_seq {
+                println!("Last sequence:  {seq}");
+            }
         } else {
             println!("Last sync:      Never");
         }
 
-        if !conflicts.is_empty() {
+        if summary.pending_conflicts > 0 {
             println!();
-            println!("⚠️  {} conflict(s) need resolution", conflicts.len());
+            println!(
+                "⚠️  {} conflict(s) need resolution",
+                summary.pending_conflicts
+            );
         }
     }
 
@@ -2732,39 +2828,57 @@ fn state_db_path(root: &Path) -> PathBuf {
     state_dir(root).join("state.db")
 }
 
-/// Helper to print sync report.
+/// Render the human-facing sync report as a string.
 ///
 /// When `dry_run` is true the counts are labelled as "would" actions and the
-/// summary makes clear that no changes were made.
-fn print_sync_report(report: &SyncReport, dry_run: bool) {
-    println!();
+/// summary makes clear that no changes were made. A successful (non-dry) run
+/// prints "Sync complete ✓"; a run with apply errors prints an explicit
+/// partial-failure header naming the error count so human completion status
+/// reflects actual completed synchronization.
+fn format_sync_report(report: &SyncReport, dry_run: bool) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    out.push('\n');
     if dry_run {
-        println!("Dry run complete — no changes were made");
-        println!("  Would upload:  {}", report.uploaded.0);
-        println!("  Would download: {}", report.downloaded.0);
-        println!("  Would delete (local): {}", report.deleted_local);
-        println!("  Would delete (remote): {}", report.deleted_remote);
+        let _ = writeln!(out, "Dry run complete — no changes were made");
+        let _ = writeln!(out, "  Would upload:  {}", report.uploaded.0);
+        let _ = writeln!(out, "  Would download: {}", report.downloaded.0);
+        let _ = writeln!(out, "  Would delete (local): {}", report.deleted_local);
+        let _ = writeln!(out, "  Would delete (remote): {}", report.deleted_remote);
+    } else if report.errors.is_empty() {
+        let _ = writeln!(out, "Sync complete ✓");
+        let _ = writeln!(out, "  Uploaded:  {}", report.uploaded.0);
+        let _ = writeln!(out, "  Downloaded: {}", report.downloaded.0);
+        let _ = writeln!(out, "  Deleted (local): {}", report.deleted_local);
+        let _ = writeln!(out, "  Deleted (remote): {}", report.deleted_remote);
     } else {
-        println!("Sync complete ✓");
-        println!("  Uploaded:  {}", report.uploaded.0);
-        println!("  Downloaded: {}", report.downloaded.0);
-        println!("  Deleted (local): {}", report.deleted_local);
-        println!("  Deleted (remote): {}", report.deleted_remote);
+        let _ = writeln!(out, "Sync completed with {} error(s)", report.errors.len());
+        let _ = writeln!(out, "  Uploaded:  {}", report.uploaded.0);
+        let _ = writeln!(out, "  Downloaded: {}", report.downloaded.0);
+        let _ = writeln!(out, "  Deleted (local): {}", report.deleted_local);
+        let _ = writeln!(out, "  Deleted (remote): {}", report.deleted_remote);
     }
 
     if report.conflicts > 0 {
-        println!("  Conflicts: {} ⚠️", report.conflicts);
-        println!();
-        println!("Run 'couchdb-file-sync conflicts' to see details");
+        let _ = writeln!(out, "  Conflicts: {} ⚠️", report.conflicts);
+        out.push('\n');
+        let _ = writeln!(out, "Run 'couchdb-file-sync conflicts' to see details");
     }
 
     if !report.errors.is_empty() {
-        println!();
-        println!("Errors:");
+        out.push('\n');
+        let _ = writeln!(out, "Errors:");
         for error in &report.errors {
-            println!("  • {error}");
+            let _ = writeln!(out, "  • {error}");
         }
     }
+
+    out
+}
+
+/// Print the human-facing sync report.
+fn print_sync_report(report: &SyncReport, dry_run: bool) {
+    print!("{}", format_sync_report(report, dry_run));
 }
 
 #[cfg(test)]
@@ -2975,6 +3089,63 @@ mod tests {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             print_sync_report(&report, false);
         }));
+    }
+
+    #[test]
+    fn format_sync_report_flags_partial_failure_and_omits_success_checkmark() {
+        // A non-dry report with apply errors must not claim "Sync complete ✓";
+        // it must surface an explicit partial-failure header and every error.
+        let report = SyncReport {
+            uploaded: UploadCount(5),
+            downloaded: DownloadCount(3),
+            deleted_local: 1,
+            deleted_remote: 0,
+            conflicts: 0,
+            errors: vec!["timeout".to_string(), "permission denied".to_string()],
+        };
+        let text = format_sync_report(&report, false);
+        assert!(
+            !text.contains("Sync complete ✓"),
+            "failed sync must not claim the success checkmark, got: {text}"
+        );
+        assert!(
+            text.contains("Sync completed with 2 error(s)"),
+            "partial-failure header must name the error count, got: {text}"
+        );
+        assert!(text.contains("timeout"), "error text must be listed");
+        assert!(
+            text.contains("permission denied"),
+            "error text must be listed"
+        );
+
+        // The same report as a dry-run keeps its planned phrasing and reports
+        // no errors (dry-run does not apply, so it never fails).
+        let dry = format_sync_report(&report, true);
+        assert!(
+            dry.contains("Dry run complete"),
+            "dry run keeps its planned phrasing, got: {dry}"
+        );
+    }
+
+    #[test]
+    fn format_sync_report_success_shows_checkmark() {
+        let report = SyncReport {
+            uploaded: UploadCount(2),
+            downloaded: DownloadCount(1),
+            deleted_local: 0,
+            deleted_remote: 1,
+            conflicts: 0,
+            errors: vec![],
+        };
+        let text = format_sync_report(&report, false);
+        assert!(
+            text.contains("Sync complete ✓"),
+            "clean sync must claim completion, got: {text}"
+        );
+        assert!(
+            !text.contains("error"),
+            "clean sync must not mention errors, got: {text}"
+        );
     }
 
     #[test]
@@ -3783,7 +3954,7 @@ mod tests {
         );
 
         let report = engine.sync().await.expect("reconciliation sync");
-        assert!(report.errors.is_empty());
+        assert_eq!(report.errors, [] as [String; 0]);
         assert!(
             report.uploaded.0 >= 1,
             "overflow-dropped create must converge"

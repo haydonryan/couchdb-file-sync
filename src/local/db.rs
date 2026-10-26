@@ -2,7 +2,8 @@ use crate::models::{Checkpoint, Conflict, CouchRev, FileState, SyncIdentity};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tracing::info;
@@ -34,6 +35,26 @@ impl LocalDb {
         db.init_schema()?;
         info!("Local database initialized");
         Ok(db)
+    }
+
+    /// Open an existing local database strictly read-only, without creating or
+    /// migrating schema.
+    ///
+    /// Dry-run sync uses this so it can walk the full pipeline against an
+    /// existing baseline without creating tables, running migrations, or
+    /// writing anything. It fails if `path` does not exist — an absent
+    /// baseline is handled by the caller with an ephemeral in-memory database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database file cannot be opened read-only.
+    pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Self {
+            conn,
+            #[cfg(test)]
+            save_file_state_calls: std::cell::Cell::new(0),
+        })
     }
 
     /// Create an in-memory database (for testing)
@@ -541,13 +562,58 @@ impl LocalDb {
     /// Remove tracked state that should not survive an authoritative rebuild.
     /// Reset all sync state (file states, conflicts, and checkpoint).
     ///
+    /// The three deletes run inside a single `SQLite` transaction so the reset is
+    /// atomic: an interruption mid-reset can never leave file states, conflicts
+    /// and the checkpoint in a partially-cleared, inconsistent state.
+    ///
     /// # Errors
     ///
     /// Returns an error if any of the reset operations fail.
     pub fn reset_sync_state(&self) -> Result<()> {
-        self.clear_file_states()?;
-        self.clear_conflicts()?;
-        self.clear_checkpoint()?;
+        // `unchecked_transaction` is safe here because callers (the engine's
+        // `AsyncLocalDb`) always hold the connection mutex, so no other thread
+        // can observe a half-committed reset.
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM file_states", [])?;
+        tx.execute("DELETE FROM conflicts", [])?;
+        tx.execute("DELETE FROM sync_checkpoint", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Atomically replace the tracked sync baseline with a freshly rebuilt one.
+    ///
+    /// Used by the authoritative local rebuild at the verified transition: it
+    /// clears all prior sync state (file states, conflicts, checkpoint) and
+    /// installs the new `states` in a single `SQLite` transaction, so the reset
+    /// and the new baseline commit or roll back together. Obsolete file states
+    /// are dropped only after their replacement content has been verified and
+    /// staged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction fails.
+    pub fn commit_rebuild_state(&self, states: &[FileState]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM file_states", [])?;
+        tx.execute("DELETE FROM conflicts", [])?;
+        tx.execute("DELETE FROM sync_checkpoint", [])?;
+        for state in states {
+            tx.execute(
+                "INSERT OR REPLACE INTO file_states
+                 (path, hash, size, modified_at, couch_rev, last_sync_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    &state.path,
+                    &state.hash,
+                    u64_to_i64(state.size)?,
+                    &state.modified_at,
+                    &state.couch_rev,
+                    &state.last_sync_at,
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -624,11 +690,115 @@ impl LocalDb {
             }),
         }
     }
+
+    /// Read the persisted record of an in-progress authoritative remote
+    /// rebuild, if one is pending. Returns `Ok(None)` when no rebuild is
+    /// incomplete.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata query or deserialization fails.
+    pub fn get_remote_rebuild_journal(&self) -> Result<Option<RemoteRebuildJournal>> {
+        let Some(raw) = self.get_meta(REMOTE_REBUILD_JOURNAL_KEY)? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_str(&raw)?))
+    }
+
+    /// Persist the declared plan/progress of an in-progress authoritative
+    /// remote rebuild. Written before the first upload and updated as
+    /// publication progresses, so an interrupted run leaves an accurate
+    /// journal that a later restart can resume or reconcile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the journal cannot be serialized or written.
+    pub fn set_remote_rebuild_journal(&self, journal: &RemoteRebuildJournal) -> Result<()> {
+        let raw = serde_json::to_string(journal)?;
+        self.set_meta(REMOTE_REBUILD_JOURNAL_KEY, &raw)
+    }
+
+    /// Clear the persisted remote-rebuild journal. Called only once remote
+    /// publication has completed and tracked state has been reset, so a
+    /// normal sync resumes normally.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the journal row cannot be deleted.
+    pub fn clear_remote_rebuild_journal(&self) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM sync_meta WHERE key = ?1",
+            params![REMOTE_REBUILD_JOURNAL_KEY],
+        )?;
+        Ok(())
+    }
+
+    /// Validate that stored state may be reused for the given sync mapping
+    /// without writing anything.
+    ///
+    /// Dry-run sync uses this against a read-only or ephemeral baseline: a
+    /// database with no recorded identity (fresh or legacy) is accepted and its
+    /// state kept, but the conservative bind is NOT persisted, honoring the
+    /// no-write dry-run contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the identity cannot be read.
+    pub fn validate_sync_identity_read_only(
+        &self,
+        identity: &SyncIdentity,
+    ) -> Result<SyncIdentityCheck> {
+        match self.get_sync_identity()? {
+            None => Ok(SyncIdentityCheck::Bound),
+            Some(stored) if stored == *identity => Ok(SyncIdentityCheck::Matched),
+            Some(stored) => Ok(SyncIdentityCheck::Mismatched {
+                stored,
+                current: identity.clone(),
+            }),
+        }
+    }
 }
 
 /// Key in `sync_meta` storing the serialized [`SyncIdentity`] that local state
 /// is bound to.
 const SYNC_IDENTITY_KEY: &str = "sync_identity";
+
+/// Key in `sync_meta` storing the serialized [`RemoteRebuildJournal`] of an
+/// in-progress authoritative remote rebuild.
+const REMOTE_REBUILD_JOURNAL_KEY: &str = "remote_rebuild_journal";
+
+/// Persisted record of an in-progress (or interrupted) authoritative remote
+/// rebuild.
+///
+/// The journal is written with the full declared plan *before* the first
+/// upload and survives until publication completes. This keeps the previous
+/// baseline intact instead of clearing it up front: if an upload or delete
+/// fails partway, the journal and the pre-rebuild tracked state remain, so a
+/// restart can resume or reconcile the authoritative plan and a normal sync is
+/// refused rather than misclassifying surviving remote data as ordinary new
+/// edits or conflicts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteRebuildJournal {
+    /// Planned local uploads in publication order.
+    pub uploads: Vec<String>,
+    /// Planned remote deletes in publication order.
+    pub deletes: Vec<String>,
+    /// Uploads already published.
+    pub uploads_done: usize,
+    /// Remote deletes already published.
+    pub deletes_done: usize,
+}
+
+impl RemoteRebuildJournal {
+    /// Return a copy of the journal with publication progress advanced to the
+    /// given completed counts, for persisting an accurate checkpoint mid-run.
+    #[must_use]
+    pub const fn with_progress(mut self, uploads_done: usize, deletes_done: usize) -> Self {
+        self.uploads_done = uploads_done;
+        self.deletes_done = deletes_done;
+        self
+    }
+}
 
 /// Outcome of validating the current sync mapping against the stored identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1252,6 +1422,32 @@ mod tests {
         assert!(db.get_checkpoint().expect("checkpoint").is_none());
     }
 
+    #[test]
+    fn test_commit_rebuild_state_replaces_baseline_atomically() {
+        let db = test_db();
+
+        // Prior baseline across all three tables.
+        db.save_file_state(&make_file_state("/old.txt"))
+            .expect("save old state");
+        db.store_conflict(&make_conflict("/old.txt"))
+            .expect("store conflict");
+        db.save_checkpoint("old-seq").expect("checkpoint");
+
+        // Commit a rebuilt baseline: stale states dropped, new ones installed.
+        db.commit_rebuild_state(&[make_file_state("/new.txt")])
+            .expect("commit rebuild state");
+
+        // Old state gone, new state present, conflicts + checkpoint cleared.
+        assert!(db.get_file_state("/old.txt").expect("old gone").is_none());
+        assert!(
+            db.get_file_state("/new.txt")
+                .expect("new present")
+                .is_some()
+        );
+        assert!(db.get_conflicts().expect("conflicts cleared").is_empty());
+        assert!(db.get_checkpoint().expect("checkpoint cleared").is_none());
+    }
+
     // ── edge cases ───────────────────────────────────────────────────────
 
     #[test]
@@ -1404,6 +1600,66 @@ mod tests {
         assert_eq!(
             db.validate_sync_identity(&canonical).unwrap(),
             SyncIdentityCheck::Matched
+        );
+    }
+
+    // ── read-only open (dry-run baseline) ────────────────────────────────
+
+    #[test]
+    fn open_read_only_opens_existing_database_without_creating_schema() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("state.db");
+        // A real writable DB with full schema and a recorded state.
+        {
+            let writable = LocalDb::open(&db_path).expect("open writable db");
+            writable
+                .save_file_state(&make_file_state("/a.txt"))
+                .expect("save state");
+        }
+
+        // Read-only open must succeed against the existing file and still
+        // expose the recorded state.
+        let ro = LocalDb::open_read_only(&db_path).expect("open read-only db");
+        assert!(
+            ro.get_file_state("/a.txt").expect("read state").is_some(),
+            "read-only baseline must still expose existing state"
+        );
+    }
+
+    #[test]
+    fn open_read_only_does_not_create_schema_on_pristine_file() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("state.db");
+        // A pristine, table-less SQLite file (no schema init ever ran).
+        {
+            let conn = Connection::open(&db_path).expect("create empty sqlite file");
+            drop(conn);
+        }
+
+        // Read-only open of the pristine file must succeed without creating
+        // any schema (no table creation, no migration).
+        let ro = LocalDb::open_read_only(&db_path).expect("open read-only db");
+        let table_count: i64 = ro
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count tables");
+        assert_eq!(
+            table_count, 0,
+            "read-only open must not create/migrate schema"
+        );
+    }
+
+    #[test]
+    fn open_read_only_fails_on_absent_file() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let missing = tmp.path().join("does-not-exist.db");
+        assert!(
+            LocalDb::open_read_only(&missing).is_err(),
+            "read-only open of an absent baseline must fail (caller uses in-memory)"
         );
     }
 }

@@ -1,5 +1,5 @@
 use crate::couchdb::CouchDb;
-use crate::local::{LocalDb, Scanner, compute_bytes_hash, compute_file_hash};
+use crate::local::{LocalDb, RemoteRebuildJournal, Scanner, compute_bytes_hash, compute_file_hash};
 use crate::models::{
     Change, ChangeType, Checkpoint, Conflict, CouchRev, DownloadCount, ExpectedRemote, FileDoc,
     FileState, IgnoreMatcher, RemoteState, ResolutionStrategy, SyncDirPath, UploadCount,
@@ -68,6 +68,52 @@ pub struct SyncReport {
     pub deleted_remote: usize,
     pub conflicts: usize,
     pub errors: Vec<String>,
+}
+
+/// A single remote file fetched, content-verified, and staged for an
+/// authoritative local rebuild. `staging` is the path to the verified bytes in
+/// the (scanner-ignored) staging area; `local_path` is where they will be
+/// installed at commit time.
+#[derive(Debug, Clone)]
+struct StagedDownload {
+    local_path: String,
+    staging: PathBuf,
+    hash: String,
+    size: u64,
+    couch_rev: Option<CouchRev>,
+}
+
+/// Persisted commit plan for an authoritative local rebuild. Written to the
+/// state dir before the live tree is mutated so an interrupted commit can be
+/// resumed on the next run; every commit step (install / delete / reset) is
+/// idempotent, so re-running the plan is safe.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RebuildJournal {
+    staged: Vec<JournalStaged>,
+    deletes: Vec<String>,
+}
+
+/// Serde-friendly staged entry persisted in the [`RebuildJournal`] (paths and
+/// hashes survive the restart; `CouchRev` is stored as its raw string).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct JournalStaged {
+    local_path: String,
+    staging: PathBuf,
+    hash: String,
+    size: u64,
+    couch_rev: Option<String>,
+}
+
+impl From<&StagedDownload> for JournalStaged {
+    fn from(s: &StagedDownload) -> Self {
+        Self {
+            local_path: s.local_path.clone(),
+            staging: s.staging.clone(),
+            hash: s.hash.clone(),
+            size: s.size,
+            couch_rev: s.couch_rev.as_ref().map(ToString::to_string),
+        }
+    }
 }
 
 /// Shared handle to the blocking SQLite-backed [`LocalDb`].
@@ -179,6 +225,29 @@ impl AsyncLocalDb {
     async fn reset_sync_state(&self) -> Result<()> {
         self.run(super::super::local::db::LocalDb::reset_sync_state)
             .await
+    }
+
+    async fn get_remote_rebuild_journal(&self) -> Result<Option<RemoteRebuildJournal>> {
+        self.run(super::super::local::db::LocalDb::get_remote_rebuild_journal)
+            .await
+    }
+
+    async fn set_remote_rebuild_journal(&self, journal: &RemoteRebuildJournal) -> Result<()> {
+        let journal = journal.clone();
+        self.run(move |db| db.set_remote_rebuild_journal(&journal))
+            .await
+    }
+
+    async fn clear_remote_rebuild_journal(&self) -> Result<()> {
+        self.run(super::super::local::db::LocalDb::clear_remote_rebuild_journal)
+            .await
+    }
+
+    /// Atomically clear the sync baseline and install `states` (see
+    /// [`LocalDb::commit_rebuild_state`]).
+    async fn commit_rebuild_state(&self, states: Vec<FileState>) -> Result<()> {
+        let states = states.clone();
+        self.run(move |db| db.commit_rebuild_state(&states)).await
     }
 
     async fn get_meta(&self, key: &str) -> Result<Option<String>> {
@@ -706,28 +775,43 @@ async fn apply_one_upload(
     );
 
     let is_deleted = matches!(change.change_type(), ChangeType::Deleted);
+
+    // Dry-run reports the *planned* outcome (what would happen) without
+    // applying anything, so counters retain the full planned counts.
+    if dry_run {
+        return Ok(UploadOutcome {
+            uploaded: usize::from(!is_deleted),
+            deleted_remote: usize::from(is_deleted),
+            error: None,
+        });
+    }
+
+    // Apply the change, counting it only when it actually succeeds so a failed
+    // upload is never reported as uploaded/deleted. The per-file error is
+    // preserved in `outcome.error` so the batch collects every failure without
+    // dropping per-path information.
     let mut outcome = UploadOutcome {
-        uploaded: usize::from(!is_deleted),
-        deleted_remote: usize::from(is_deleted),
+        uploaded: 0,
+        deleted_remote: 0,
         error: None,
     };
-
-    if !dry_run {
-        if is_deleted {
-            match worker.apply_to_couchdb(&change).await {
-                Ok(()) => {
-                    // Preserve the original post-delete local state refresh.
-                    worker.local_db.delete_file_state(change.path()).await?;
-                }
-                Err(e) => {
-                    error!("Failed to upload {}: {}", change.path(), e);
-                    outcome.error = Some(format!("Upload {}: {}", change.path(), e));
-                }
+    if is_deleted {
+        match worker.apply_to_couchdb(&change).await {
+            Ok(()) => {
+                // Preserve the original post-delete local state refresh.
+                worker.local_db.delete_file_state(change.path()).await?;
+                outcome.deleted_remote = 1;
             }
-        } else if let Err(e) = worker.apply_to_couchdb(&change).await {
-            error!("Failed to upload {}: {}", change.path(), e);
-            outcome.error = Some(format!("Upload {}: {}", change.path(), e));
+            Err(e) => {
+                error!("Failed to upload {}: {}", change.path(), e);
+                outcome.error = Some(format!("Upload {}: {}", change.path(), e));
+            }
         }
+    } else if let Err(e) = worker.apply_to_couchdb(&change).await {
+        error!("Failed to upload {}: {}", change.path(), e);
+        outcome.error = Some(format!("Upload {}: {}", change.path(), e));
+    } else {
+        outcome.uploaded = 1;
     }
 
     Ok(outcome)
@@ -793,15 +877,33 @@ async fn apply_one_download(
     );
 
     let is_deleted = matches!(change.change_type(), ChangeType::Deleted);
+
+    // Dry-run reports the *planned* outcome (what would happen) without
+    // applying anything, so counters retain the full planned counts.
+    if dry_run {
+        return Ok(DownloadOutcome {
+            downloaded: usize::from(!is_deleted),
+            deleted_local: usize::from(is_deleted),
+            error: None,
+        });
+    }
+
+    // Apply the change, counting it only when it actually succeeds so a failed
+    // download is never reported as downloaded/deleted. The per-file error is
+    // preserved in `outcome.error` so the batch collects every failure without
+    // dropping per-path information.
     let mut outcome = DownloadOutcome {
-        downloaded: usize::from(!is_deleted),
-        deleted_local: usize::from(is_deleted),
+        downloaded: 0,
+        deleted_local: 0,
         error: None,
     };
-
-    if !dry_run && let Err(e) = worker.apply_to_filesystem(&change).await {
+    if let Err(e) = worker.apply_to_filesystem(&change).await {
         error!("Failed to download {}: {}", change.path(), e);
         outcome.error = Some(format!("Download {}: {}", change.path(), e));
+    } else if is_deleted {
+        outcome.deleted_local = 1;
+    } else {
+        outcome.downloaded = 1;
     }
 
     Ok(outcome)
@@ -1080,6 +1182,26 @@ impl SyncEngine {
         // Fail fast on invalid apply/batch bounds before any work runs.
         self.validate_apply_settings()?;
 
+        // Refuse a real sync while an authoritative remote rebuild is
+        // incomplete. Publication may have failed partway, leaving the remote
+        // partially rebuilt while the previous local baseline is still
+        // authoritative; ordinary triage against that state would misclassify
+        // surviving remote data as new edits or conflicts. The user must
+        // resume (and the rebuild will reconcile) the declared plan via
+        // `rebuild-remote`. A dry-run is read-only and safe to inspect.
+        if !dry_run && let Some(journal) = self.local_db.get_remote_rebuild_journal().await? {
+            anyhow::bail!(
+                "A remote rebuild is incomplete ({}/{} uploads, {}/{} deletes \
+                 published). Run `couchdb-file-sync rebuild-remote` to resume or \
+                 reconcile the authoritative mirror before syncing; a normal sync \
+                 would misclassify surviving remote data as ordinary new edits.",
+                journal.uploads_done,
+                journal.uploads.len(),
+                journal.deletes_done,
+                journal.deletes.len()
+            );
+        }
+
         if dry_run {
             info!("========== DRY-RUN SYNC CYCLE STARTING ==========");
         } else {
@@ -1267,23 +1389,49 @@ impl SyncEngine {
         let (uploads, remote_deletes) =
             triage::plan_remote_rebuild(&local_states, &remote_docs, self.couchdb.remote_prefix());
 
-        self.local_db.reset_sync_state().await?;
-
+        // Record the declared authoritative plan BEFORE the first upload while
+        // keeping the existing baseline intact. If an upload or delete fails
+        // partway, the journal (and the pre-rebuild tracked state) survive, so
+        // a later restart can resume or reconcile the rebuild and a normal sync
+        // is refused rather than misclassifying surviving remote data as
+        // ordinary new edits. State is only reset once publication completes.
+        let mut journal = RemoteRebuildJournal {
+            uploads: uploads.clone(),
+            deletes: remote_deletes.clone(),
+            uploads_done: 0,
+            deletes_done: 0,
+        };
+        self.local_db.set_remote_rebuild_journal(&journal).await?;
         let mut report = SyncReport::default();
 
-        for local_path in uploads {
-            let remote_path = self.couchdb.get_remote_path(&local_path);
+        for local_path in &uploads {
+            let remote_path = self.couchdb.get_remote_path(local_path);
             // Remote rebuild is an explicit, unconditional mirror of local state
             // to remote: force-overwrite any remote doc regardless of its rev.
-            self.upload_local_file(&local_path, &remote_path, &ExpectedRemote::Force)
+            self.upload_local_file(local_path, &remote_path, &ExpectedRemote::Force)
                 .await?;
+            journal.uploads_done += 1;
             report.uploaded.0 += 1;
         }
+        // Persist upload progress so an interrupted run leaves an accurate
+        // journal for resumption/reconciliation.
+        self.local_db.set_remote_rebuild_journal(&journal).await?;
 
-        for remote_path in remote_deletes {
-            self.couchdb.delete_file(&remote_path).await?;
+        for remote_path in &remote_deletes {
+            self.couchdb.delete_file(remote_path).await?;
+            journal.deletes_done += 1;
             report.deleted_remote += 1;
         }
+        self.local_db.set_remote_rebuild_journal(&journal).await?;
+
+        // Publication is complete: the remote mirror now matches local
+        // authority. Only now is it safe to reset tracked state and clear the
+        // journal so a normal sync resumes normally. The reset is delayed so a
+        // failed rebuild never leaves local state cleared while the remote
+        // scope is only partially published (a recoverable baseline must
+        // survive a failed rebuild).
+        self.local_db.reset_sync_state().await?;
+        self.local_db.clear_remote_rebuild_journal().await?;
 
         info!(
             "========== REMOTE REBUILD COMPLETE: {} uploaded, {} remote deletes ==========",
@@ -1295,12 +1443,35 @@ impl SyncEngine {
 
     /// Rebuild the local filesystem so it exactly matches the remote scope.
     ///
+    /// The rebuild is staged so a failure is never destructive:
+    ///
+    /// 1. **Stage** — every remote file is fetched, content-verified, and
+    ///    written to a sibling staging area outside the live tree, without
+    ///    touching the live files or the sync baseline. A fetch/validation
+    ///    failure here cleans up the staging files and aborts, leaving the
+    ///    prior local tree and baseline exactly intact.
+    /// 2. **Commit** — the install/delete plan is persisted to a journal, then
+    ///    the verified staged content is installed, obsolete local files are
+    ///    removed, and the sync baseline is reset + repopulated in a single
+    ///    `SQLite` transaction. Obsolete files are removed only after their
+    ///    replacement data is verified. An interruption mid-commit is resumable
+    ///    from the journal on the next run.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the local scan, remote fetch, or any download/delete
-    /// fails.
+    /// Returns an error if the local scan, remote fetch, any download/delete,
+    /// or the staged commit fails.
     pub async fn rebuild_local_from_remote(&mut self) -> Result<SyncReport> {
         info!("========== LOCAL REBUILD STARTING ==========");
+
+        // A prior commit may have been interrupted (process crash / cancellation)
+        // after the journal was written. Resume it first: the journal records
+        // already-verified staged content and the pending deletes, so completing
+        // it restores a consistent tree + baseline without re-downloading.
+        if let Some(report) = self.resume_local_rebuild_commit().await? {
+            info!("Resumed an interrupted local rebuild commit");
+            return Ok(report);
+        }
 
         let outcome = self.scanner.full_scan().await?;
         // A rebuild that deletes local files must not run on an incomplete
@@ -1317,29 +1488,80 @@ impl SyncEngine {
         let (local_deletes, remote_downloads) =
             triage::plan_local_rebuild(&local_states, &remote_docs);
 
-        self.local_db.reset_sync_state().await?;
-
         let mut report = SyncReport::default();
 
-        for local_path in local_deletes {
-            // Defensive guard: never delete an ignored/internal local path
-            // during a local rebuild.
-            if self.incoming_path_is_ignored(&local_path) {
-                debug!(
-                    "Skipping ignored local path during rebuild delete: {}",
-                    local_path
-                );
-                continue;
-            }
-            let file_path = self.root_dir.join_contained(&local_path)?;
-            if file_path.exists() {
-                tokio::fs::remove_file(&file_path).await?;
-                report.deleted_local += 1;
-            }
-        }
+        // Stage & verify every remote download before mutating anything.
+        let staged = self.stage_local_rebuild(&remote_downloads).await?;
 
+        // Commit the verified, staged content with a resumable journal.
+        self.commit_local_rebuild(staged, &local_deletes, &mut report)
+            .await?;
+
+        info!(
+            "========== LOCAL REBUILD COMPLETE: {} deleted locally, {} downloaded ==========",
+            report.deleted_local, report.downloaded
+        );
+
+        Ok(report)
+    }
+
+    /// Enforce the configured download size limit against remote metadata
+    /// before any content is fetched/allocated, and again against the actually
+    /// transferred length so growth during transfer can never bypass the bound
+    /// (see [`ApplyWorker::bound_download_size`]).
+    fn bound_download_size(&self, remote_path: &str, size: u64) -> Result<()> {
+        if let Some(limit) = self.max_file_size
+            && size > limit
+        {
+            anyhow::bail!(
+                "refusing to download {remote_path}: {size} bytes exceeds configured max_file_size {limit}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Absolute path to the internal state directory (`.couchdb-file-sync`,
+    /// falling back to the legacy `.couchfs`), which is unconditionally ignored
+    /// by the scanner. It is a safe home for rebuild journals and staging
+    /// because it is on the same filesystem as the sync root but never part of
+    /// the synced content.
+    fn state_dir(&self) -> PathBuf {
+        let new_dir = self.root_dir.as_path().join(".couchdb-file-sync");
+        if new_dir.exists() {
+            return new_dir;
+        }
+        let old_dir = self.root_dir.as_path().join(".couchfs");
+        if old_dir.exists() {
+            return old_dir;
+        }
+        new_dir
+    }
+
+    /// Path to the directory that holds verified-but-uninstalled rebuild
+    /// downloads. It lives under the (unconditionally ignored) state dir, so a
+    /// half-finished rebuild never leaks a staged file into the synced tree.
+    fn rebuild_stage_dir(&self) -> PathBuf {
+        self.state_dir().join("rebuild-stage")
+    }
+
+    /// Path to the local-rebuild commit journal.
+    fn rebuild_journal_path(&self) -> PathBuf {
+        self.state_dir().join("rebuild-local.journal")
+    }
+
+    /// Stage and verify every remote download for a local rebuild, without
+    /// mutating the live tree or the sync baseline.
+    ///
+    /// On any fetch/validation failure, all staging files already written are
+    /// removed and the error is propagated, so the prior local tree and
+    /// baseline survive untouched.
+    async fn stage_local_rebuild(
+        &self,
+        remote_downloads: &[String],
+    ) -> Result<Vec<StagedDownload>> {
+        let mut staged = Vec::new();
         for remote_path in remote_downloads {
-            let local_path = self.couchdb.get_local_path(&remote_path);
+            let local_path = self.couchdb.get_local_path(remote_path);
             // Defensive guard: never download an ignored/internal remote path
             // during a local rebuild.
             if self.incoming_path_is_ignored(&local_path) {
@@ -1349,21 +1571,278 @@ impl SyncEngine {
                 );
                 continue;
             }
-            if self
-                .download_remote_file(&remote_path, &local_path, true, false)
+            match self.stage_remote_download(remote_path, &local_path).await {
+                Ok(Some(entry)) => staged.push(entry),
+                Ok(None) => {}
+                Err(e) => {
+                    for entry in &staged {
+                        let _ = tokio::fs::remove_file(&entry.staging).await;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(staged)
+    }
+
+    /// Fetch a single remote file, verify its content, and write it to the
+    /// staging area. Returns `Ok(None)` when the file must be preserved as-is
+    /// (a nonempty untracked local directory occupies its destination).
+    async fn stage_remote_download(
+        &self,
+        remote_path: &str,
+        local_path: &str,
+    ) -> Result<Option<StagedDownload>> {
+        let Some(doc) = self.couchdb.fetch_metadata(remote_path).await? else {
+            anyhow::bail!("Document not found in CouchDB: {remote_path}");
+        };
+        // A soft-deleted tombstone is not downloadable content and must never be
+        // materialized locally.
+        if doc.deleted {
+            anyhow::bail!("Document deleted in CouchDB: {remote_path}");
+        }
+
+        self.bound_download_size(remote_path, doc.size)?;
+
+        let file_path = self.root_dir.join_contained(local_path)?;
+        // Filesystem type transition: an incoming remote file arriving where a
+        // directory currently exists. Preserve a nonempty directory because its
+        // untracked local content must never be destroyed by a rebuild (mirrors
+        // `download_remote_file`). An empty directory is safely replaced at
+        // commit time.
+        if file_path.is_dir() {
+            let empty = tokio::fs::read_dir(&file_path)
                 .await?
-                .is_some()
-            {
-                report.downloaded.0 += 1;
+                .next_entry()
+                .await?
+                .is_none();
+            if !empty {
+                debug!(
+                    "Preserving nonempty local directory {:?} for incoming remote file {} (untracked content must not be removed)",
+                    file_path, remote_path
+                );
+                return Ok(None);
             }
         }
 
-        info!(
-            "========== LOCAL REBUILD COMPLETE: {} deleted locally, {} downloaded ==========",
-            report.deleted_local, report.downloaded
-        );
+        let content = match self.couchdb.get_file_content_for_doc(&doc).await {
+            Ok(data) => data,
+            Err(e) => {
+                anyhow::bail!("failed to fetch content for {remote_path}: {e}");
+            }
+        };
+        let len = u64::try_from(content.len()).unwrap_or(u64::MAX);
+        self.bound_download_size(remote_path, len)?;
 
-        Ok(report)
+        let hash = compute_bytes_hash(&content);
+        if !doc.hash.is_empty() && doc.hash != hash {
+            anyhow::bail!(
+                "content hash mismatch for {remote_path}: remote stored {}, downloaded {}; refusing to stage partial/corrupt file",
+                doc.hash,
+                hash
+            );
+        }
+
+        // Write the verified bytes into the staging area (outside the live
+        // tree), so a failed rebuild leaves no partial content in the synced
+        // directories. `sync_all` makes the staged bytes durable before the
+        // journal is written.
+        let staging = self.rebuild_stage_dir().join(local_path);
+        if let Some(parent) = staging.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        {
+            let mut f = tokio::fs::File::create(&staging).await?;
+            f.write_all(&content).await?;
+            f.flush().await?;
+            f.sync_all().await?;
+        }
+
+        Ok(Some(StagedDownload {
+            local_path: local_path.to_string(),
+            staging,
+            hash,
+            size: content.len() as u64,
+            couch_rev: doc.rev.as_deref().and_then(CouchRev::new),
+        }))
+    }
+
+    /// Commit a staged local rebuild: journal the plan, install the verified
+    /// staged content, remove obsolete files, and reset + repopulate the sync
+    /// baseline transactionally at the verified transition.
+    async fn commit_local_rebuild(
+        &self,
+        staged: Vec<StagedDownload>,
+        local_deletes: &[String],
+        report: &mut SyncReport,
+    ) -> Result<()> {
+        let journal = RebuildJournal {
+            staged: staged.iter().map(JournalStaged::from).collect(),
+            deletes: local_deletes.to_vec(),
+        };
+        self.write_rebuild_journal(&journal).await?;
+
+        // Install the verified staged content into the live tree. Idempotent so
+        // a resumed journal re-run is safe.
+        let mut installed_states = Vec::new();
+        for entry in &journal.staged {
+            self.install_staged(entry).await?;
+            installed_states.push(self.staged_file_state(entry).await?);
+            report.downloaded.0 += 1;
+        }
+
+        // Remove obsolete local files only after their replacement data has
+        // been verified and staged.
+        for local_path in &journal.deletes {
+            // Never delete a path we just installed (defensive; the rebuild
+            // plan keeps deletes and downloads disjoint).
+            if journal.staged.iter().any(|s| &s.local_path == local_path) {
+                continue;
+            }
+            // Defensive guard: never delete an ignored/internal local path
+            // during a local rebuild.
+            if self.incoming_path_is_ignored(local_path) {
+                debug!(
+                    "Skipping ignored local path during rebuild delete: {}",
+                    local_path
+                );
+                continue;
+            }
+            let file_path = self.root_dir.join_contained(local_path)?;
+            if file_path.exists() {
+                tokio::fs::remove_file(&file_path).await?;
+                report.deleted_local += 1;
+            }
+        }
+
+        // Reset the sync baseline and install the new one atomically at the
+        // verified transition.
+        self.local_db.commit_rebuild_state(installed_states).await?;
+
+        // The commit is complete: drop the journal and staging residue.
+        self.remove_rebuild_artifacts().await?;
+        Ok(())
+    }
+
+    /// Install one staged download into the live tree (creating parents and
+    /// replacing an empty directory in the way). Idempotent: if the staging
+    /// file was already moved, a target that exists means it is already
+    /// installed.
+    async fn install_staged(&self, entry: &JournalStaged) -> Result<()> {
+        let file_path = self.root_dir.join_contained(&entry.local_path)?;
+        // Empty directory in the way (remote directory replaced by a file).
+        if file_path.is_dir() {
+            let empty = tokio::fs::read_dir(&file_path)
+                .await?
+                .next_entry()
+                .await?
+                .is_none();
+            if empty {
+                debug!(
+                    "[REBUILD] Replacing empty local directory {:?} with remote file {}",
+                    file_path, entry.local_path
+                );
+                tokio::fs::remove_dir(&file_path).await?;
+            }
+        }
+        if let Some(parent) = file_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        if tokio::fs::try_exists(&entry.staging).await? {
+            tokio::fs::rename(&entry.staging, &file_path).await?;
+        } else if !file_path.exists() {
+            anyhow::bail!(
+                "staged content for {} is missing (staging {} vanished); cannot complete rebuild install",
+                entry.local_path,
+                entry.staging.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Persist the local-rebuild commit plan so an interruption can be resumed.
+    async fn write_rebuild_journal(&self, journal: &RebuildJournal) -> Result<()> {
+        let path = self.rebuild_journal_path();
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let bytes = serde_json::to_vec_pretty(journal)?;
+        tokio::fs::write(&path, bytes).await?;
+        Ok(())
+    }
+
+    /// Resume an interrupted local-rebuild commit if a journal is present.
+    /// Returns `Ok(None)` when there is nothing to resume.
+    async fn resume_local_rebuild_commit(&self) -> Result<Option<SyncReport>> {
+        let path = self.rebuild_journal_path();
+        if !tokio::fs::try_exists(&path).await? {
+            return Ok(None);
+        }
+        let bytes = tokio::fs::read(&path).await?;
+        let journal: RebuildJournal = serde_json::from_slice(&bytes)?;
+
+        let mut report = SyncReport::default();
+        // Re-run the idempotent commit steps: install any not-yet-installed
+        // staged content, remove obsolete files, and reset + repopulate the
+        // baseline transactionally.
+        for entry in &journal.staged {
+            self.install_staged(entry).await?;
+            report.downloaded.0 += 1;
+        }
+        for local_path in &journal.deletes {
+            if journal.staged.iter().any(|s| &s.local_path == local_path) {
+                continue;
+            }
+            if self.incoming_path_is_ignored(local_path) {
+                debug!(
+                    "Skipping ignored local path during rebuild delete: {}",
+                    local_path
+                );
+                continue;
+            }
+            let file_path = self.root_dir.join_contained(local_path)?;
+            if file_path.exists() {
+                tokio::fs::remove_file(&file_path).await?;
+                report.deleted_local += 1;
+            }
+        }
+        let mut installed_states = Vec::new();
+        for entry in &journal.staged {
+            installed_states.push(self.staged_file_state(entry).await?);
+        }
+        self.local_db.commit_rebuild_state(installed_states).await?;
+        self.remove_rebuild_artifacts().await?;
+        Ok(Some(report))
+    }
+
+    /// Build the [`FileState`] to record for a staged entry after it has been
+    /// installed, using the verified content hash/rev from the journal and the
+    /// on-disk metadata of the installed file.
+    async fn staged_file_state(&self, entry: &JournalStaged) -> Result<FileState> {
+        let file_path = self.root_dir.join_contained(&entry.local_path)?;
+        let metadata = tokio::fs::metadata(&file_path).await?;
+        Ok(FileState {
+            path: entry.local_path.clone(),
+            hash: entry.hash.clone(),
+            size: metadata.len(),
+            modified_at: metadata.modified()?.into(),
+            couch_rev: entry.couch_rev.as_deref().and_then(CouchRev::new),
+            last_sync_at: Utc::now(),
+        })
+    }
+
+    /// Remove the commit journal and any remaining staging residue after a
+    /// completed (or successfully resumed) commit.
+    async fn remove_rebuild_artifacts(&self) -> Result<()> {
+        let journal = self.rebuild_journal_path();
+        if tokio::fs::try_exists(&journal).await? {
+            tokio::fs::remove_file(&journal).await?;
+        }
+        let stage_dir = self.rebuild_stage_dir();
+        if tokio::fs::try_exists(&stage_dir).await? {
+            tokio::fs::remove_dir_all(&stage_dir).await?;
+        }
+        Ok(())
     }
 
     /// One-time, versioned, conservative migration that repairs historical
@@ -2897,6 +3376,291 @@ mod tests {
         assert_eq!(state.path, "data.bin");
     }
 
+    // ── Authoritative local rebuild (staged + journaled) ──────────────────
+
+    /// Build a remote `FileDoc` for `prefix/` scope with the given content and
+    /// the content's own hash (so content verification passes).
+    fn remote_doc(remote_path: &str, content: &[u8]) -> FileDoc {
+        let mut doc = FileDoc::new(
+            remote_path.to_string(),
+            compute_bytes_hash(content),
+            content.len() as u64,
+        );
+        doc.rev = Some("1-abc".to_string());
+        doc.mtime = TimestampMillis::now();
+        doc.path = remote_path.to_string();
+        doc
+    }
+
+    #[tokio::test]
+    async fn rebuild_local_fetch_failure_preserves_tree_and_baseline() {
+        // A fetch/validation failure during the stage phase must leave the
+        // prior local tree and the sync baseline exactly intact.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        // Obsolete local file that a full mirror would delete.
+        std::fs::create_dir_all(root.as_path().join("sub")).unwrap();
+        std::fs::write(root.as_path().join("sub/old.txt"), b"precious local").unwrap();
+
+        let local = test_local_db();
+        seed_file_state(&local, "sub/old.txt", "localhash", 14);
+        local.save_checkpoint("99-before").expect("checkpoint");
+        let conflict = Conflict::new(
+            "sub/old.txt".to_string(),
+            FileState::new("sub/old.txt".to_string(), "lh".to_string(), 14, Utc::now()),
+            RemoteState {
+                hash: "rh".to_string(),
+                size: 1,
+                modified_at: Utc::now(),
+                couch_rev: CouchRev::default(),
+                deleted: false,
+            },
+        );
+        local.store_conflict(&conflict).expect("conflict");
+
+        let remote = remote_doc("prefix/new.txt", b"replacement remote");
+        let canned = CannedCouch {
+            all_files: vec![remote.clone()],
+            metadata: std::collections::HashMap::from([("prefix/new.txt".to_string(), remote)]),
+            contents: std::collections::HashMap::from([(
+                "prefix/new.txt".to_string(),
+                b"replacement remote".to_vec(),
+            )]),
+            content_errors: std::collections::HashSet::from(["prefix/new.txt".to_string()]),
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let result = engine.rebuild_local_from_remote().await;
+        assert!(result.is_err(), "fetch failure must fail the rebuild");
+
+        // Prior local tree preserved, including the obsolete file.
+        assert_eq!(
+            std::fs::read_to_string(root.as_path().join("sub/old.txt")).unwrap(),
+            "precious local"
+        );
+        // Baseline preserved: file state, conflict and checkpoint all survive.
+        assert_eq!(
+            engine
+                .get_file_state("sub/old.txt")
+                .await
+                .unwrap()
+                .map(|s| s.path),
+            Some("sub/old.txt".to_string())
+        );
+        assert_eq!(engine.get_conflicts().await.unwrap().len(), 1);
+        assert!(engine.get_checkpoint().await.unwrap().is_some());
+        // No staging residue leaked into the live tree.
+        assert!(!root.as_path().join("new.txt").exists());
+        // No journal left behind.
+        assert!(
+            !root
+                .as_path()
+                .join(".couchdb-file-sync")
+                .join("rebuild-local.journal")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_local_success_deletes_obsolete_only_after_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(root.as_path().join("old.txt"), b"obsolete local").unwrap();
+
+        let local = test_local_db();
+        seed_file_state(&local, "old.txt", "oldhash", 14);
+
+        let remote = remote_doc("prefix/new.txt", b"replacement remote");
+        let canned = CannedCouch {
+            all_files: vec![remote.clone()],
+            metadata: std::collections::HashMap::from([("prefix/new.txt".to_string(), remote)]),
+            contents: std::collections::HashMap::from([(
+                "prefix/new.txt".to_string(),
+                b"replacement remote".to_vec(),
+            )]),
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let report = engine
+            .rebuild_local_from_remote()
+            .await
+            .expect("rebuild succeeds");
+        assert_eq!(report.deleted_local, 1);
+        assert_eq!(report.downloaded.0, 1);
+
+        // Obsolete file removed, replacement installed with verified content.
+        assert!(!root.as_path().join("old.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.as_path().join("new.txt")).unwrap(),
+            "replacement remote"
+        );
+        // Baseline replaced: new state present, old gone.
+        let new_state = engine.get_file_state("new.txt").await.unwrap().unwrap();
+        assert_eq!(new_state.hash, compute_bytes_hash(b"replacement remote"));
+        assert!(engine.get_file_state("old.txt").await.unwrap().is_none());
+        // Journal cleaned up after a successful commit.
+        assert!(
+            !root
+                .as_path()
+                .join(".couchdb-file-sync")
+                .join("rebuild-local.journal")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_local_content_hash_mismatch_preserves_tree() {
+        // A remote doc whose stored hash does not match the downloaded bytes
+        // must abort staging and leave the prior tree intact.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(root.as_path().join("old.txt"), b"keep me").unwrap();
+        let local = test_local_db();
+        seed_file_state(&local, "old.txt", "localhash", 7);
+
+        // Doc stores a wrong hash so verification fails.
+        let mut remote = remote_doc("prefix/new.txt", b"the real content");
+        remote.hash = "not-the-hash".to_string();
+        let canned = CannedCouch {
+            all_files: vec![remote.clone()],
+            metadata: std::collections::HashMap::from([("prefix/new.txt".to_string(), remote)]),
+            contents: std::collections::HashMap::from([(
+                "prefix/new.txt".to_string(),
+                b"the real content".to_vec(),
+            )]),
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let result = engine.rebuild_local_from_remote().await;
+        assert!(result.is_err(), "hash mismatch must fail the rebuild");
+        // Nothing mutated: the obsolete file is still present, and the
+        // replacement was never installed.
+        assert_eq!(
+            std::fs::read_to_string(root.as_path().join("old.txt")).unwrap(),
+            "keep me"
+        );
+        assert!(!root.as_path().join("new.txt").exists());
+        assert_eq!(
+            engine
+                .get_file_state("old.txt")
+                .await
+                .unwrap()
+                .unwrap()
+                .path,
+            "old.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_local_resumes_interrupted_commit_from_journal() {
+        // Simulate a crash mid-commit: a journal + verified staged file already
+        // exist, and the live tree still holds the obsolete file. The next
+        // rebuild must resume the commit (no re-download) and finish it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(root.as_path().join("old.txt"), b"obsolete local").unwrap();
+
+        let local = test_local_db();
+        seed_file_state(&local, "old.txt", "oldhash", 14);
+
+        // Create the state dir and write a journal + staged content exactly as
+        // a crashed commit would have left them.
+        let state_path = root.as_path().join(".couchdb-file-sync");
+        std::fs::create_dir_all(&state_path).unwrap();
+        let rebuild_stage = state_path.join("rebuild-stage");
+        std::fs::create_dir_all(&rebuild_stage).unwrap();
+        std::fs::write(rebuild_stage.join("new.txt"), b"replacement remote").unwrap();
+        let journal = serde_json::json!({
+            "staged": [{
+                "local_path": "new.txt",
+                "staging": rebuild_stage.join("new.txt"),
+                "hash": compute_bytes_hash(b"replacement remote"),
+                "size": 17,
+                "couch_rev": "1-abc"
+            }],
+            "deletes": ["old.txt"]
+        });
+        std::fs::write(
+            state_path.join("rebuild-local.journal"),
+            serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", CannedCouch::default()),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let report = engine
+            .rebuild_local_from_remote()
+            .await
+            .expect("resumed rebuild succeeds");
+        assert_eq!(report.downloaded.0, 1, "resume installs the staged content");
+        assert_eq!(report.deleted_local, 1, "resume removes obsolete files");
+
+        assert_eq!(
+            std::fs::read_to_string(root.as_path().join("new.txt")).unwrap(),
+            "replacement remote"
+        );
+        assert!(!root.as_path().join("old.txt").exists());
+        // Baseline repopulated and the journal is gone.
+        assert!(engine.get_file_state("new.txt").await.unwrap().is_some());
+        assert!(!state_path.join("rebuild-local.journal").exists());
+    }
+
+    #[tokio::test]
+    async fn rebuild_remote_failure_preserves_local_baseline() {
+        // A failed remote rebuild (upload error) must not clear the local sync
+        // baseline: it is only reset after publication fully succeeds.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(root.as_path().join("up.txt"), b"local content").unwrap();
+        let local = test_local_db();
+        seed_file_state(&local, "up.txt", "localhash", 13);
+        local.save_checkpoint("50-before").expect("checkpoint");
+
+        let canned = CannedCouch {
+            all_files: Vec::new(),
+            save_errors: std::collections::HashSet::from(["prefix/up.txt".to_string()]),
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let result = engine.rebuild_remote_from_local().await;
+        assert!(
+            result.is_err(),
+            "upload failure must fail the remote rebuild"
+        );
+        // Baseline preserved despite the failure.
+        assert!(engine.get_file_state("up.txt").await.unwrap().is_some());
+        assert!(engine.get_checkpoint().await.unwrap().is_some());
+    }
+
     // ── Dry-run sync cycle ─────────────────────────────────────────────
 
     fn test_canned_couch(remote_path: &str, canned: CannedCouch) -> CouchDb {
@@ -3141,6 +3905,144 @@ mod tests {
             engine.couchdb.test_write_calls(),
             0,
             "dry run must not write to CouchDB"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_counts_only_successful_uploads_in_a_mixed_cycle() {
+        // A one-shot sync with one upload that succeeds and one that fails must
+        // report the successful count only, surface the per-path error, and
+        // leave the failed file retryable (no saved state, no checkpoint advance).
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        // Two new local files: ok.txt uploads, fail.txt fails at save.
+        std::fs::write(root.as_path().join("ok.txt"), "ok content").unwrap();
+        std::fs::write(root.as_path().join("fail.txt"), "fail content").unwrap();
+
+        let canned = CannedCouch {
+            changes: Vec::new(),
+            last_seq: "500-after".to_string(),
+            save_errors: std::collections::HashSet::from(["prefix/fail.txt".to_string()]),
+            ..CannedCouch::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let report = engine.sync().await.expect("mixed upload sync");
+
+        assert_eq!(
+            report.uploaded.0, 1,
+            "only the successful upload counts, not the failed one"
+        );
+        assert_eq!(report.errors.len(), 1, "the failed upload is surfaced");
+        assert!(
+            report.errors.iter().any(|e| e.contains("fail.txt")),
+            "error must name the failed path: {:?}",
+            report.errors
+        );
+        assert_eq!(
+            report.deleted_remote, 0,
+            "no remote deletion planned in this cycle"
+        );
+
+        // The successful upload is recorded; the failed one is left unrecorded
+        // so the next cycle retries it (no checkpoint advance past a failure).
+        assert!(
+            engine.get_file_state("ok.txt").await.unwrap().is_some(),
+            "successful upload must be recorded"
+        );
+        assert!(
+            engine.get_file_state("fail.txt").await.unwrap().is_none(),
+            "failed upload must not be recorded (retryable next cycle)"
+        );
+        assert!(
+            engine.get_checkpoint().await.unwrap().is_none(),
+            "checkpoint must not advance when any apply failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_counts_only_successful_downloads_in_a_mixed_cycle() {
+        // A one-shot sync with one download that succeeds and one that fails
+        // must report the successful count only, surface the per-path error,
+        // and leave the failed file absent (retryable next cycle).
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+
+        let remote_prefix = "prefix/";
+        let ok_path = format!("{remote_prefix}ok.txt");
+        let fail_path = format!("{remote_prefix}fail.txt");
+        let mut metadata = std::collections::HashMap::new();
+        let mut contents = std::collections::HashMap::new();
+        for (i, p) in [&ok_path, &fail_path].into_iter().enumerate() {
+            let mut doc = FileDoc::new(p.clone(), String::new(), 3);
+            doc.rev = Some(format!("1-{i}"));
+            doc.path = p.clone();
+            metadata.insert(p.clone(), doc);
+        }
+        contents.insert(ok_path.clone(), b"ok!".to_vec());
+
+        let canned = CannedCouch {
+            changes: vec![
+                Change::remote_created(
+                    ok_path.clone(),
+                    "okhash".to_string(),
+                    3,
+                    Utc::now(),
+                    "1-0".to_string(),
+                ),
+                Change::remote_created(
+                    fail_path.clone(),
+                    "failhash".to_string(),
+                    3,
+                    Utc::now(),
+                    "1-1".to_string(),
+                ),
+            ],
+            last_seq: "500-after".to_string(),
+            metadata,
+            contents,
+            content_errors: std::collections::HashSet::from([fail_path.clone()]),
+            ..CannedCouch::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch(remote_prefix, canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let report = engine.sync().await.expect("mixed download sync");
+
+        assert_eq!(
+            report.downloaded.0, 1,
+            "only the successful download counts, not the failed one"
+        );
+        assert_eq!(report.errors.len(), 1, "the failed download is surfaced");
+        assert!(
+            report.errors.iter().any(|e| e.contains("fail.txt")),
+            "error must name the failed path: {:?}",
+            report.errors
+        );
+
+        // The successful download is written; the failed one is left absent so
+        // the next cycle retries it (no checkpoint advance past a failure).
+        assert_eq!(
+            std::fs::read(root.as_path().join("ok.txt")).unwrap(),
+            b"ok!",
+            "successful download must be written"
+        );
+        assert!(
+            !root.as_path().join("fail.txt").exists(),
+            "failed download must not be written"
+        );
+        assert!(
+            engine.get_checkpoint().await.unwrap().is_none(),
+            "checkpoint must not advance when any apply failed"
         );
     }
 
@@ -3811,7 +4713,7 @@ mod tests {
             IgnoreMatcher::empty(),
         );
         let report = engine.sync().await.expect("sync with collection disabled");
-        assert!(report.errors.is_empty());
+        assert_eq!(report.errors, [] as [String; 0]);
         assert_eq!(
             engine.couchdb.test_write_calls(),
             0,
@@ -3828,7 +4730,7 @@ mod tests {
         )
         .with_orphan_chunk_collection(Some(std::time::Duration::from_mins(5)), 100);
         let report = engine.sync().await.expect("sync with collection enabled");
-        assert!(report.errors.is_empty());
+        assert_eq!(report.errors, [] as [String; 0]);
         assert_eq!(
             engine.couchdb.test_write_calls(),
             1,
@@ -5944,8 +6846,8 @@ mod tests {
             .await
             .expect("batch upload must not abort the sync");
 
-        // Every file is accounted for and every failure is collected.
-        assert_eq!(report.uploaded.0, N, "all uploads accounted for");
+        // Every failure is collected and only the successful uploads count.
+        assert_eq!(report.uploaded.0, N - 2, "only successful uploads counted");
         assert_eq!(report.deleted_remote, 0);
         assert_eq!(
             report.errors.len(),
@@ -6019,7 +6921,11 @@ mod tests {
             .await
             .expect("batch download must not abort the sync");
 
-        assert_eq!(report.downloaded.0, N, "all downloads accounted for");
+        assert_eq!(
+            report.downloaded.0,
+            N - 2,
+            "only successful downloads counted"
+        );
         assert_eq!(report.deleted_local, 0);
         assert_eq!(
             report.errors.len(),
@@ -6083,7 +6989,7 @@ mod tests {
             .await
             .expect("batch upload must not abort the sync");
 
-        assert_eq!(report.uploaded.0, N, "all uploads accounted for");
+        assert_eq!(report.uploaded.0, N - 2, "only successful uploads counted");
         assert_eq!(
             report.errors.len(),
             2,
@@ -6145,8 +7051,9 @@ mod tests {
         .expect("batch upload must not abort the sync");
 
         assert_eq!(
-            report.uploaded.0, N,
-            "all uploads accounted for across waves"
+            report.uploaded.0,
+            N - 3,
+            "only successful uploads counted across waves"
         );
         assert_eq!(
             report.errors.len(),
@@ -7370,6 +8277,258 @@ mod tests {
         assert!(
             !root.as_path().join(".sync-ignore").exists(),
             ".sync-ignore must stay protected under negation"
+        );
+    }
+
+    fn is_effective_root() -> bool {
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+    }
+
+    // ── Recoverable remote rebuild baseline (#6370) ────────────────────────
+
+    #[tokio::test]
+    async fn rebuild_upload_failure_retains_baseline_and_refuses_sync_until_resumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(root.as_path().join("up.txt"), b"local content").unwrap();
+
+        // The FIRST save of the planned upload fails transiently.
+        let canned = CannedCouch {
+            save_errors_once: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::from(["prefix/up.txt".to_string()]),
+            )),
+            ..CannedCouch::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+        // Baseline: prior tracked state that a rebuild would normally clear.
+        engine
+            .local_db
+            .save_file_state(&FileState::new(
+                "up.txt".to_string(),
+                "deadbeef".to_string(),
+                3,
+                Utc::now() - Duration::days(1),
+            ))
+            .await
+            .unwrap();
+
+        // The first publication attempt fails after the plan is journaled but
+        // before the baseline is cleared.
+        let err = engine
+            .rebuild_remote_from_local()
+            .await
+            .expect_err("transient upload failure must abort the rebuild");
+        assert!(
+            err.to_string().contains("simulated transient save failure"),
+            "unexpected error: {err}"
+        );
+
+        // The baseline is retained: prior tracked state survives a failed
+        // rebuild instead of being cleared up front.
+        assert!(
+            engine.get_file_state("up.txt").await.unwrap().is_some(),
+            "a failed rebuild must retain the previous baseline, not clear it"
+        );
+
+        // The declared plan is journaled with progress so a restart can resume.
+        let journal = engine
+            .local_db
+            .get_remote_rebuild_journal()
+            .await
+            .unwrap()
+            .expect("a failed rebuild must leave a journal");
+        assert_eq!(journal.uploads, vec!["up.txt".to_string()]);
+        assert_eq!(
+            journal.uploads_done, 0,
+            "first upload failed before any progress"
+        );
+
+        // A normal sync is refused rather than misclassifying surviving remote
+        // data as ordinary new edits or conflicts.
+        let sync_err = engine
+            .sync()
+            .await
+            .expect_err("normal sync must be refused while a rebuild is pending");
+        assert!(
+            sync_err
+                .to_string()
+                .contains("remote rebuild is incomplete"),
+            "unexpected sync error: {sync_err}"
+        );
+
+        // Re-running the rebuild resumes/reconciles: the transient failure is
+        // consumed, publication completes, the journal is cleared, and state is
+        // reset so a normal sync resumes normally.
+        let retry = engine
+            .rebuild_remote_from_local()
+            .await
+            .expect("retry must complete the rebuild");
+        assert_eq!(retry.uploaded.0, 1);
+        assert_eq!(
+            engine.local_db.get_remote_rebuild_journal().await.unwrap(),
+            None,
+            "a completed rebuild must clear the journal"
+        );
+        assert!(
+            engine.get_file_state("up.txt").await.unwrap().is_none(),
+            "a completed rebuild must reset tracked state"
+        );
+        engine
+            .sync()
+            .await
+            .expect("normal sync resumes after rebuild");
+    }
+
+    #[tokio::test]
+    async fn rebuild_delete_failure_retains_baseline_and_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(root.as_path().join("keep.txt"), b"keep").unwrap();
+
+        // A remote orphan would be deleted by the rebuild; its delete fails once.
+        let canned = CannedCouch {
+            all_files: vec![remote_doc_at("prefix/old.txt", "1-abc", Vec::new())],
+            delete_errors_once: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::from(["prefix/old.txt".to_string()]),
+            )),
+            ..CannedCouch::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+        // Baseline: prior tracked state that a rebuild would normally clear.
+        engine
+            .local_db
+            .save_file_state(&FileState::new(
+                "keep.txt".to_string(),
+                "cafe".to_string(),
+                4,
+                Utc::now() - Duration::days(1),
+            ))
+            .await
+            .unwrap();
+
+        let err = engine
+            .rebuild_remote_from_local()
+            .await
+            .expect_err("transient delete failure must abort the rebuild");
+        assert!(
+            err.to_string()
+                .contains("simulated transient delete failure"),
+            "unexpected error: {err}"
+        );
+
+        // The upload completed before the failed delete; the baseline is kept.
+        let journal = engine
+            .local_db
+            .get_remote_rebuild_journal()
+            .await
+            .unwrap()
+            .expect("delete failure must leave a journal");
+        assert_eq!(
+            journal.uploads_done, 1,
+            "upload completed before the failed delete"
+        );
+        assert_eq!(journal.deletes_done, 0, "delete failed before progress");
+        assert_eq!(journal.deletes, vec!["prefix/old.txt".to_string()]);
+        assert!(
+            engine.get_file_state("keep.txt").await.unwrap().is_some(),
+            "a failed rebuild must retain the previous baseline"
+        );
+
+        // Retry completes: the delete succeeds now, the journal is cleared, and
+        // state is reset so a normal sync resumes normally.
+        let retry = engine
+            .rebuild_remote_from_local()
+            .await
+            .expect("retry must complete the rebuild");
+        assert_eq!(retry.uploaded.0, 1);
+        assert_eq!(retry.deleted_remote, 1);
+        assert_eq!(
+            engine.local_db.get_remote_rebuild_journal().await.unwrap(),
+            None
+        );
+        assert!(
+            engine.get_file_state("keep.txt").await.unwrap().is_none(),
+            "a completed rebuild must reset tracked state"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_incomplete_scan_aborts_without_journal_or_remote_deletion() {
+        if is_effective_root() {
+            return; // root bypasses permission checks; the test is void.
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("visible.txt"), b"keep").unwrap();
+        let locked_dir = dir.path().join("locked");
+        std::fs::create_dir_all(&locked_dir).unwrap();
+        std::fs::write(locked_dir.join("hidden.txt"), b"secret").unwrap();
+        let mut perms = std::fs::metadata(&locked_dir).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
+        std::fs::set_permissions(&locked_dir, perms).unwrap();
+
+        let root = SyncDirPath::new(dir.path()).unwrap();
+
+        // A remote orphan that WOULD be deleted if the rebuild ran.
+        let canned = CannedCouch {
+            all_files: vec![remote_doc_at("prefix/old.txt", "1-abc", Vec::new())],
+            ..CannedCouch::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+        // Baseline: prior tracked state that a rebuild would normally clear.
+        engine
+            .local_db
+            .save_file_state(&FileState::new(
+                "visible.txt".to_string(),
+                "deadbeef".to_string(),
+                4,
+                Utc::now() - Duration::days(1),
+            ))
+            .await
+            .unwrap();
+
+        let err = engine
+            .rebuild_remote_from_local()
+            .await
+            .expect_err("incomplete scan must abort the rebuild");
+        assert!(
+            err.to_string().contains("scan is incomplete"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            engine.local_db.get_remote_rebuild_journal().await.unwrap(),
+            None,
+            "an aborted rebuild must not leave a journal"
+        );
+        assert!(
+            engine
+                .get_file_state("visible.txt")
+                .await
+                .unwrap()
+                .is_some(),
+            "an aborted rebuild must retain the baseline"
+        );
+        assert_eq!(
+            engine.couchdb.test_write_calls(),
+            0,
+            "no remote mutation may happen on an incomplete scan"
         );
     }
 }
