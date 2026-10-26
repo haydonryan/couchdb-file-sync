@@ -270,6 +270,14 @@ pub struct SyncConfig {
     pub poll_interval: u64,
     #[serde(default = "default_debounce_ms")]
     pub debounce_ms: u64,
+    /// How often (seconds) the live sync loop runs a bounded reconciliation
+    /// pass. When a local apply fails or the file watcher drops events
+    /// (overflow), the affected paths are coalesced into a pending set that is
+    /// retried on this cadence so every local edit eventually reaches remote
+    /// without another user edit or daemon restart. `0` disables the periodic
+    /// rescan (dropped events would then rely on a fresh event to converge).
+    #[serde(default = "default_rescan_interval_secs")]
+    pub rescan_interval_secs: u64,
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
     #[serde(default = "default_max_file_size")]
@@ -292,6 +300,7 @@ impl Default for SyncConfig {
             root_dir: None,
             poll_interval: default_poll_interval(),
             debounce_ms: default_debounce_ms(),
+            rescan_interval_secs: default_rescan_interval_secs(),
             batch_size: default_batch_size(),
             max_file_size: default_max_file_size(),
             parallel: default_parallel(),
@@ -382,6 +391,10 @@ const fn default_poll_interval() -> u64 {
 
 const fn default_debounce_ms() -> u64 {
     500
+}
+
+const fn default_rescan_interval_secs() -> u64 {
+    30
 }
 
 const fn default_batch_size() -> usize {

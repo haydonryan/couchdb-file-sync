@@ -178,6 +178,10 @@ paths:
 sync:
   poll_interval: 60
   debounce_ms: 500
+  # Live mode: how often (seconds) a bounded reconciliation rescan retries
+  # local changes that failed to upload or were dropped when the file watcher
+  # overflowed. 0 disables the periodic rescan. Default: 30
+  rescan_interval_secs: 30
   # Soft-delete tombstones older than this many seconds are pruned so
   # get_all_files/get_changes do not grow unbounded. 0 disables pruning.
   tombstone_retention_secs: 604800

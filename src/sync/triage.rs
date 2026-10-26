@@ -57,8 +57,15 @@ pub fn remote_path_to_local_path(remote_path: &str, remote_prefix: &str) -> Stri
     }
 }
 
-/// Check whether a stored state path was polluted by the remote prefix
-/// (e.g., the local DB accidentally stored a remote-prefixed path).
+/// Check whether a stored state path *starts with* the remote prefix.
+///
+/// This is a pure lexical candidate test for historical remote-prefix
+/// pollution (the local DB accidentally storing a full remote path). It is
+/// deliberately NOT a deletion decision: a legitimate local subtree whose name
+/// happens to coincide with the remote prefix (e.g. a local `notes/a.txt`
+/// under a remote `notes/` scope) is lexically identical to a polluted entry,
+/// so the two cannot be told apart by the string alone. Repair must use the
+/// evidence-based [`polluted_state_repairs`] planner, never this predicate.
 #[must_use]
 pub fn is_polluted_state_path(path: &str, remote_prefix: &str) -> bool {
     let remote_prefix = remote_prefix.trim_end_matches('/');
@@ -67,6 +74,50 @@ pub fn is_polluted_state_path(path: &str, remote_prefix: &str) -> bool {
             || path
                 .strip_prefix(remote_prefix)
                 .is_some_and(|r| r.starts_with('/')))
+}
+
+/// Plan which stored state entries are genuinely polluted by the remote
+/// prefix, using explicit filesystem evidence rather than lexical guessing.
+///
+/// A stored path that merely *starts with* the remote prefix is ambiguous: it
+/// may be a legitimate local subtree whose name coincides with the prefix, or a
+/// historical entry where the full remote path was accidentally stored. These
+/// are lexically identical, so a migration must never delete on prefix alone —
+/// that is the destructive bug this replaces. An entry is only repaired when
+/// there is concrete evidence it is a phantom: its on-disk prefixed path does
+/// NOT exist while the prefix-stripped local path DOES exist (the real file
+/// lives at the stripped path). Entries whose prefixed path exists on disk are
+/// valid baselines and are always kept; entries with no evidence either way are
+/// kept too (conservative — never delete a baseline without proof).
+///
+/// `prefixed_exists` / `stripped_exists` report whether a file exists at the
+/// given local path.
+///
+/// Returns the list of stored state paths to remove (the phantom prefixed
+/// entries). The real files at their stripped paths are re-scanned normally.
+#[must_use]
+pub fn polluted_state_repairs(
+    states: &[FileState],
+    remote_prefix: &str,
+    prefixed_exists: impl Fn(&str) -> bool,
+    stripped_exists: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut repairs = Vec::new();
+    for state in states {
+        if !is_polluted_state_path(&state.path, remote_prefix) {
+            continue;
+        }
+        let stripped = remote_path_to_local_path(&state.path, remote_prefix);
+        if stripped == state.path {
+            // A bare entry equal to the prefix has no distinct stripped twin;
+            // never guess about it.
+            continue;
+        }
+        if !prefixed_exists(&state.path) && stripped_exists(&stripped) {
+            repairs.push(state.path.clone());
+        }
+    }
+    repairs
 }
 
 /// Parse the generation number from a `CouchDB` revision (`N-hash`).
@@ -603,6 +654,89 @@ mod tests {
             "Agents/"
         ));
         assert!(!is_polluted_state_path("Agentsmith/profile.md", "Agents/"));
+    }
+
+    #[test]
+    fn repairs_only_entries_with_explicit_filesystem_evidence() {
+        let prefix = "notes/";
+        let states = ["notes/a.txt", "notes/b.txt", "notes/c.txt", "plain.txt"]
+            .into_iter()
+            .map(|p| FileState::new(p.to_string(), "h".to_string(), 1, Utc::now()))
+            .collect::<Vec<_>>();
+
+        // notes/a.txt: prefixed path missing, stripped path present → phantom,
+        // safely repaired.
+        let prefixed = ["notes/b.txt"];
+        let stripped = ["a.txt", "b.txt"];
+        let repairs = polluted_state_repairs(
+            &states,
+            prefix,
+            |p| prefixed.contains(&p),
+            |p| stripped.contains(&p),
+        );
+        assert_eq!(repairs, vec!["notes/a.txt"]);
+
+        // notes/b.txt: the prefixed file itself exists on disk → valid baseline,
+        // never repaired even though the stripped twin also exists.
+        let prefixed = ["notes/b.txt"];
+        let stripped = ["b.txt"];
+        let repairs = polluted_state_repairs(
+            &states,
+            prefix,
+            |p| prefixed.contains(&p),
+            |p| stripped.contains(&p),
+        );
+        assert!(
+            !repairs.iter().any(|p| p == "notes/b.txt"),
+            "an entry whose prefixed path exists is a valid baseline and must be kept"
+        );
+
+        // notes/c.txt: neither prefixed nor stripped path exists → ambiguous,
+        // conservatively kept.
+        let prefixed: [&str; 0] = [];
+        let stripped: [&str; 0] = [];
+        let repairs = polluted_state_repairs(
+            &states,
+            prefix,
+            |p| prefixed.contains(&p),
+            |p| stripped.contains(&p),
+        );
+        assert!(
+            !repairs.iter().any(|p| p == "notes/c.txt"),
+            "an entry with no filesystem evidence either way must be kept"
+        );
+
+        // Non-prefix paths are never candidates.
+        let repairs = polluted_state_repairs(
+            &states,
+            prefix,
+            |p| prefixed.contains(&p),
+            |p| stripped.contains(&p),
+        );
+        assert!(
+            !repairs.iter().any(|p| p == "plain.txt"),
+            "non-prefix entries are never repaired"
+        );
+    }
+
+    #[test]
+    fn repairs_prefix_entries_when_the_real_file_lives_at_the_stripped_path() {
+        // A genuine historical pollution: the DB stored the full remote path
+        // notes/deep/file.md but the real local file is deep/file.md.
+        let prefix = "notes/";
+        let states = [FileState::new(
+            "notes/deep/file.md".to_string(),
+            "h".to_string(),
+            1,
+            Utc::now(),
+        )];
+        let repairs = polluted_state_repairs(
+            &states,
+            prefix,
+            |p| p == "notes/something-else.md", // prefixed path absent
+            |p| p == "deep/file.md",            // stripped path present
+        );
+        assert_eq!(repairs, vec!["notes/deep/file.md"]);
     }
 
     // ── remote_delete_is_new ────────────────────────────────────────

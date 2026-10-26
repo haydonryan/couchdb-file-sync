@@ -22,7 +22,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -1013,8 +1013,22 @@ async fn daemon_sync(
     Ok(report)
 }
 
+/// Expected on-disk state for a path that the tool itself just installed,
+/// used to suppress the watcher's echo of that write without hiding a
+/// distinct user edit that lands in the same moment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExpectedState {
+    /// The tool successfully deleted the file. Only a matching delete echo is
+    /// suppressed; any recreated content (a real user edit) must propagate.
+    Absent,
+    /// The tool successfully wrote this exact content hash. Only a local
+    /// event whose on-disk bytes match is suppressed; different bytes are a
+    /// real edit and must sync.
+    Content(String),
+}
+
 struct TouchTracker {
-    entries: Vec<(String, i64)>,
+    entries: Vec<(String, ExpectedState)>,
 }
 
 impl TouchTracker {
@@ -1024,26 +1038,323 @@ impl TouchTracker {
         }
     }
 
-    fn mark(&mut self, path: &str, mtime: SystemTime) {
-        let bucket = Self::bucket(mtime);
-        self.entries.push((path.to_string(), bucket));
+    /// Record that the tool successfully installed `hash` at `path`. Only the
+    /// latest identity per path is kept so a fresh write supersedes an older
+    /// marker.
+    fn mark_content(&mut self, path: &str, hash: String) {
+        self.mark(path, ExpectedState::Content(hash));
+    }
+
+    /// Record that the tool successfully removed `path`.
+    fn mark_absent(&mut self, path: &str) {
+        self.mark(path, ExpectedState::Absent);
+    }
+
+    fn mark(&mut self, path: &str, state: ExpectedState) {
+        self.entries.retain(|(p, _)| p != path);
+        self.entries.push((path.to_string(), state));
         if self.entries.len() > 50 {
             let drain = self.entries.len() - 50;
             self.entries.drain(0..drain);
         }
     }
 
-    fn is_touched(&self, path: &str, mtime: SystemTime) -> bool {
-        let bucket = Self::bucket(mtime);
-        self.entries.iter().any(|(p, b)| p == path && *b == bucket)
+    /// Whether the tool may have just written `path`, so a caller knows a
+    /// content hash is worth computing before asking `is_touched`.
+    fn contains(&self, path: &str) -> bool {
+        self.entries.iter().any(|(p, _)| p == path)
     }
 
-    fn bucket(mtime: SystemTime) -> i64 {
-        let millis = mtime
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        i64::try_from(millis).unwrap_or(i64::MAX) / 5000
+    /// True when `path`'s current on-disk state matches the identity the tool
+    /// itself installed, i.e. this local change is an echo of our own write
+    /// rather than a distinct user edit.
+    fn is_touched(&self, path: &str, change_type: ChangeType, current_hash: Option<&str>) -> bool {
+        let Some((_, state)) = self.entries.iter().find(|(p, _)| p == path) else {
+            return false;
+        };
+        match state {
+            ExpectedState::Absent => change_type == ChangeType::Deleted,
+            ExpectedState::Content(written) => {
+                change_type != ChangeType::Deleted && current_hash == Some(written.as_str())
+            }
+        }
+    }
+}
+
+/// Tracks the live remote changes-feed cursor under ordered application
+/// acknowledgement.
+///
+/// The durable cursor (persisted as the sync checkpoint) advances ONLY to the
+/// highest sequence whose contiguous prefix of surfaced changes has been fully
+/// applied. A failed entry records a `gap`: while a gap exists, later
+/// successfully-applied entries are processed but do NOT advance the cursor, so
+/// the checkpoint never passes uncommitted work and the failed entry is never
+/// skipped. Because the feed cursor resumes from the checkpoint, a gapped
+/// entry is re-fetched and retried on the next pass (live) and after a restart
+/// (the checkpoint stays pinned below it).
+struct RemoteFeedCursor {
+    /// Last sequence that is safe to resume the feed from (the durable
+    /// checkpoint reported back to the producer).
+    checkpoint: String,
+    /// Sequence of an entry that failed to apply and must succeed before the
+    /// cursor can advance again.
+    gap: Option<String>,
+}
+
+impl RemoteFeedCursor {
+    const fn new(checkpoint: String) -> Self {
+        Self {
+            checkpoint,
+            gap: None,
+        }
+    }
+
+    /// Record a successfully applied entry with sequence `seq`.
+    ///
+    /// Returns the sequence the durable checkpoint should advance to, or
+    /// `None` when a prior gap (an earlier failed entry) still pins the cursor.
+    fn applied(&mut self, seq: &str) -> Option<String> {
+        let clears_gap = self.gap.as_deref() == Some(seq);
+        if clears_gap || self.gap.is_none() {
+            self.gap = None;
+            self.checkpoint = seq.to_string();
+            Some(seq.to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Record a failed entry with sequence `seq`. The cursor is left pinned
+    /// below `seq` (and any earlier failure) so the entry is retried.
+    fn failed(&mut self, seq: &str) {
+        self.gap = Some(seq.to_string());
+    }
+
+    /// The current safe resume cursor (the durable checkpoint).
+    fn checkpoint(&self) -> &str {
+        &self.checkpoint
+    }
+}
+
+/// Bounded reconciliation state for the live sync loop.
+///
+/// Local changes can fail to apply (transient upload errors) or be lost when
+/// the file watcher's internal event channel overflows (a burst larger than
+/// its capacity). Neither case must strand a local edit until the next user
+/// edit or daemon restart, so the live loop coalesces the affected paths into
+/// `dirty` (and sets `full_rescan` when the watcher dropped events of unknown
+/// scope) and re-runs a full sync cycle as reconciliation. The rescan is
+/// bounded: it only runs when something is pending, and never more often than
+/// `interval`.
+struct Reconcile {
+    /// Coalesced paths whose local apply failed and must be retried.
+    dirty: HashSet<String>,
+    /// Set when the watcher overflowed and dropped events of unknown scope;
+    /// forces a full reconciliation rescan rather than a path-scoped retry.
+    full_rescan: bool,
+    /// When the last reconciliation pass ran (cooldown for boundedness).
+    last: Instant,
+    /// Minimum time between reconciliation passes.
+    interval: Duration,
+}
+
+impl Reconcile {
+    fn new(interval: Duration) -> Self {
+        Self {
+            dirty: HashSet::new(),
+            full_rescan: false,
+            last: Instant::now(),
+            interval,
+        }
+    }
+
+    /// Record that `path` failed to apply and must be retried.
+    fn mark_dirty(&mut self, path: &str) {
+        self.dirty.insert(path.to_string());
+    }
+
+    /// Record that the watcher overflowed and dropped events of unknown scope.
+    const fn mark_full_rescan(&mut self) {
+        self.full_rescan = true;
+    }
+
+    /// Whether any reconciliation work is pending.
+    // `HashSet::is_empty` is not `const`, so this cannot be a `const fn`
+    // despite clippy's `missing_const_for_fn` suggestion.
+    #[allow(clippy::missing_const_for_fn)]
+    fn pending(&self) -> bool {
+        self.full_rescan || !self.dirty.is_empty()
+    }
+
+    /// Whether a reconciliation pass may run now (bounded by `interval`).
+    fn due(&self) -> bool {
+        self.last.elapsed() >= self.interval
+    }
+
+    /// Clear pending state after a successful reconciliation pass.
+    fn reset(&mut self) {
+        self.dirty.clear();
+        self.full_rescan = false;
+        self.last = Instant::now();
+    }
+}
+
+/// Apply one remote changes-feed entry under ordered application
+/// acknowledgement: apply the change, advance the durable cursor only when the
+/// contiguous prefix is fully applied, and report the cursor back to the
+/// producer. Returns `true` when the live loop should stop (the producer is
+/// gone).
+#[allow(clippy::too_many_arguments)] // single cohesive per-entry apply; bundled state would be opaque
+async fn apply_live_remote_entry(
+    engine: &mut SyncEngine,
+    touched: &mut TouchTracker,
+    ignore_matcher: &IgnoreMatcher,
+    entry: ChangeFeedEntry,
+    remote_cursor: &mut RemoteFeedCursor,
+    ack_tx: &mpsc::Sender<String>,
+    config: &AppConfig,
+    path: &Path,
+) -> Result<bool> {
+    let seq = entry.seq.clone();
+    match handle_remote_change(engine, touched, ignore_matcher, entry).await {
+        Ok(()) => {
+            // A failed persistence leaves the durable cursor behind (safe:
+            // nothing is skipped); a restart re-applies the entry idempotently.
+            if let Some(advance_to) = remote_cursor.applied(&seq)
+                && let Err(e) = engine.save_checkpoint(&advance_to).await
+            {
+                warn!("Failed to persist live checkpoint at {advance_to}: {e}");
+            }
+        }
+        Err(e) => {
+            remote_cursor.failed(&seq);
+            warn!("Live remote change error: {}", e);
+            notify_sync_error_telegram(
+                config,
+                Some(path),
+                &format!("Live remote change error: {e}"),
+            )
+            .await;
+            notify_sync_error_matrix(
+                config,
+                Some(path),
+                &format!("Live remote change error: {e}"),
+            )
+            .await;
+        }
+    }
+    // Acknowledge the durable cursor back to the producer after every entry
+    // (success or failure) so the feed resumes from the highest
+    // contiguously-applied sequence.
+    if ack_tx
+        .send(remote_cursor.checkpoint().to_string())
+        .await
+        .is_err()
+    {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Recover from an invalid remote resume cursor by running a full
+/// reconciliation and reporting the fresh checkpoint back to the producer, so
+/// the feed resumes from a known-good position instead of jumping to "now".
+/// Returns `true` when the live loop should stop (the producer is gone).
+async fn reconcile_live_remote_cursor(
+    engine: &mut SyncEngine,
+    ack_tx: &mpsc::Sender<String>,
+    remote_cursor: &mut RemoteFeedCursor,
+) -> Result<bool> {
+    if let Err(e) = engine.sync().await {
+        warn!("Live reconciliation failed: {}", e);
+    }
+    let seq = engine
+        .get_checkpoint()
+        .await
+        .ok()
+        .flatten()
+        .map_or_else(|| remote_cursor.checkpoint().to_string(), |cp| cp.last_seq);
+    *remote_cursor = RemoteFeedCursor::new(seq.clone());
+    if ack_tx.send(seq).await.is_err() {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Apply one local watcher change; a transient apply failure is coalesced into
+/// the bounded reconciliation set so it is retried on the rescan cadence.
+async fn apply_live_local_change(
+    engine: &mut SyncEngine,
+    reconcile: Option<&mut Reconcile>,
+    touched: &TouchTracker,
+    change: &Change,
+    config: &AppConfig,
+    path: &Path,
+) {
+    if let Err(e) = handle_local_change(engine, reconcile, touched, change).await {
+        warn!("Live local change error for {}: {}", change.path(), e);
+        notify_sync_error_telegram(
+            config,
+            Some(path),
+            &format!("Live local change error for {}: {}", change.path(), e),
+        )
+        .await;
+        notify_sync_error_matrix(
+            config,
+            Some(path),
+            &format!("Live local change error for {}: {}", change.path(), e),
+        )
+        .await;
+    }
+}
+
+/// Run a bounded reconciliation rescan when pending local work exists and the
+/// cooldown has elapsed. A full sync cycle re-scans the filesystem and retries
+/// every failed/dropped local change; it also heals remote divergence.
+async fn attempt_live_reconciliation(
+    engine: &mut SyncEngine,
+    reconcile: Option<&mut Reconcile>,
+    config: &AppConfig,
+    path: &Path,
+) {
+    let Some(r) = reconcile else { return };
+    if !(r.pending() && r.due()) {
+        return;
+    }
+    match engine.sync().await {
+        Ok(report) => {
+            if !report.errors.is_empty() {
+                // Some changes still failed; surface them and retry on the
+                // next cadence.
+                let summary = format_sync_error_summary(&report.errors);
+                warn!(
+                    "Live reconciliation left {} error(s): {}",
+                    report.errors.len(),
+                    summary
+                );
+                notify_sync_error_telegram(config, Some(path), &summary).await;
+                notify_sync_error_matrix(config, Some(path), &summary).await;
+            }
+            r.reset();
+        }
+        Err(e) => {
+            // Fatal sync failure: notify the supervisor and back off before the
+            // next retry.
+            warn!("Live reconciliation failed: {}", e);
+            notify_sync_error_telegram(
+                config,
+                Some(path),
+                &format!("Live reconciliation failed: {e}"),
+            )
+            .await;
+            notify_sync_error_matrix(
+                config,
+                Some(path),
+                &format!("Live reconciliation failed: {e}"),
+            )
+            .await;
+            r.last = Instant::now();
+        }
     }
 }
 
@@ -1052,48 +1363,83 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
 
     let (ignore_matcher, mut engine) = build_live_sync_engine(&path, &config).await?;
     let initial_since = bootstrap_live_sync(&mut engine).await?;
-    let (mut local_rx, mut remote_rx) =
-        spawn_live_change_sources(config.clone(), &path, ignore_matcher.clone(), initial_since)?;
+    let LiveChangeChannels {
+        mut local_rx,
+        mut remote_rx,
+        ack_tx,
+        mut reconcile_rx,
+        mut overflow_rx,
+    } = spawn_live_change_sources(
+        config.clone(),
+        &path,
+        ignore_matcher.clone(),
+        initial_since.clone(),
+    )?;
 
     let mut touched = TouchTracker::new();
+    let mut remote_cursor = RemoteFeedCursor::new(initial_since);
+
+    // Bounded reconciliation: a local apply that fails transiently or a watcher
+    // event that is dropped on overflow must still reach remote without another
+    // user edit or daemon restart. Pending work is coalesced and retried on the
+    // rescan cadence (`0` disables the periodic rescan).
+    let mut reconcile = (config.sync.rescan_interval_secs > 0)
+        .then(|| Reconcile::new(Duration::from_secs(config.sync.rescan_interval_secs)));
+    let mut rescan_timer =
+        tokio::time::interval(Duration::from_secs(config.sync.rescan_interval_secs.max(1)));
+    // The first `interval` tick fires immediately; consume it so the cooldown
+    // drives the cadence rather than running a spurious first pass.
+    rescan_timer.tick().await;
 
     loop {
         tokio::select! {
             Some(change) = local_rx.recv() => {
-                if let Err(e) = handle_local_change(&mut engine, &touched, &change).await {
-                    warn!("Live local change error for {}: {}", change.path(), e);
-                    notify_sync_error_telegram(
-                        &config,
-                        Some(&path),
-                        &format!("Live local change error for {}: {}", change.path(), e),
-                    )
-                    .await;
-                    notify_sync_error_matrix(
-                        &config,
-                        Some(&path),
-                        &format!("Live local change error for {}: {}", change.path(), e),
-                    )
-                    .await;
-                }
+                apply_live_local_change(
+                    &mut engine,
+                    reconcile.as_mut(),
+                    &touched,
+                    &change,
+                    &config,
+                    &path,
+                )
+                .await;
             }
             Some(entry) = remote_rx.recv() => {
-                if let Err(e) = handle_remote_change(&mut engine, &mut touched, &ignore_matcher, entry).await {
-                    warn!("Live remote change error: {}", e);
-                    notify_sync_error_telegram(
-                        &config,
-                        Some(&path),
-                        &format!("Live remote change error: {e}"),
-                    )
-                    .await;
-                    notify_sync_error_matrix(
-                        &config,
-                        Some(&path),
-                        &format!("Live remote change error: {e}"),
-                    )
-                    .await;
+                if apply_live_remote_entry(
+                    &mut engine,
+                    &mut touched,
+                    &ignore_matcher,
+                    entry,
+                    &mut remote_cursor,
+                    &ack_tx,
+                    &config,
+                    &path,
+                )
+                .await?
+                {
+                    return Ok(());
                 }
             }
+            Some(()) = reconcile_rx.recv() => {
+                // The producer hit an invalid resume cursor; reconcile from a
+                // known-good position instead of jumping to "now".
+                if reconcile_live_remote_cursor(&mut engine, &ack_tx, &mut remote_cursor).await? {
+                    return Ok(());
+                }
+            }
+            Some(()) = overflow_rx.recv() => {
+                if let Some(r) = reconcile.as_mut() {
+                    r.mark_full_rescan();
+                }
+            }
+            _ = rescan_timer.tick(), if reconcile.is_some() => {
+                // Periodic cadence tick; reconciliation attempt below.
+            }
         }
+
+        // Attempt a bounded reconciliation whenever work is pending and the
+        // cooldown has elapsed (runs after any event, and on each timer tick).
+        attempt_live_reconciliation(&mut engine, reconcile.as_mut(), &config, &path).await;
     }
 }
 
@@ -1143,14 +1489,34 @@ async fn bootstrap_live_sync(engine: &mut SyncEngine) -> Result<String> {
         info!("Live bootstrap sync: already in sync");
     }
 
-    let initial_since: String = if let Some(cp) = engine.get_checkpoint().await? {
-        cp.last_seq
-    } else {
-        info!("No checkpoint found, starting changes feed from 'now'");
-        "now".to_string()
-    };
+    // The durable checkpoint is the only safe resume cursor for the live feed.
+    // A full bootstrap sync always records a checkpoint when it completes, so a
+    // missing/unknown checkpoint here means bootstrap did not durably land. Do
+    // NOT fall back to "now": a "now" start would skip every remote change that
+    // predates the daemon (a fresh daemon must never miss pre-existing remote
+    // files), so the unknown-cursor case is an error, not a silent "now".
+    let initial_since: String = engine
+        .get_checkpoint()
+        .await?
+        .map(|cp| cp.last_seq)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "live bootstrap sync completed without a durable checkpoint; refusing to start the changes feed from an unknown cursor (a 'now' start could skip pre-existing remote files)"
+            )
+        })?;
 
     Ok(initial_since)
+}
+
+/// Channels bridging the live changes-feed producer task and the consumer
+/// select-loop: the remote feed entries, plus the ordered-ack and
+/// reconciliation channels that keep the durable cursor replay-safe.
+struct LiveChangeChannels {
+    local_rx: mpsc::Receiver<Change>,
+    remote_rx: mpsc::Receiver<ChangeFeedEntry>,
+    ack_tx: mpsc::Sender<String>,
+    reconcile_rx: mpsc::Receiver<()>,
+    overflow_rx: mpsc::Receiver<()>,
 }
 
 fn spawn_live_change_sources(
@@ -1158,17 +1524,32 @@ fn spawn_live_change_sources(
     path: &Path,
     ignore_matcher: Arc<IgnoreMatcher>,
     initial_since: String,
-) -> Result<(mpsc::Receiver<Change>, mpsc::Receiver<ChangeFeedEntry>)> {
+) -> Result<LiveChangeChannels> {
     let (local_tx, local_rx) = mpsc::channel::<Change>(256);
     let (remote_tx, remote_rx) = mpsc::channel::<ChangeFeedEntry>(256);
+    // The consumer acknowledges each durably-applied sequence back to the
+    // producer (ordered ack), and can be asked to run a full reconciliation
+    // when the producer hits an invalid resume cursor.
+    let (ack_tx, ack_rx) = mpsc::channel::<String>(256);
+    let (reconcile_tx, reconcile_rx) = mpsc::channel::<()>(1);
+    // Capacity-1 notice signalled by the watcher when its internal event
+    // channel overflows and drops events, so the live loop schedules a bounded
+    // reconciliation rescan (coalesced: a burst yields one pending notice).
+    let (overflow_tx, overflow_rx) = mpsc::channel::<()>(1);
 
     let watcher_root = resolve_sync_dir(path)?;
     let watcher_ignore = ignore_matcher;
     let debounce_ms = config.sync.debounce_ms;
     let watcher_config = config.clone();
     tokio::spawn(async move {
-        if let Err(e) =
-            run_local_watcher(watcher_root.clone(), watcher_ignore, debounce_ms, local_tx).await
+        if let Err(e) = run_local_watcher(
+            watcher_root.clone(),
+            watcher_ignore,
+            debounce_ms,
+            local_tx,
+            overflow_tx,
+        )
+        .await
         {
             error!("Local watcher error: {}", e);
             notify_sync_error_telegram(
@@ -1190,7 +1571,15 @@ fn spawn_live_change_sources(
     let remote_config_notify = remote_config.clone();
     let remote_root = path.to_path_buf();
     tokio::spawn(async move {
-        if let Err(e) = run_remote_changes(remote_config, initial_since, remote_tx).await {
+        if let Err(e) = run_remote_changes(
+            remote_config,
+            initial_since,
+            remote_tx,
+            ack_rx,
+            reconcile_tx,
+        )
+        .await
+        {
             error!("Remote changes feed error: {}", e);
             notify_sync_error_telegram(
                 &remote_config_notify,
@@ -1207,7 +1596,13 @@ fn spawn_live_change_sources(
         }
     });
 
-    Ok((local_rx, remote_rx))
+    Ok(LiveChangeChannels {
+        local_rx,
+        remote_rx,
+        ack_tx,
+        reconcile_rx,
+        overflow_rx,
+    })
 }
 
 async fn run_local_watcher(
@@ -1215,9 +1610,14 @@ async fn run_local_watcher(
     ignore_matcher: Arc<IgnoreMatcher>,
     debounce_ms: u64,
     tx: mpsc::Sender<Change>,
+    overflow_tx: mpsc::Sender<()>,
 ) -> Result<()> {
-    let mut watcher =
-        AsyncFileWatcher::start(root.clone(), (*ignore_matcher).clone(), debounce_ms)?;
+    let mut watcher = AsyncFileWatcher::start(
+        root.clone(),
+        (*ignore_matcher).clone(),
+        debounce_ms,
+        overflow_tx,
+    )?;
 
     loop {
         if let Some(event) = watcher.next_event().await
@@ -1235,6 +1635,8 @@ async fn run_remote_changes(
     config: AppConfig,
     mut since: String,
     tx: mpsc::Sender<ChangeFeedEntry>,
+    mut ack_rx: mpsc::Receiver<String>,
+    reconcile_tx: mpsc::Sender<()>,
 ) -> Result<()> {
     let couchdb = CouchDb::new(
         &config.couchdb.url,
@@ -1256,11 +1658,26 @@ async fn run_remote_changes(
             .get_changes_feed(&since, ChangesFeed::LongPoll, wait_budget_ms)
             .await
         {
-            Ok((entries, last_seq)) => {
-                since = last_seq;
+            Ok((entries, _last_seq)) => {
+                // The cursor advances ONLY to the sequence the consumer has
+                // durably applied (its ordered ack), never to the feed's
+                // trailing `last_seq`. `last_seq` reflects the whole batch,
+                // including entries the consumer may not have applied yet; if
+                // we jumped straight to it, a failed entry in the batch would
+                // be skipped on the next fetch. Each entry is acknowledged in
+                // feed order, so `since` climbs exactly to the highest
+                // contiguously-applied sequence and a failed entry is re-fetched
+                // and retried on the next pass.
+                let entry_count = entries.len();
                 for entry in entries {
                     if tx.send(entry).await.is_err() {
                         return Ok(());
+                    }
+                }
+                for _ in 0..entry_count {
+                    match ack_rx.recv().await {
+                        Some(watermark) => since = watermark,
+                        None => return Ok(()),
                     }
                 }
             }
@@ -1270,8 +1687,21 @@ async fn run_remote_changes(
                     .and_then(reqwest::Error::status)
                     && status == StatusCode::BAD_REQUEST
                 {
-                    warn!("Changes feed returned 400; resetting since to \"now\" and retrying");
-                    since = "now".to_string();
+                    // Invalid resume cursor. Do NOT jump to "now": that would
+                    // silently skip every change before the present moment.
+                    // Instead ask the consumer to run a full reconciliation
+                    // (which rebuilds a fresh, valid checkpoint), then resume
+                    // the feed from that reconciled cursor.
+                    warn!(
+                        "Changes feed rejected cursor {since:?} (400); requesting reconciliation instead of jumping to \"now\""
+                    );
+                    if reconcile_tx.send(()).await.is_err() {
+                        return Ok(());
+                    }
+                    match ack_rx.recv().await {
+                        Some(seq) => since = seq,
+                        None => return Ok(()),
+                    }
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
@@ -1287,11 +1717,23 @@ async fn run_remote_changes(
 
 async fn handle_local_change(
     engine: &mut SyncEngine,
+    reconcile: Option<&mut Reconcile>,
     touched: &TouchTracker,
     change: &Change,
 ) -> Result<()> {
-    let mtime = local_mtime(engine.root_dir(), change.path()).await;
-    if touched.is_touched(change.path(), mtime) {
+    // Only hash paths the tool may have just written; ordinary user edits of
+    // arbitrary files skip the (potentially expensive) content check.
+    let current_hash = if touched.contains(change.path()) {
+        match change.change_type() {
+            ChangeType::Created | ChangeType::Modified => {
+                compute_file_hash(&engine.root_dir().join(change.path())).ok()
+            }
+            ChangeType::Deleted => None,
+        }
+    } else {
+        None
+    };
+    if touched.is_touched(change.path(), change.change_type(), current_hash.as_deref()) {
         return Ok(());
     }
 
@@ -1309,6 +1751,12 @@ async fn handle_local_change(
         ChangeType::Created | ChangeType::Modified | ChangeType::Deleted => {
             if let Err(e) = engine.apply_local_change(change).await {
                 warn!("Failed to apply local change {}: {}", change.path(), e);
+                // Coalesce the failed path so the bounded reconciliation rescan
+                // retries it and the error reaches the supervisor.
+                if let Some(r) = reconcile {
+                    r.mark_dirty(change.path());
+                }
+                return Err(e);
             }
         }
     }
@@ -1323,13 +1771,16 @@ async fn handle_remote_change(
     entry: ChangeFeedEntry,
 ) -> Result<()> {
     let change = entry.change;
-    let seq = entry.seq;
 
     let local_path = engine.remote_to_local_path(change.path());
     let local_rel = local_path.trim_start_matches('/').to_string();
 
+    // The durable checkpoint is advanced by the live-sync consumer (via the
+    // ordered-ack cursor), not here: it must only advance past an entry once
+    // the whole contiguous prefix of surfaced changes has been applied, so a
+    // failed entry is never skipped. These early returns just report success.
+
     if ignore_matcher.should_ignore(Path::new(&local_rel)) {
-        engine.save_checkpoint(&seq).await?;
         return Ok(());
     }
 
@@ -1337,7 +1788,6 @@ async fn handle_remote_change(
         && let (Some(remote_rev), Some(local_rev)) = (change.rev(), state.couch_rev.as_deref())
         && remote_rev == local_rev
     {
-        engine.save_checkpoint(&seq).await?;
         return Ok(());
     }
 
@@ -1370,8 +1820,10 @@ async fn handle_remote_change(
                 local_content_matches,
             ) {
                 triage::RemoteDeleteVerdict::Apply => {
-                    touched.mark(&local_rel, SystemTime::now());
                     engine.apply_remote_change(&change).await?;
+                    // Only a successful delete leaves an "absent" marker, so a
+                    // failed/slow removal never suppresses a later user edit.
+                    touched.mark_absent(&local_rel);
                 }
                 triage::RemoteDeleteVerdict::Conflict => {
                     let local_state = match &state {
@@ -1404,53 +1856,62 @@ async fn handle_remote_change(
             }
         }
         ChangeType::Created | ChangeType::Modified => {
-            let file_path = engine.root_dir().join(&local_rel);
-            let local_meta = tokio::fs::metadata(&file_path).await.ok();
-            let local_exists = local_meta.is_some();
-            let local_mtime_val = local_meta
-                .and_then(|meta| meta.modified().ok())
-                .unwrap_or_else(SystemTime::now);
-            let local_mtime = DateTime::<Utc>::from(local_mtime_val);
-
-            // Arbitrate using the authoritative CouchDB revision (remote side)
-            // and the stored local sync state (same-machine mtime, immune to
-            // cross-host clock skew) rather than comparing local vs remote
-            // mtimes with a 1s tolerance.
-            let state = engine.get_file_state(&local_rel).await?;
-            let apply_remote = triage::live_should_apply_remote(
-                change.rev(),
-                state.as_ref(),
-                local_exists,
-                local_mtime,
-            );
-
-            if apply_remote {
-                touched.mark(&local_rel, SystemTime::now());
-                engine.apply_remote_change(&change).await?;
-            } else {
-                // Upload the local version to arbitrate. Carry the observed
-                // remote revision as the publication baseline so a further
-                // concurrent remote write landing during the upload is rejected
-                // (surfaced as an error) instead of silently overwritten.
-                let local_change = Change::local_modified(local_rel.clone(), String::new(), 0)
-                    .with_expected_rev(change.rev().map_or(ExpectedRemote::Force, |rev| {
-                        ExpectedRemote::At(rev.to_string())
-                    }));
-                engine.apply_local_change(&local_change).await?;
-            }
+            apply_live_remote_write(engine, touched, &local_rel, &change).await?;
         }
     }
 
-    engine.save_checkpoint(&seq).await?;
     Ok(())
 }
 
-async fn local_mtime(root: &Path, relative_path: &str) -> SystemTime {
-    let file_path = root.join(relative_path);
-    tokio::fs::metadata(&file_path)
-        .await
-        .and_then(|meta| meta.modified())
-        .unwrap_or_else(|_| SystemTime::now())
+/// Apply a remote create/modify to the local tree, arbitrating against any
+/// concurrent local edit and recording the installed content identity only
+/// after a successful write.
+async fn apply_live_remote_write(
+    engine: &mut SyncEngine,
+    touched: &mut TouchTracker,
+    local_rel: &str,
+    change: &Change,
+) -> Result<()> {
+    let file_path = engine.root_dir().join(local_rel);
+    let local_meta = tokio::fs::metadata(&file_path).await.ok();
+    let local_exists = local_meta.is_some();
+    let local_mtime_val = local_meta
+        .and_then(|meta| meta.modified().ok())
+        .unwrap_or_else(SystemTime::now);
+    let local_mtime = DateTime::<Utc>::from(local_mtime_val);
+
+    // Arbitrate using the authoritative CouchDB revision (remote side)
+    // and the stored local sync state (same-machine mtime, immune to
+    // cross-host clock skew) rather than comparing local vs remote
+    // mtimes with a 1s tolerance.
+    let state = engine.get_file_state(local_rel).await?;
+    let apply_remote =
+        triage::live_should_apply_remote(change.rev(), state.as_ref(), local_exists, local_mtime);
+
+    if apply_remote {
+        engine.apply_remote_change(change).await?;
+        // Only a successful write records the installed content as the
+        // expected identity, so a failed/slow download never leaves a marker
+        // that would swallow a real user edit. The on-disk hash is
+        // authoritative: only bytes matching exactly what we wrote are treated
+        // as our own echo; same-bucket edits with different bytes (including
+        // mtime-preserving writes) sync.
+        if let Ok(hash) = compute_file_hash(&file_path) {
+            touched.mark_content(local_rel, hash);
+        }
+    } else {
+        // Upload the local version to arbitrate. Carry the observed remote
+        // revision as the publication baseline so a further concurrent remote
+        // write landing during the upload is rejected (surfaced as an error)
+        // instead of silently overwritten.
+        let local_change = Change::local_modified(local_rel.to_string(), String::new(), 0)
+            .with_expected_rev(change.rev().map_or(ExpectedRemote::Force, |rev| {
+                ExpectedRemote::At(rev.to_string())
+            }));
+        engine.apply_local_change(&local_change).await?;
+    }
+
+    Ok(())
 }
 
 /// List conflicts
@@ -1800,8 +2261,8 @@ fn print_sync_report(report: &SyncReport, dry_run: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{DownloadCount, UploadCount};
-    use std::time::SystemTime;
+    use crate::couchdb::db::CannedCouch;
+    use crate::models::{DownloadCount, FileDoc, UploadCount};
 
     // ── resolve_sync_dir (CLI path resolution) ────────────────────────────
 
@@ -2040,41 +2501,6 @@ mod tests {
         assert_eq!(result, root.join(".couchdb-file-sync").join("state.db"));
     }
 
-    // ── local_mtime ───────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn test_local_mtime_file_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::write(root.join("test.txt"), "content").unwrap();
-        let mtime = local_mtime(root, "test.txt").await;
-        let now = SystemTime::now();
-        let diff = now.duration_since(mtime).unwrap_or_default();
-        assert!(diff.as_secs() < 5);
-    }
-
-    #[tokio::test]
-    async fn test_local_mtime_file_not_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let mtime = local_mtime(root, "nonexistent.txt").await;
-        let now = SystemTime::now();
-        let diff = now.duration_since(mtime).unwrap_or_default();
-        assert!(diff.as_secs() < 5);
-    }
-
-    #[tokio::test]
-    async fn test_local_mtime_nested_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join("subdir")).unwrap();
-        std::fs::write(root.join("subdir/file.txt"), "content").unwrap();
-        let mtime = local_mtime(root, "subdir/file.txt").await;
-        let now = SystemTime::now();
-        let diff = now.duration_since(mtime).unwrap_or_default();
-        assert!(diff.as_secs() < 5);
-    }
-
     // ── load_ignore_patterns ──────────────────────────────────────────────
 
     #[test]
@@ -2117,5 +2543,538 @@ mod tests {
         .unwrap();
         let matcher = load_ignore_patterns(root);
         assert!(matcher.is_empty());
+    }
+
+    // ── TouchTracker (content-identity echo suppression) ──────────────────
+
+    #[test]
+    fn touch_tracker_suppresses_matching_content_echo() {
+        let mut t = TouchTracker::new();
+        t.mark_content("a.txt", "hash-AAA".to_string());
+        // The watcher's echo of our own write carries the same bytes.
+        assert!(t.is_touched("a.txt", ChangeType::Modified, Some("hash-AAA")));
+        assert!(t.is_touched("a.txt", ChangeType::Created, Some("hash-AAA")));
+        // A different path is never suppressed.
+        assert!(!t.is_touched("b.txt", ChangeType::Modified, Some("hash-AAA")));
+    }
+
+    #[test]
+    fn touch_tracker_propagates_different_bytes_in_same_moment() {
+        let mut t = TouchTracker::new();
+        t.mark_content("a.txt", "hash-AAA".to_string());
+        // A real user edit lands with different bytes; even an instant later it
+        // must not be suppressed.
+        assert!(!t.is_touched("a.txt", ChangeType::Modified, Some("hash-BBB")));
+        // A deleted-echo check with content still present is not ours.
+        assert!(!t.is_touched("a.txt", ChangeType::Deleted, None));
+    }
+
+    #[test]
+    fn touch_tracker_propagates_mtime_preserving_edit() {
+        let mut t = TouchTracker::new();
+        t.mark_content("a.txt", "hash-AAA".to_string());
+        // A tool like `touch -r`/`cp -p` rewrites content while preserving the
+        // mtime; the differing bytes are a genuine edit and must sync.
+        assert!(!t.is_touched("a.txt", ChangeType::Modified, Some("hash-NEW")));
+    }
+
+    #[test]
+    fn touch_tracker_absent_suppresses_delete_echo_but_not_recreate() {
+        let mut t = TouchTracker::new();
+        t.mark_absent("gone.txt");
+        // The delete echo of our own removal is suppressed.
+        assert!(t.is_touched("gone.txt", ChangeType::Deleted, None));
+        // Recreating the file is a distinct user action and must propagate.
+        assert!(!t.is_touched("gone.txt", ChangeType::Created, Some("hash-NEW")));
+        assert!(!t.is_touched("gone.txt", ChangeType::Modified, Some("hash-NEW")));
+    }
+
+    #[test]
+    fn touch_tracker_unmarked_path_never_suppresses() {
+        // Simulates a failed/slow write that left no marker: no identity was
+        // recorded, so a subsequent user edit is never swallowed.
+        let t = TouchTracker::new();
+        assert!(!t.is_touched("a.txt", ChangeType::Modified, Some("hash-AAA")));
+        assert!(!t.is_touched("a.txt", ChangeType::Deleted, None));
+    }
+
+    #[test]
+    fn touch_tracker_latest_write_supersedes_older() {
+        let mut t = TouchTracker::new();
+        t.mark_content("a.txt", "hash-OLD".to_string());
+        // A newer install of different content replaces the prior identity.
+        t.mark_content("a.txt", "hash-NEW".to_string());
+        assert!(!t.is_touched("a.txt", ChangeType::Modified, Some("hash-OLD")));
+        assert!(t.is_touched("a.txt", ChangeType::Modified, Some("hash-NEW")));
+    }
+
+    #[test]
+    fn touch_tracker_is_bounded() {
+        let mut t = TouchTracker::new();
+        for i in 0..80 {
+            t.mark_content(&format!("f{i}.txt"), format!("hash-{i}"));
+        }
+        assert!(t.entries.len() <= 50);
+        // The oldest entries are evicted; the newest 50 remain effective.
+        assert!(t.is_touched("f79.txt", ChangeType::Modified, Some("hash-79")));
+    }
+
+    // ── RemoteFeedCursor (ordered-ack live cursor) ────────────────────────
+
+    #[test]
+    fn remote_cursor_advances_through_a_clean_run() {
+        let mut cursor = RemoteFeedCursor::new("0-before".to_string());
+        assert_eq!(cursor.applied("1-first"), Some("1-first".to_string()));
+        assert_eq!(cursor.applied("2-second"), Some("2-second".to_string()));
+        assert_eq!(cursor.checkpoint(), "2-second");
+    }
+
+    #[test]
+    fn remote_cursor_pins_on_failure_and_later_success_does_not_skip_it() {
+        let mut cursor = RemoteFeedCursor::new("0-before".to_string());
+        // First event fails → cursor pins below it.
+        cursor.failed("1-first");
+        assert_eq!(cursor.checkpoint(), "0-before");
+        // Second event succeeds, but the first is still un-applied: the cursor
+        // must NOT advance past the failed entry.
+        assert_eq!(
+            cursor.applied("2-second"),
+            None,
+            "cursor must not advance past a failed entry"
+        );
+        assert_eq!(cursor.checkpoint(), "0-before");
+    }
+
+    #[test]
+    fn remote_cursor_retries_the_failed_entry_then_advances() {
+        let mut cursor = RemoteFeedCursor::new("0-before".to_string());
+        cursor.failed("1-first");
+        assert_eq!(cursor.applied("2-second"), None);
+        // Retry pass re-fetches the failed entry first; once it applies the gap
+        // clears and the cursor resumes advancing.
+        assert_eq!(cursor.applied("1-first"), Some("1-first".to_string()));
+        assert_eq!(cursor.applied("2-second"), Some("2-second".to_string()));
+        assert_eq!(cursor.checkpoint(), "2-second");
+    }
+
+    #[test]
+    fn remote_cursor_keeps_pinned_until_every_entry_in_the_pass_applies() {
+        let mut cursor = RemoteFeedCursor::new("0-before".to_string());
+        // Pass 1: first entry fails, second applies, third fails. The cursor
+        // stays pinned at the last fully-applied prefix (before the first).
+        cursor.failed("1-first");
+        assert_eq!(cursor.applied("2-second"), None);
+        cursor.failed("3-third");
+        assert_eq!(cursor.checkpoint(), "0-before");
+        // Retry pass: the feed is re-fetched from the pinned checkpoint, so
+        // 1-first and 2-second are re-applied before 3-third. The cursor only
+        // advances once the trailing gap (3-third) applies, which then covers
+        // the whole re-applied prefix.
+        assert_eq!(cursor.applied("1-first"), None);
+        assert_eq!(cursor.applied("2-second"), None);
+        assert_eq!(cursor.applied("3-third"), Some("3-third".to_string()));
+        assert_eq!(cursor.checkpoint(), "3-third");
+    }
+
+    // ── Live remote checkpoint discipline + restart replay ───────────────
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn live_remote_checkpoint_never_passes_a_failed_entry_and_restart_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::create_dir_all(root.as_path().join(".couchdb-file-sync")).unwrap();
+        let state_path = root.as_path().join(".couchdb-file-sync/state.db");
+        let local = LocalDb::open(&state_path).unwrap();
+        local.save_checkpoint("0-before").unwrap();
+
+        let remote_prefix = "prefix/";
+        let first_path = format!("{remote_prefix}first.txt");
+        let second_path = format!("{remote_prefix}second.txt");
+
+        let canned = CannedCouch {
+            metadata: std::collections::HashMap::from([
+                (
+                    first_path.clone(),
+                    FileDoc::new(first_path.clone(), String::new(), 5),
+                ),
+                (
+                    second_path.clone(),
+                    FileDoc::new(second_path.clone(), String::new(), 6),
+                ),
+            ]),
+            contents: std::collections::HashMap::from([
+                (first_path.clone(), b"first".to_vec()),
+                (second_path.clone(), b"second".to_vec()),
+            ]),
+            // Inject a failure on the FIRST remote event's content download.
+            content_errors: std::collections::HashSet::from([first_path.clone()]),
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            CouchDb::for_test_with_canned(remote_prefix, canned),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+        let mut touched = TouchTracker::new();
+        let mut cursor = RemoteFeedCursor::new("0-before".to_string());
+
+        let first_entry = ChangeFeedEntry {
+            change: Change::remote_created(
+                first_path.clone(),
+                "hash".to_string(),
+                5,
+                Utc::now(),
+                "1-first".to_string(),
+            ),
+            seq: "1-first".to_string(),
+        };
+        let second_entry = ChangeFeedEntry {
+            change: Change::remote_created(
+                second_path.clone(),
+                "hash".to_string(),
+                6,
+                Utc::now(),
+                "2-second".to_string(),
+            ),
+            seq: "2-second".to_string(),
+        };
+
+        // Session 1: the first event fails to apply...
+        let first_result = handle_remote_change(
+            &mut engine,
+            &mut touched,
+            &IgnoreMatcher::empty(),
+            first_entry,
+        )
+        .await;
+        assert!(first_result.is_err(), "first event should fail to apply");
+        cursor.failed("1-first");
+        assert!(
+            !root.as_path().join("first.txt").exists(),
+            "failed first event must not be applied"
+        );
+
+        // ...and the second event succeeds, but the durable cursor must NOT
+        // advance past the failed first event.
+        handle_remote_change(
+            &mut engine,
+            &mut touched,
+            &IgnoreMatcher::empty(),
+            second_entry,
+        )
+        .await
+        .expect("second event should apply");
+        assert_eq!(
+            cursor.applied("2-second"),
+            None,
+            "cursor must not advance past the failed entry"
+        );
+        assert_eq!(cursor.checkpoint(), "0-before");
+        assert!(root.as_path().join("second.txt").exists());
+
+        let cp = engine
+            .get_checkpoint()
+            .await
+            .unwrap()
+            .expect("checkpoint exists");
+        assert_eq!(
+            cp.last_seq, "0-before",
+            "checkpoint must never pass uncommitted work"
+        );
+
+        // Restart: a fresh engine from the same durable DB, now with the content
+        // fetch fixed. The failed first event is re-fetched from the pinned
+        // checkpoint and must apply; both events end up applied.
+        let canned_ok = CannedCouch {
+            metadata: std::collections::HashMap::from([
+                (
+                    first_path.clone(),
+                    FileDoc::new(first_path.clone(), String::new(), 5),
+                ),
+                (
+                    second_path.clone(),
+                    FileDoc::new(second_path.clone(), String::new(), 6),
+                ),
+            ]),
+            contents: std::collections::HashMap::from([
+                (first_path.clone(), b"first".to_vec()),
+                (second_path.clone(), b"second".to_vec()),
+            ]),
+            ..Default::default()
+        };
+        let mut engine2 = SyncEngine::with_ignore(
+            CouchDb::for_test_with_canned(remote_prefix, canned_ok),
+            LocalDb::open(&state_path).unwrap(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+        let mut touched2 = TouchTracker::new();
+        let mut cursor2 =
+            RemoteFeedCursor::new(engine2.get_checkpoint().await.unwrap().unwrap().last_seq);
+
+        for (path, size, seq, rev) in [
+            (first_path.clone(), 5, "1-first", "1-first"),
+            (second_path.clone(), 6, "2-second", "2-second"),
+        ] {
+            let entry = ChangeFeedEntry {
+                change: Change::remote_created(
+                    path.clone(),
+                    "hash".to_string(),
+                    size,
+                    Utc::now(),
+                    rev.to_string(),
+                ),
+                seq: seq.to_string(),
+            };
+            handle_remote_change(&mut engine2, &mut touched2, &IgnoreMatcher::empty(), entry)
+                .await
+                .expect("both events must apply after restart");
+            if let Some(advance_to) = cursor2.applied(seq) {
+                engine2.save_checkpoint(&advance_to).await.unwrap();
+            }
+        }
+
+        assert!(
+            root.as_path().join("first.txt").exists(),
+            "failed first event must apply after restart (never skipped)"
+        );
+        assert!(root.as_path().join("second.txt").exists());
+        let cp2 = engine2
+            .get_checkpoint()
+            .await
+            .unwrap()
+            .expect("checkpoint exists after restart");
+        assert_eq!(cp2.last_seq, "2-second");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_live_resumes_from_durable_checkpoint_not_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let canned = CannedCouch {
+            last_seq: "99-after".to_string(),
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            CouchDb::for_test_with_canned("prefix/", canned),
+            LocalDb::open_in_memory().unwrap(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let since = bootstrap_live_sync(&mut engine).await.expect("bootstrap");
+        assert_eq!(
+            since, "99-after",
+            "live feed must resume from the durable checkpoint, never from 'now'"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_live_unknown_checkpoint_after_failure_errors_not_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        // A remote change whose content cannot be fetched makes the bootstrap
+        // sync record an error and therefore NOT save a checkpoint.
+        let remote = "prefix/fail.txt".to_string();
+        let canned = CannedCouch {
+            changes: vec![Change::remote_created(
+                remote.clone(),
+                "hash".to_string(),
+                4,
+                Utc::now(),
+                "1-a".to_string(),
+            )],
+            last_seq: "99-after".to_string(),
+            metadata: std::collections::HashMap::from([(
+                remote.clone(),
+                FileDoc::new(remote.clone(), String::new(), 4),
+            )]),
+            content_errors: std::collections::HashSet::from([remote]),
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            CouchDb::for_test_with_canned("prefix/", canned),
+            LocalDb::open_in_memory().unwrap(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let result = bootstrap_live_sync(&mut engine).await;
+        assert!(
+            result.is_err(),
+            "bootstrap with no durable checkpoint must error, never start from 'now'"
+        );
+    }
+
+    // ── Live reconciliation after transient failure / watcher overflow (#6347) ─
+
+    /// Build a live engine against a canned `CouchDB` that fails the first
+    /// `save_file`/`delete_file` for the given remote path(s), so the live apply
+    /// fails transiently but a reconciliation retry succeeds.
+    fn live_engine_with_transient_failures(
+        local: LocalDb,
+        root: SyncDirPath,
+        save_once: Vec<String>,
+        delete_once: Vec<String>,
+    ) -> SyncEngine {
+        use crate::couchdb::db::CannedCouch;
+        let canned = CannedCouch {
+            save_errors_once: Arc::new(std::sync::Mutex::new(HashSet::from_iter(save_once))),
+            delete_errors_once: Arc::new(std::sync::Mutex::new(HashSet::from_iter(delete_once))),
+            ..Default::default()
+        };
+        SyncEngine::new(
+            CouchDb::for_test_with_canned("prefix/", canned),
+            local,
+            root,
+        )
+    }
+
+    #[tokio::test]
+    async fn live_transient_create_failure_marks_dirty_and_converges() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(dir.path().join("new.txt"), "hello").unwrap();
+
+        let mut engine = live_engine_with_transient_failures(
+            LocalDb::open_in_memory().expect("in-memory LocalDb"),
+            root.clone(),
+            vec!["prefix/new.txt".to_string()],
+            Vec::new(),
+        );
+        let mut reconcile = Reconcile::new(Duration::from_secs(30));
+        let touched = TouchTracker::new();
+        let change = Change::local_created("new.txt".to_string(), String::new(), 0);
+
+        // The live apply fails transiently; the path must be queued for
+        // reconciliation and the error must reach the caller (supervisor).
+        handle_local_change(&mut engine, Some(&mut reconcile), &touched, &change)
+            .await
+            .expect_err("transient upload failure must surface as an error");
+        assert!(reconcile.pending(), "failed path must be queued");
+        assert!(reconcile.dirty.contains("new.txt"));
+
+        // The reconciliation rescan retries the failed upload and converges.
+        let report = engine.sync().await.expect("reconciliation sync");
+        assert!(report.errors.is_empty(), "reconcile must not leave errors");
+        assert!(report.uploaded.0 >= 1, "the failed create must be retried");
+    }
+
+    #[tokio::test]
+    async fn live_transient_edit_failure_marks_dirty_and_converges() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(dir.path().join("edit.txt"), "v1").unwrap();
+        // Seed a tracked state, then edit the file so triage sees a change.
+        let local = LocalDb::open_in_memory().expect("in-memory LocalDb");
+        local
+            .save_file_state(&FileState::new(
+                "edit.txt".to_string(),
+                "stale-hash".to_string(),
+                2,
+                Utc::now(),
+            ))
+            .expect("seed state");
+        std::fs::write(dir.path().join("edit.txt"), "v2").unwrap();
+
+        let mut engine = live_engine_with_transient_failures(
+            local,
+            root.clone(),
+            vec!["prefix/edit.txt".to_string()],
+            Vec::new(),
+        );
+
+        let mut reconcile = Reconcile::new(Duration::from_secs(30));
+        let touched = TouchTracker::new();
+        let change = Change::local_modified("edit.txt".to_string(), String::new(), 0);
+
+        handle_local_change(&mut engine, Some(&mut reconcile), &touched, &change)
+            .await
+            .expect_err("transient upload failure must surface as an error");
+        assert!(reconcile.dirty.contains("edit.txt"));
+
+        let report = engine.sync().await.expect("reconciliation sync");
+        assert!(report.errors.is_empty(), "reconcile must not leave errors");
+        assert!(report.uploaded.0 >= 1, "the failed edit must be retried");
+    }
+
+    #[tokio::test]
+    async fn live_transient_delete_failure_marks_dirty_and_converges() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(dir.path().join("del.txt"), "data").unwrap();
+        let local = LocalDb::open_in_memory().expect("in-memory LocalDb");
+        local
+            .save_file_state(&FileState::new(
+                "del.txt".to_string(),
+                "stale-hash".to_string(),
+                4,
+                Utc::now(),
+            ))
+            .expect("seed state");
+        let mut engine = live_engine_with_transient_failures(
+            local,
+            root.clone(),
+            Vec::new(),
+            vec!["prefix/del.txt".to_string()],
+        );
+
+        let mut reconcile = Reconcile::new(Duration::from_secs(30));
+        let touched = TouchTracker::new();
+        std::fs::remove_file(dir.path().join("del.txt")).unwrap();
+        let change = Change::local_deleted("del.txt".to_string());
+
+        handle_local_change(&mut engine, Some(&mut reconcile), &touched, &change)
+            .await
+            .expect_err("transient delete failure must surface as an error");
+        assert!(reconcile.dirty.contains("del.txt"));
+
+        let report = engine.sync().await.expect("reconciliation sync");
+        assert!(report.errors.is_empty(), "reconcile must not leave errors");
+        assert!(
+            report.deleted_remote >= 1,
+            "the failed delete must be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn watcher_overflow_schedules_full_rescan_that_converges() {
+        // A file is created but its watcher event is lost to overflow (a burst
+        // larger than the channel capacity). The overflow notice sets
+        // `full_rescan`, and the bounded reconciliation converges the untracked
+        // file without another user edit.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(dir.path().join("burst.txt"), "data").unwrap();
+
+        let mut engine = live_engine_with_transient_failures(
+            LocalDb::open_in_memory().expect("in-memory LocalDb"),
+            root.clone(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut reconcile = Reconcile::new(Duration::from_secs(30));
+
+        // Watcher overflow notice consumed by the live loop.
+        reconcile.mark_full_rescan();
+        assert!(reconcile.pending(), "overflow must schedule reconciliation");
+        assert!(
+            !reconcile.dirty.contains("burst.txt"),
+            "overflow marks a full rescan, not a specific path"
+        );
+
+        let report = engine.sync().await.expect("reconciliation sync");
+        assert!(report.errors.is_empty());
+        assert!(
+            report.uploaded.0 >= 1,
+            "overflow-dropped create must converge"
+        );
+        reconcile.reset();
+        assert!(
+            !reconcile.pending(),
+            "reconciliation must clear pending work"
+        );
     }
 }

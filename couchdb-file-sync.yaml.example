@@ -25,6 +25,11 @@ sync:
   
   # File watching: debounce time in milliseconds
   debounce_ms: 500
+
+  # Live mode: how often (seconds) a bounded reconciliation rescan runs to
+  # retry local changes that failed to upload or were dropped when the file
+  # watcher overflowed. 0 disables the periodic rescan. Default: 30
+  rescan_interval_secs: 30
   
   # Batch size for bulk operations
   batch_size: 100
