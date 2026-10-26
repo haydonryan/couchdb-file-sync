@@ -280,6 +280,10 @@ pub struct SyncConfig {
     pub rescan_interval_secs: u64,
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Maximum size (bytes) of a single file that sync will upload or
+    /// download. Files larger than this are skipped and reported before full
+    /// allocation or transfer, and are never recorded as synced state. `0`
+    /// means unlimited.
     #[serde(default = "default_max_file_size")]
     pub max_file_size: u64,
     #[serde(default = "default_parallel")]
@@ -300,6 +304,13 @@ pub struct SyncConfig {
     /// it. `0` disables orphan collection.
     #[serde(default = "default_orphan_chunk_grace_secs")]
     pub orphan_chunk_grace_secs: u64,
+    /// How to interpret a chunk `data` string that carries no explicit codec.
+    /// `base64` (the default, v0.5 migration mode) decodes legacy records
+    /// written by earlier versions of this tool; `plain_text` treats them as
+    /// raw text for importing official `LiveSync` chunks. New chunks written by
+    /// this client always carry an explicit codec and are unaffected.
+    #[serde(default = "default_legacy_chunk_data")]
+    pub legacy_chunk_data: crate::models::LegacyChunkData,
 }
 
 impl Default for SyncConfig {
@@ -315,8 +326,14 @@ impl Default for SyncConfig {
             max_parallel: default_max_parallel(),
             tombstone_retention_secs: default_tombstone_retention_secs(),
             orphan_chunk_grace_secs: default_orphan_chunk_grace_secs(),
+            legacy_chunk_data: default_legacy_chunk_data(),
         }
     }
+}
+
+/// Default legacy chunk interpretation: base64 (v0.5 migration mode).
+const fn default_legacy_chunk_data() -> crate::models::LegacyChunkData {
+    crate::models::LegacyChunkData::Base64
 }
 
 /// Ignore patterns configuration

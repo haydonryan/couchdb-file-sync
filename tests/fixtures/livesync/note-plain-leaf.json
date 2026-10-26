@@ -1,0 +1,9 @@
+{
+  "_id": "h:62f6a1c2b3d4e5f6a7b8c9d0e1f2a3b4",
+  "_rev": "3-9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+  "type": "leaf",
+  "data": "# Hello, LiveSync\n\nThis is a plain-text note chunk. Official LiveSync stores text\nchunks with raw string `data` (not base64).\n",
+  "c": 0,
+  "mtime": 1720000000000,
+  "size": 121
+}
