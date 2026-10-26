@@ -93,6 +93,14 @@ impl LocalDb {
                 last_sync_at TEXT NOT NULL
             );
 
+            -- Versioned data-migration + sync bookkeeping metadata. Keys gate
+            -- one-time conservative migrations (e.g. historical remote-prefix
+            -- pollution repair) so they run exactly once per remote scope.
+            CREATE TABLE IF NOT EXISTS sync_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
             -- Indexes
             CREATE INDEX IF NOT EXISTS idx_conflicts_notified ON conflicts(notified);
             ",
@@ -484,6 +492,34 @@ impl LocalDb {
         self.clear_file_states()?;
         self.clear_conflicts()?;
         self.clear_checkpoint()?;
+        Ok(())
+    }
+
+    /// Read a key/value metadata entry used to gate one-time versioned data
+    /// migrations (see `sync_meta`). Returns `Ok(None)` when the key is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata query fails.
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT value FROM sync_meta WHERE key = ?1")?;
+        let value = stmt.query_row([key], |row| row.get(0)).optional()?;
+        Ok(value)
+    }
+
+    /// Write a key/value metadata entry used to record that a one-time
+    /// versioned data migration has run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata write fails.
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO sync_meta (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )?;
         Ok(())
     }
 }
