@@ -4,13 +4,72 @@ use std::collections::HashSet;
 use std::path::Path;
 use tracing::{debug, warn};
 
-/// A single ignore pattern entry with its negation flag.
+/// A single compiled ignore entry.
+///
+/// Each entry is compiled into either a *pathname* glob (patterns containing a
+/// `/` or `**`, matched against the full root-relative path) or a *basename*
+/// glob (slashless patterns, matched against any single path component).
+/// `dir_only` marks a trailing-`/` pattern that only matches directories, and
+/// `anchored` marks a leading-`/` slashless pattern that only matches at the
+/// sync root.
 #[derive(Debug, Clone)]
 pub struct IgnoreEntry {
-    /// The compiled glob matcher for this pattern.
-    pub matcher: GlobMatcher,
+    /// Full-path glob for patterns containing a `/` or `**`.
+    pathname: Option<GlobMatcher>,
+    /// Single-component glob for slashless patterns.
+    basename: Option<GlobMatcher>,
     /// Whether this is a negation pattern (prefixed with `!`).
-    pub is_negation: bool,
+    is_negation: bool,
+    /// Whether the pattern ends with `/`, so it only matches directories.
+    dir_only: bool,
+    /// Whether the pattern starts with `/`, anchoring a slashless pattern to
+    /// the sync root. Pathname patterns are inherently root-anchored.
+    anchored: bool,
+}
+
+impl IgnoreEntry {
+    /// Whether this entry matches `path` (root-relative) as a file or
+    /// directory. A pattern that excludes an ancestor directory excludes
+    /// everything beneath it, so every ancestor prefix is checked too.
+    fn matches(&self, path: &str, is_dir: bool) -> bool {
+        let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        for i in 0..comps.len() {
+            let prefix = comps[..=i].join("/");
+            let prefix_is_dir = i < comps.len() - 1 || is_dir;
+            if self.matches_prefix(&prefix, prefix_is_dir) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether this entry matches a single root-relative path prefix.
+    fn matches_prefix(&self, prefix: &str, is_dir: bool) -> bool {
+        if let Some(basename) = &self.basename {
+            let last = prefix.rsplit('/').next().unwrap_or(prefix);
+            if !basename.is_match(last) {
+                return false;
+            }
+            // A leading-`/` slashless pattern is anchored to the root.
+            if self.anchored && prefix.contains('/') {
+                return false;
+            }
+            if self.dir_only && !is_dir {
+                return false;
+            }
+            true
+        } else if let Some(pathname) = &self.pathname {
+            if !pathname.is_match(prefix) {
+                return false;
+            }
+            if self.dir_only && !is_dir {
+                return false;
+            }
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Manages ignore patterns from .sync-ignore files
@@ -120,15 +179,25 @@ impl IgnoreMatcher {
     fn parse_patterns(content: &str, strict: bool) -> anyhow::Result<Vec<IgnoreEntry>> {
         let mut patterns = Vec::new();
 
-        for line in content.lines() {
+        for raw in content.lines() {
+            // A leading `\#` or `\!` escapes the comment/negation marker so the
+            // pattern matches a literal `#` or `!` (gitignore semantics).
+            let (escaped_marker, line) = if raw.starts_with("\\#") || raw.starts_with("\\!") {
+                (true, &raw[1..])
+            } else {
+                (false, raw)
+            };
             let line = line.trim();
 
             // Skip empty lines and comments
-            if line.is_empty() || line.starts_with('#') {
+            if line.is_empty() {
+                continue;
+            }
+            if !escaped_marker && line.starts_with('#') {
                 continue;
             }
 
-            let is_negation = line.starts_with('!');
+            let is_negation = !escaped_marker && line.starts_with('!');
             let pattern_str = if is_negation { &line[1..] } else { line };
 
             // Skip empty patterns after removing !
@@ -137,9 +206,9 @@ impl IgnoreMatcher {
                 continue;
             }
 
-            // Convert gitignore pattern to glob
-            let glob = match Self::pattern_to_glob(pattern_str) {
-                Ok(glob) => glob,
+            // Convert gitignore pattern to a compiled entry
+            let entry = match Self::compile_pattern(pattern_str, is_negation) {
+                Ok(entry) => entry,
                 Err(e) => {
                     if strict {
                         return Err(anyhow::anyhow!(
@@ -151,62 +220,95 @@ impl IgnoreMatcher {
                 }
             };
 
-            patterns.push(IgnoreEntry {
-                matcher: glob.compile_matcher(),
-                is_negation,
-            });
+            patterns.push(entry);
             debug!("Added ignore pattern: {} (negation: {})", line, is_negation);
         }
 
         Ok(patterns)
     }
 
-    /// Convert a gitignore-style pattern to a glob pattern
-    fn pattern_to_glob(pattern: &str) -> anyhow::Result<Glob> {
-        let mut glob_pattern = String::new();
+    /// Compile a gitignore-style pattern into a matcher entry.
+    fn compile_pattern(pattern: &str, is_negation: bool) -> anyhow::Result<IgnoreEntry> {
+        let mut pat = pattern;
+        let mut dir_only = false;
+        let mut anchored = false;
 
-        // Handle patterns starting with **/ (match at any depth)
-        let remaining_pattern = if let Some(stripped) = pattern.strip_prefix("**/") {
-            glob_pattern.push_str("**/");
-            stripped
-        } else if pattern.contains('/') {
-            // Contains path separator - exact or prefix match
-            glob_pattern.push_str(pattern);
-            pattern
-        } else {
-            // No path separator - match in any directory
-            glob_pattern.push_str("**/");
-            glob_pattern.push_str(pattern);
-            pattern
-        };
-
-        // Handle directory patterns (ending with /)
-        if remaining_pattern.ends_with('/') {
-            glob_pattern.push_str("**/*");
+        // A trailing `/` restricts the pattern to directories.
+        if pat.ends_with('/') {
+            dir_only = true;
+            pat = &pat[..pat.len() - 1];
+        }
+        // A leading `/` anchors a slashless pattern to the sync root.
+        if pat.starts_with('/') {
+            anchored = true;
+            pat = &pat[1..];
+        }
+        if pat.is_empty() {
+            anyhow::bail!("empty pattern");
         }
 
-        Ok(Glob::new(&glob_pattern)?)
+        // Patterns containing a path separator or `**` match across separators
+        // against the full root-relative path; slashless patterns match a
+        // single component at any depth.
+        let matcher = Glob::new(pat)?;
+        if pat.contains('/') || pat.contains("**") {
+            Ok(IgnoreEntry {
+                pathname: Some(matcher.compile_matcher()),
+                basename: None,
+                is_negation,
+                dir_only,
+                anchored,
+            })
+        } else {
+            Ok(IgnoreEntry {
+                pathname: None,
+                basename: Some(matcher.compile_matcher()),
+                is_negation,
+                dir_only,
+                anchored,
+            })
+        }
     }
 
-    /// Check if a path matches any ignore pattern
+    /// Check if a path matches any ignore pattern, honoring gitignore ordering
+    /// and negation semantics. An ancestor directory that ends up excluded
+    /// excludes the whole subtree beneath it (matching git's rule that a file
+    /// inside an excluded directory cannot be re-included).
     #[must_use]
-    pub fn is_ignored(&self, path: &str, _is_dir: bool) -> bool {
-        let mut ignored = false;
+    pub fn is_ignored(&self, path: &str, is_dir: bool) -> bool {
+        let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        if comps.is_empty() {
+            return false;
+        }
 
-        for entry in &self.patterns {
-            if entry.matcher.is_match(path) {
-                ignored = !entry.is_negation;
+        let mut excluded = false;
+        for i in 0..comps.len() {
+            let prefix = comps[..=i].join("/");
+            let prefix_is_dir = i < comps.len() - 1 || is_dir;
+
+            // Apply every pattern in order; the last match wins, so a negation
+            // can re-include a path an earlier pattern excluded.
+            for entry in &self.patterns {
+                if entry.matches_prefix(&prefix, prefix_is_dir) {
+                    excluded = !entry.is_negation;
+                }
+            }
+
+            // An excluded directory hides everything below it.
+            if prefix_is_dir && i < comps.len() - 1 && excluded {
+                return true;
             }
         }
 
-        ignored
+        excluded
     }
 
-    /// Returns true if any pattern (positive or negation) matches the path.
-    fn has_matching_pattern(&self, path: &str) -> bool {
+    /// Returns true if any pattern (positive or negation) matches the path or
+    /// an ancestor directory of it.
+    fn has_matching_pattern(&self, path: &str, is_dir: bool) -> bool {
         self.patterns
             .iter()
-            .any(|entry| entry.matcher.is_match(path))
+            .any(|entry| entry.matches(path, is_dir))
     }
 
     /// Check if a file should be ignored
@@ -237,7 +339,7 @@ impl IgnoreMatcher {
             // An explicit pattern takes precedence over the default dotfile
             // rule, so a negation (e.g. `!.env`) can re-include a dotfile.
             // When no pattern matches the dotfile, keep the default ignore.
-            if !self.has_matching_pattern(&path_str) {
+            if !self.has_matching_pattern(&path_str, path.is_dir()) {
                 return true;
             }
         }
@@ -320,5 +422,79 @@ mod tests {
         // A positive pattern still wins over the dotfile default re-include.
         let matcher = IgnoreMatcher::from_content("!.env\n.env");
         assert!(matcher.should_ignore(Path::new(".env")));
+    }
+
+    #[test]
+    fn test_gitignore_semantics_table() {
+        // (pattern, path, is_dir, expected_ignored)
+        let cases: &[(&str, &str, bool, bool)] = &[
+            // Root anchoring: a leading `/` matches only at the sync root.
+            ("/secret.txt", "secret.txt", false, true),
+            ("/secret.txt", "dir/secret.txt", false, false),
+            ("/cache", "cache", true, true),
+            ("/cache", "nested/cache", true, false),
+            // Slashless directory-only pattern matches at any depth.
+            ("cache/", "cache/x.txt", false, true),
+            ("cache/", "nested/cache/a.txt", false, true),
+            ("cache/", "a/b/cache/y.txt", false, true),
+            ("cache/", "cache.txt", false, false),
+            ("cache/", "visible.txt", false, false),
+            // Slashless name matches the directory and everything beneath it.
+            ("private", "private", true, true),
+            ("private", "private/a.txt", false, true),
+            ("private", "a/private/x.txt", false, true),
+            ("private", "privatex", false, false),
+            // ** patterns match at any depth, leaving unrelated files visible.
+            ("**/cache/", "cache/x.txt", false, true),
+            ("**/cache/", "a/b/cache/y.txt", false, true),
+            ("**/cache/", "visible.txt", false, false),
+            ("**/cache/", "cache.txt", false, false),
+            ("**/target", "target", true, true),
+            ("**/target", "a/b/target", true, true),
+            // Internal-slash patterns are relative to the sync root.
+            ("docs/*.md", "docs/readme.md", false, true),
+            ("docs/*.md", "sub/docs/readme.md", false, false),
+        ];
+
+        for (i, (pattern, path, is_dir, expected)) in cases.iter().enumerate() {
+            let matcher = IgnoreMatcher::from_content(pattern);
+            assert_eq!(
+                matcher.is_ignored(path, *is_dir),
+                *expected,
+                "case {i}: pattern {pattern:?} vs {path:?} (dir={is_dir})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ordered_negation_and_ancestor_exclusion() {
+        // A negation after a positive re-includes the path.
+        let matcher = IgnoreMatcher::from_content("*.log\n!important.log");
+        assert!(!matcher.is_ignored("important.log", false));
+        assert!(matcher.is_ignored("debug.log", false));
+        // Order matters: a positive after a negation wins.
+        let matcher = IgnoreMatcher::from_content("!important.log\n*.log");
+        assert!(matcher.is_ignored("important.log", false));
+        // A file inside an excluded directory cannot be re-included.
+        let matcher = IgnoreMatcher::from_content("cache/\n!cache/keep.txt");
+        assert!(matcher.is_ignored("cache/keep.txt", false));
+        // Re-including the directory itself allows its contents again.
+        let matcher = IgnoreMatcher::from_content("cache/\n!cache/");
+        assert!(!matcher.is_ignored("cache/keep.txt", false));
+    }
+
+    #[test]
+    fn test_escaped_literals() {
+        // \# at line start is a literal #, not a comment.
+        let matcher = IgnoreMatcher::from_content("\\#secret");
+        assert!(matcher.is_ignored("#secret", false));
+        assert!(!matcher.is_ignored("other", false));
+        // \! at line start is a literal !, not a negation.
+        let matcher = IgnoreMatcher::from_content("\\!bang");
+        assert!(matcher.is_ignored("!bang", false));
+        // \* inside a pattern is a literal asterisk.
+        let matcher = IgnoreMatcher::from_content("\\*foo");
+        assert!(matcher.is_ignored("*foo", false));
+        assert!(!matcher.is_ignored("xfoo", false));
     }
 }
