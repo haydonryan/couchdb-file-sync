@@ -739,6 +739,56 @@ mod tests {
     }
 
     #[test]
+    fn test_process_event_directory_rename_emits_dir_scoped_changes() {
+        // Story #6350: a real AsyncFileWatcher rename probe of a populated
+        // directory emits events only for the top-level directory path, with
+        // no child paths. A directory move therefore produces LocalDeleted(old)
+        // + LocalCreated(new) for the directory itself. These directory-scoped
+        // changes must not be applied as single files (an upload would try to
+        // read the directory and fail); the live loop routes them to a subtree
+        // reconciliation rescan via `is_directory_scoped`.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let sender = EventSender::new(tx, tokio::sync::mpsc::channel(1).0, Duration::from_secs(1));
+        let matcher = IgnoreMatcher::empty();
+        let root = Path::new("/root");
+        let watcher = test_watcher(root);
+
+        let event = debounced_event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            vec![PathBuf::from("/root/olddir"), PathBuf::from("/root/newdir")],
+        );
+
+        process_event(&event, &sender, &matcher, root);
+
+        let mut changes = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let Some(change) = watcher.event_to_change(ev) {
+                changes.push(change);
+            }
+        }
+
+        assert_eq!(changes.len(), 2, "directory rename must yield two changes");
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path() == "olddir" && c.change_type() == ChangeType::Deleted),
+            "directory move-out must emit a LocalDeleted for the old path"
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path() == "newdir" && c.change_type() == ChangeType::Created),
+            "directory move-in must emit a LocalCreated for the new path"
+        );
+        assert!(
+            changes
+                .iter()
+                .all(|c| c.path() != "olddir/x.txt" && c.path() != "newdir/x.txt"),
+            "directory events must not carry child paths (the rescan expands the subtree)"
+        );
+    }
+
+    #[test]
     fn test_process_event_rename_both_single_path_does_nothing() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let sender = EventSender::new(tx, tokio::sync::mpsc::channel(1).0, Duration::from_secs(1));
