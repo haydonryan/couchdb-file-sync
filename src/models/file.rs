@@ -1,8 +1,16 @@
+use anyhow::{Result, anyhow, bail};
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use couch_rs::document::TypedCouchDocument;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fmt;
+
+/// Official Obsidian `LiveSync` marks LZ-compressed chunk data with this leading
+/// marker (`\u000eLZ\u001d`). This tool does not implement the decompressor, so
+/// any chunk carrying it is an unsupported binary format and must fail rather
+/// than be silently reinterpreted as text or base64.
+const LIVESYNC_COMPRESSED_MARKER: &[u8] = &[0x0E, 0x4C, 0x5A, 0x1D];
 
 /// Document type enum replacing arbitrary String
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,36 +214,55 @@ impl FileDoc {
     }
 }
 
-/// Custom serde adapter that base64-encodes arbitrary bytes to a JSON string
-/// and decodes them back, so chunk content survives JSON transport losslessly
-/// even when it is not valid UTF-8.
-mod b64 {
-    use base64::Engine;
-    use serde::{Deserialize, Deserializer, Serializer};
+/// Content codec for a chunk document's `data` string.
+///
+/// Every chunk written by this client carries an explicit codec so its
+/// `data` field is never ambiguous. Records lacking a codec are legacy
+/// (either old v0.5 base64 chunks or official `LiveSync` plain-text chunks);
+/// their interpretation is governed by [`LegacyChunkData`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ChunkCodec {
+    /// Native base64-encoded arbitrary bytes (this project's encoded form).
+    #[default]
+    Base64,
+    /// Official `LiveSync` plain-text chunk: `data` is a raw UTF-8 string.
+    Plain,
+}
 
-    pub fn serialize<S: Serializer>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(data))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-        let encoded = String::deserialize(deserializer)?;
-        base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(serde::de::Error::custom)
-    }
+/// Policy for interpreting a legacy chunk `data` string that carries no
+/// explicit `codec`.
+///
+/// A legacy record is inherently ambiguous: it could be a v0.5 base64-encoded
+/// chunk written by this tool, or a raw plain-text chunk written by official
+/// `LiveSync`. The two cannot be told apart, so the operator picks the policy
+/// that matches the database they are syncing. New chunks written by this
+/// client always carry a codec and are unaffected by this policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyChunkData {
+    /// Migration mode: an untagged `data` string is base64-encoded bytes
+    /// (v0.5 records written by earlier versions of this tool).
+    #[default]
+    Base64,
+    /// `LiveSync` plain-text import mode: an untagged `data` string is raw
+    /// text and is NOT base64-reinterpreted.
+    PlainText,
 }
 
 /// Chunk document containing actual file content
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkDoc {
     #[serde(rename = "_id")]
     pub id: String,
     #[serde(rename = "_rev", skip_serializing_if = "Option::is_none")]
     pub rev: Option<String>,
-    /// The actual content data, base64-encoded on the wire so arbitrary
-    /// (non-UTF-8) bytes survive JSON transport losslessly.
-    #[serde(with = "b64", default)]
-    pub data: Vec<u8>,
+    /// The content as it appears on the wire: a JSON string. For a native
+    /// record (`codec: base64`) this is base64-encoded bytes; for a `LiveSync`
+    /// plain chunk it is raw text. Use [`ChunkDoc::content_bytes`] with a
+    /// legacy policy to decode it.
+    #[serde(default)]
+    pub data: String,
     /// Document type: "leaf" for chunks
     #[serde(rename = "type", default)]
     pub doc_type: DocType,
@@ -247,6 +274,71 @@ pub struct ChunkDoc {
     /// chunks leave this `0`.
     #[serde(default)]
     pub created_at: TimestampMillis,
+    /// Explicit content codec for `data`. Absent on legacy (v0.5 / `LiveSync`)
+    /// records; [`ChunkDoc::content_bytes`] then applies the configured
+    /// [`LegacyChunkData`] policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<ChunkCodec>,
+}
+
+impl ChunkDoc {
+    /// Build a native chunk whose content is base64-encoded on the wire with
+    /// an explicit `base64` codec, so it is never mistaken for raw text on
+    /// read-back.
+    #[must_use]
+    pub fn new_encoded(id: String, content: Vec<u8>) -> Self {
+        Self {
+            id,
+            rev: None,
+            data: base64::engine::general_purpose::STANDARD.encode(content),
+            doc_type: DocType::Leaf,
+            created_at: TimestampMillis::now(),
+            codec: Some(ChunkCodec::Base64),
+        }
+    }
+
+    /// Decode the chunk content to raw bytes.
+    ///
+    /// An explicit `codec` is authoritative. When it is absent (a
+    /// legacy/ambiguous record), the supplied `legacy` policy decides whether
+    /// the string is base64 (v0.5 migration) or raw plain text (`LiveSync`
+    /// import). Invalid base64, an unsupported codec, or official `LiveSync`
+    /// compressed data yields an error rather than silently corrupting the
+    /// bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a base64 record contains invalid base64, or when
+    /// the data carries the official `LiveSync` LZ-compressed marker (an
+    /// unsupported binary format).
+    pub fn content_bytes(&self, legacy: LegacyChunkData) -> Result<Vec<u8>> {
+        // Official LiveSync marks LZ-compressed chunks with a leading marker
+        // (`\u000eLZ\u001d`). Treating those bytes as text or base64 would
+        // silently corrupt the file, so fail per-chunk instead.
+        if self.data.as_bytes().starts_with(LIVESYNC_COMPRESSED_MARKER) {
+            bail!(
+                "chunk {} uses unsupported LiveSync compressed format; refusing to decode",
+                self.id
+            );
+        }
+        let use_base64 = match self.codec {
+            Some(ChunkCodec::Plain) => false,
+            Some(ChunkCodec::Base64) => true,
+            None => matches!(legacy, LegacyChunkData::Base64),
+        };
+        if use_base64 {
+            base64::engine::general_purpose::STANDARD
+                .decode(&self.data)
+                .map_err(|e| {
+                    anyhow!(
+                        "chunk {} has invalid base64 data (unsupported or corrupt format): {e}",
+                        self.id
+                    )
+                })
+        } else {
+            Ok(self.data.as_bytes().to_vec())
+        }
+    }
 }
 
 impl TypedCouchDocument for FileDoc {
@@ -601,13 +693,137 @@ mod tests {
         let chunk = ChunkDoc {
             id: "h:chunk1".into(),
             rev: Some("1-rev".into()),
-            data: b"file content here".to_vec(),
+            data: "ZmlsZSBjb250ZW50IGhlcmU=".into(), // base64("file content here")
             doc_type: DocType::Leaf,
             created_at: TimestampMillis::new(1234),
+            codec: Some(ChunkCodec::Base64),
         };
         assert_eq!(chunk.id, "h:chunk1");
-        assert_eq!(chunk.data, b"file content here".to_vec());
+        assert_eq!(chunk.data, "ZmlsZSBjb250ZW50IGhlcmU=");
         assert_eq!(chunk.doc_type, DocType::Leaf);
+        assert_eq!(
+            chunk.content_bytes(LegacyChunkData::Base64).unwrap(),
+            b"file content here"
+        );
+    }
+
+    #[test]
+    fn test_new_encoded_writes_explicit_base64_codec() {
+        let chunk = ChunkDoc::new_encoded("h:c".into(), b"arbitrary \xFF\x00 bytes".to_vec());
+        assert_eq!(chunk.codec, Some(ChunkCodec::Base64));
+        // The wire form is base64 and decodes back byte-identically regardless
+        // of the legacy policy, because the explicit codec is authoritative.
+        assert_eq!(
+            chunk.content_bytes(LegacyChunkData::PlainText).unwrap(),
+            b"arbitrary \xFF\x00 bytes"
+        );
+        assert_eq!(
+            chunk.content_bytes(LegacyChunkData::Base64).unwrap(),
+            b"arbitrary \xFF\x00 bytes"
+        );
+    }
+
+    #[test]
+    fn test_explicit_plain_codec_is_never_base64_reinterpreted() {
+        // "YWJj" is raw text (4 bytes) but is also valid base64 for "abc".
+        // With an explicit Plain codec it must decode to the raw text bytes.
+        let chunk = ChunkDoc {
+            id: "h:p".into(),
+            rev: None,
+            data: "YWJj".into(),
+            doc_type: DocType::Leaf,
+            created_at: TimestampMillis::new(0),
+            codec: Some(ChunkCodec::Plain),
+        };
+        assert_eq!(
+            chunk.content_bytes(LegacyChunkData::Base64).unwrap(),
+            b"YWJj",
+            "explicit Plain codec must win over the base64 legacy policy"
+        );
+    }
+
+    #[test]
+    fn test_legacy_untagged_data_respects_migration_mode() {
+        // v0.5 untagged base64 record: decodes as base64 in migration mode,
+        // and (documented tradeoff) as raw text in plain-text import mode.
+        let chunk = ChunkDoc {
+            id: "h:v05".into(),
+            rev: None,
+            data: "YWJj".into(), // base64("abc")
+            doc_type: DocType::Leaf,
+            created_at: TimestampMillis::new(0),
+            codec: None,
+        };
+        assert_eq!(
+            chunk.content_bytes(LegacyChunkData::Base64).unwrap(),
+            b"abc",
+            "v0.5 migration mode decodes untagged data as base64"
+        );
+        assert_eq!(
+            chunk.content_bytes(LegacyChunkData::PlainText).unwrap(),
+            b"YWJj",
+            "plain-text import mode reads untagged data as raw text"
+        );
+    }
+
+    #[test]
+    fn test_invalid_base64_untagged_fails_instead_of_corrupting() {
+        let chunk = ChunkDoc {
+            id: "h:bad".into(),
+            rev: None,
+            data: "!!!not base64!!!".into(),
+            doc_type: DocType::Leaf,
+            created_at: TimestampMillis::new(0),
+            codec: None,
+        };
+        let err = chunk
+            .content_bytes(LegacyChunkData::Base64)
+            .expect_err("invalid base64 must error, not corrupt");
+        assert!(err.to_string().contains("invalid base64"), "{err}");
+    }
+
+    #[test]
+    fn test_unsupported_codec_fails_deserialization() {
+        // An unknown codec value (e.g. a future binary/encrypted format) must
+        // fail per-record rather than being silently reinterpreted.
+        let raw = r#"{"_id":"h:x","type":"leaf","data":"abc","codec":"encrypted"}"#;
+        let err = serde_json::from_str::<ChunkDoc>(raw)
+            .expect_err("unknown codec must fail deserialization");
+        assert!(err.to_string().contains("unknown variant"), "{err}");
+    }
+
+    #[test]
+    fn test_unsupported_metadata_type_fails_deserialization() {
+        // A chunk whose `type` (metadata) we do not support must fail rather
+        // than be treated as plain/leaf content.
+        let raw = r#"{"_id":"h:x","type":"encrypted","data":"abc"}"#;
+        let err = serde_json::from_str::<ChunkDoc>(raw)
+            .expect_err("unknown doc_type must fail deserialization");
+        assert!(err.to_string().contains("unknown variant"), "{err}");
+    }
+
+    #[test]
+    fn test_livesync_compressed_chunk_fails_in_both_modes() {
+        // Official LiveSync LZ-compressed chunks carry a marker prefix. They
+        // are unsupported and must fail in either legacy mode rather than
+        // being silently read as text/base64.
+        let chunk = ChunkDoc {
+            id: "h:z".into(),
+            rev: None,
+            data: "\u{000E}LZ\u{001D}<lz-bytes>".into(),
+            doc_type: DocType::Leaf,
+            created_at: TimestampMillis::new(0),
+            codec: None,
+        };
+        for legacy in [LegacyChunkData::Base64, LegacyChunkData::PlainText] {
+            let err = chunk
+                .content_bytes(legacy)
+                .expect_err("compressed chunk must be rejected");
+            assert!(
+                err.to_string().contains("unsupported LiveSync compressed"),
+                "{err}"
+            );
+        }
     }
     #[test]
     fn test_file_doc_merge_ids() {

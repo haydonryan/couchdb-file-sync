@@ -106,6 +106,9 @@ pub struct CouchDb {
     /// Maximum total attempts (including the initial one) for a `CouchDB`
     /// operation before giving up on transient connectivity failures.
     retry_attempts: u32,
+    /// How to interpret legacy chunk `data` strings that carry no explicit
+    /// codec (see [`LegacyChunkData`]).
+    legacy_chunk_data: crate::models::LegacyChunkData,
     /// Test-only canned responses used to exercise the sync pipeline without a
     /// live `CouchDB` server. Only present in test builds.
     #[cfg(test)]
@@ -286,6 +289,7 @@ impl CouchDb {
             remote_path: RemotePath::new(remote_path.to_string()),
             timeout_seconds,
             retry_attempts,
+            legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             #[cfg(test)]
             test_state: None,
             #[cfg(test)]
@@ -293,6 +297,15 @@ impl CouchDb {
             #[cfg(test)]
             test_backoff: Duration::from_millis(1),
         })
+    }
+
+    /// Set how to interpret legacy chunk `data` strings that carry no explicit
+    /// codec (see [`LegacyChunkData`]). Defaults to the v0.5 `base64` migration
+    /// mode.
+    #[must_use]
+    pub const fn with_legacy_chunk_data(mut self, legacy: crate::models::LegacyChunkData) -> Self {
+        self.legacy_chunk_data = legacy;
+        self
     }
 
     async fn get_update_seq(&self) -> Result<String> {
@@ -362,6 +375,7 @@ impl CouchDb {
             remote_path: RemotePath::new(remote_path.to_string()),
             timeout_seconds: 30,
             retry_attempts: 3,
+            legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             #[cfg(test)]
             test_state: None,
             #[cfg(test)]
@@ -407,6 +421,7 @@ impl CouchDb {
             remote_path: RemotePath::new(remote_path.to_string()),
             timeout_seconds: 30,
             retry_attempts: 3,
+            legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             test_state: None,
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),
             test_backoff: Duration::from_millis(1),
@@ -1098,7 +1113,7 @@ impl CouchDb {
                     "Chunk {chunk_id} not found for file {path}; refusing to return partial content"
                 );
             };
-            content.extend_from_slice(&chunk.data);
+            content.extend_from_slice(&chunk.content_bytes(self.legacy_chunk_data)?);
         }
 
         Ok(content)
@@ -1161,13 +1176,7 @@ impl CouchDb {
         }
 
         let chunk_id = Self::generate_chunk_id();
-        let chunk = ChunkDoc {
-            id: chunk_id.clone(),
-            rev: None,
-            data: content,
-            doc_type: crate::models::DocType::Leaf,
-            created_at: crate::models::TimestampMillis::now(),
-        };
+        let chunk = ChunkDoc::new_encoded(chunk_id.clone(), content);
 
         self.save_chunk(&chunk).await?;
 
@@ -1455,6 +1464,7 @@ mod tests {
             remote_path: RemotePath::new(remote_path.to_string()),
             timeout_seconds: 30,
             retry_attempts: 3,
+            legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             test_state: None,
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),
             test_backoff: Duration::from_millis(1),
@@ -1790,6 +1800,7 @@ mod tests {
             remote_path: RemotePath::new(String::new()),
             timeout_seconds: 30,
             retry_attempts: 3,
+            legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             test_state: None,
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),
             test_backoff: Duration::from_millis(1),
@@ -1965,6 +1976,7 @@ mod tests {
             remote_path: RemotePath::new(remote_path.to_string()),
             timeout_seconds: 30,
             retry_attempts: 3,
+            legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             test_state: None,
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),
             test_backoff: Duration::from_millis(1),
@@ -1990,6 +2002,7 @@ mod tests {
             remote_path: RemotePath::new(remote_path.to_string()),
             timeout_seconds,
             retry_attempts: 3,
+            legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             test_state: None,
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),
             test_backoff: Duration::from_millis(1),
@@ -3123,6 +3136,7 @@ mod tests {
             remote_path: RemotePath::new(String::new()),
             timeout_seconds: 30,
             retry_attempts: 3,
+            legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             test_state: None,
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),
             test_backoff: Duration::from_millis(1),

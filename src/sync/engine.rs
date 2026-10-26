@@ -2408,7 +2408,7 @@ mod tests {
     use crate::couchdb::db::{CannedCouch, ConcurrencyProbe};
     use crate::local::{LocalDb, compute_bytes_hash, compute_file_hash};
     use crate::models::{
-        Change, ChunkDoc, CouchRev, DocType, FileDoc, IgnoreMatcher, TimestampMillis,
+        Change, ChunkCodec, ChunkDoc, CouchRev, DocType, FileDoc, IgnoreMatcher, TimestampMillis,
     };
     use chrono::{Duration, Utc};
     use std::path::PathBuf;
@@ -3707,9 +3707,10 @@ mod tests {
         let shared_chunk = ChunkDoc {
             id: shared_chunk_id.to_string(),
             rev: Some("1-ccc".to_string()),
-            data: b"aaaaa".to_vec(),
+            data: "YWFhYWE=".to_string(), // base64("aaaaa")
             doc_type: DocType::Leaf,
             created_at: TimestampMillis::new(1000),
+            codec: Some(ChunkCodec::Base64),
         };
         seed.insert(
             shared_chunk_id.to_string(),

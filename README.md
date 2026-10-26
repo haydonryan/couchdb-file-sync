@@ -220,9 +220,41 @@ database name, the remote database UUID, and the normalized prefix. If any of
 those change (for example, you point the same directory at a different prefix,
 a different database, or a recreated database), the old state is **not** reused.
 The affected command errors and asks you to run `couchdb-file-sync
-rebuild-remote` or `rebuild-local` — the sanctioned explicit reset for the new
+`rebuild-remote` or `rebuild-local` — the sanctioned explicit reset for the new
 mapping. The daemon also refuses to start if two configured paths resolve to
 the same canonical root.
+
+#### Chunk encoding and LiveSync plain-text interop
+
+File content is stored in `leaf` chunk documents. Every chunk written by this
+tool carries an explicit `codec` field (`"base64"`) plus a base64-encoded
+`data` string, so arbitrary (non-UTF-8) file bytes survive JSON transport
+losslessly and the encoding is never ambiguous on read-back.
+
+Official Obsidian LiveSync databases store text chunks differently: their leaf
+`data` is a **raw plain-text string** with no `codec` field, and their metadata
+documents use distinct `plain`/`new` types. Because an untagged `data` string
+is inherently ambiguous — it could be a v0.5 base64 chunk written by an older
+version of this tool, or a raw LiveSync text chunk — the operator picks the
+interpretation with the `sync.legacy_chunk_data` config option:
+
+- **`base64`** (default, *migration mode*): untagged `data` strings are treated
+  as base64-encoded bytes. Use this when continuing to sync a database written
+  by earlier versions of this tool (v0.5 untagged base64 records).
+- **`plain_text`** (*LiveSync plain-text import mode*): untagged `data` strings
+  are treated as raw text and are **not** base64-reinterpreted. Use this when
+  importing/reading text chunks from an official LiveSync database.
+
+New chunks written by this client always carry the explicit `codec`, so they
+are read correctly in either mode. Unsupported or corrupt content — invalid
+base64 in base64 mode, official LiveSync LZ-compressed chunks (identified by
+their marker prefix), or an unknown `codec`/`type` value — fails **per chunk**
+rather than silently corrupting the file bytes.
+
+```yaml
+sync:
+  legacy_chunk_data: plain_text   # or base64 (default)
+```
 
 ## CLI Commands
 

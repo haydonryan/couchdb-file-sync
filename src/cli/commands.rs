@@ -541,7 +541,8 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
         config.couchdb.timeout_seconds,
         config.couchdb.retry_attempts,
     )
-    .await?;
+    .await?
+    .with_legacy_chunk_data(config.sync.legacy_chunk_data);
 
     // Validate that the stored state belongs to the current mapping before
     // reusing it (conservatively binding fresh/legacy state).
@@ -613,7 +614,8 @@ pub async fn rebuild_remote(path: PathBuf, config: AppConfig) -> Result<SyncRepo
         config.couchdb.timeout_seconds,
         config.couchdb.retry_attempts,
     )
-    .await?;
+    .await?
+    .with_legacy_chunk_data(config.sync.legacy_chunk_data);
 
     // Rebuild is the explicit decision to reset state for the current mapping.
     let root = resolve_sync_dir(&path)?;
@@ -654,7 +656,8 @@ pub async fn rebuild_local(path: PathBuf, config: AppConfig) -> Result<SyncRepor
         config.couchdb.timeout_seconds,
         config.couchdb.retry_attempts,
     )
-    .await?;
+    .await?
+    .with_legacy_chunk_data(config.sync.legacy_chunk_data);
 
     // Rebuild is the explicit decision to reset state for the current mapping.
     let root = resolve_sync_dir(&path)?;
@@ -1139,7 +1142,8 @@ async fn daemon_sync(
         config.couchdb.timeout_seconds,
         config.couchdb.retry_attempts,
     )
-    .await?;
+    .await?
+    .with_legacy_chunk_data(config.sync.legacy_chunk_data);
 
     // Validate that the stored state belongs to the current mapping before
     // reusing it (conservatively binding fresh/legacy state).
@@ -1798,7 +1802,8 @@ async fn build_live_sync_engine(
         config.couchdb.timeout_seconds,
         config.couchdb.retry_attempts,
     )
-    .await?;
+    .await?
+    .with_legacy_chunk_data(config.sync.legacy_chunk_data);
 
     let sync_dir = resolve_sync_dir(path)?;
     let identity = sync_identity_for(
@@ -2009,7 +2014,8 @@ async fn run_remote_changes(
         config.couchdb.timeout_seconds,
         config.couchdb.retry_attempts,
     )
-    .await?;
+    .await?
+    .with_legacy_chunk_data(config.sync.legacy_chunk_data);
 
     loop {
         // Budget the live long-poll wait from the configured timeout so it
@@ -2362,7 +2368,8 @@ pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
         config.couchdb.timeout_seconds,
         config.couchdb.retry_attempts,
     )
-    .await?;
+    .await?
+    .with_legacy_chunk_data(config.sync.legacy_chunk_data);
 
     let root = resolve_sync_dir(&path)?;
     let identity = sync_identity_for(

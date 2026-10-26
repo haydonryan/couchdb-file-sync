@@ -53,6 +53,13 @@ sync:
   # Default: 300 (5 minutes)
   orphan_chunk_grace_secs: 300
 
+  # How to interpret a chunk `data` string that carries no explicit codec.
+  # "base64" (default, v0.5 migration mode) decodes legacy records written by
+  # earlier versions of this tool; "plain_text" treats them as raw text for
+  # importing official LiveSync chunks. New chunks always carry a codec.
+  # Default: base64
+  # legacy_chunk_data: base64
+
 # Ignore patterns (alternative to .sync-ignore file)
 ignore:
   patterns:
