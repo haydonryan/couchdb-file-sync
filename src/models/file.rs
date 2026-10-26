@@ -239,9 +239,40 @@ pub struct ChunkDoc {
     /// Document type: "leaf" for chunks
     #[serde(rename = "type", default)]
     pub doc_type: DocType,
+    /// Creation time in milliseconds since epoch, stamped when a chunk is
+    /// uploaded. Lets the orphan collector distinguish a long-orphaned chunk
+    /// from one that is merely mid-publication (a chunk written by this or a
+    /// concurrent client whose metadata document has not landed yet), so
+    /// in-flight content is never collected. Older or externally-created
+    /// chunks leave this `0`.
+    #[serde(default)]
+    pub created_at: TimestampMillis,
 }
 
 impl TypedCouchDocument for FileDoc {
+    fn get_id(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.id)
+    }
+
+    fn get_rev(&self) -> Cow<'_, str> {
+        Cow::Borrowed(self.rev.as_deref().unwrap_or(""))
+    }
+
+    fn set_rev(&mut self, rev: &str) {
+        self.rev = Some(rev.to_string());
+    }
+
+    fn set_id(&mut self, id: &str) {
+        self.id = id.to_string();
+    }
+
+    fn merge_ids(&mut self, other: &Self) {
+        self.id.clone_from(&other.id);
+        self.rev.clone_from(&other.rev);
+    }
+}
+
+impl TypedCouchDocument for ChunkDoc {
     fn get_id(&self) -> Cow<'_, str> {
         Cow::Borrowed(&self.id)
     }
@@ -572,6 +603,7 @@ mod tests {
             rev: Some("1-rev".into()),
             data: b"file content here".to_vec(),
             doc_type: DocType::Leaf,
+            created_at: TimestampMillis::new(1234),
         };
         assert_eq!(chunk.id, "h:chunk1");
         assert_eq!(chunk.data, b"file content here".to_vec());

@@ -16,7 +16,7 @@ A Rust-based filesystem-to-CouchDB synchronization engine with bidirectional syn
 | ✅ | **Authoritative Rebuilds** | Rebuild the remote from local or rebuild the local tree from remote |
 | ✅ | **Telegram Notifications** | Get notified when conflicts are detected |
 | ⚠️ | **Flexible Configuration** | CLI args, YAML config, and environment variables |
-| ⚠️ | **Conflict File Preservation (optional)** | Keep-both resolution saves remote file as `filename.remote` |
+| ⚠️ | **Conflict File Preservation (optional)** | Keep-both resolution saves a unique, local-only `.filename.remote` copy |
 | ❌ | **Live Mode** | Optional filesystem watcher + CouchDB changes feed for low-latency sync |
 | ⚠️ | **Detailed Sync Logs** | `sync` and `daemon` write detailed logs to `$XDG_STATE_HOME/couchdb-file-sync/couchdb-file-sync.log` by default (override via `logging.file`) |
 
@@ -185,6 +185,11 @@ sync:
   # Soft-delete tombstones older than this many seconds are pruned so
   # get_all_files/get_changes do not grow unbounded. 0 disables pruning.
   tombstone_retention_secs: 604800
+  # Grace period (seconds) protecting in-flight chunk publication during
+  # orphan collection. Each cycle reclaims unreferenced chunks left by failed
+  # uploads and pruned tombstones, deferring any chunk younger than this window
+  # in case a concurrent client is mid-publication. 0 disables collection.
+  orphan_chunk_grace_secs: 300
 
 notifications:
   telegram:
@@ -295,7 +300,7 @@ couchdb-file-sync resolve docs/report.pdf --strategy keep-local
 # Keep remote version
 couchdb-file-sync resolve docs/report.pdf --strategy keep-remote
 
-# Keep both (saves remote as .remote file)
+# Keep both (saves remote as a unique, local-only .report.pdf.remote copy)
 couchdb-file-sync resolve docs/report.pdf --strategy keep-both
 ```
 
@@ -374,8 +379,18 @@ couchdb-file-sync resolve <path> --strategy <strategy>
 - **keep-remote**: Download remote version, overwriting local. If the remote
   was deleted (tombstone), the local file is deleted to match — it does not
   resurrect the tombstone's stale content.
-- **keep-both**: Save remote as `.remote`, keep local as-is. A remote tombstone
-  has no content to keep, so the local file is left untouched.
+- **keep-both**: Save the remote version under a unique, dot-prefixed local-only
+  name (`.filename.remote`, `.filename.remote.1`, …), keeping the local file
+  as-is. The copy is excluded from sync, never clobbers an existing backup, and
+  never marks itself as a synced download. A remote tombstone has no content to
+  keep, so the local file is left untouched.
+
+Resolution is snapshot-aware: destructive strategies never overwrite a version
+that changed since the conflict was previewed. **keep-local** refuses (and
+refreshes the conflict) if the remote advanced past the previewed revision, and
+**keep-remote** refuses if the local file was edited after preview — so a newer,
+unseen version is never silently clobbered. Re-run `couchdb-file-sync
+conflicts` to re-review a refreshed conflict.
 
 ## Project Structure
 

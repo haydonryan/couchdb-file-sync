@@ -558,8 +558,14 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
     // Run sync (dry-run walks the pipeline without writing)
     let retention = (config.sync.tombstone_retention_secs > 0)
         .then(|| std::time::Duration::from_secs(config.sync.tombstone_retention_secs));
+    let orphan_grace = (config.sync.orphan_chunk_grace_secs > 0)
+        .then(|| std::time::Duration::from_secs(config.sync.orphan_chunk_grace_secs));
     let mut engine = SyncEngine::with_ignore(couchdb, local_db, root, ignore_matcher)
-        .with_tombstone_retention(retention);
+        .with_tombstone_retention(retention)
+        .with_orphan_chunk_collection(
+            orphan_grace,
+            u64::try_from(config.sync.batch_size).unwrap_or(1000),
+        );
     let report = if dry_run {
         engine.sync_dry_run().await?
     } else {
@@ -1011,7 +1017,10 @@ pub async fn daemon(
         println!("Syncing {} path(s): {}", paths.len(), path_list.join(", "));
         println!("Press Ctrl+C to stop");
 
-        let mut handles = Vec::new();
+        // One supervised live-sync worker per path. Each worker owns its
+        // producers and restarts with a bounded budget; a worker only finishes
+        // when its path is complete or the restart budget is exhausted (Err).
+        let mut workers = tokio::task::JoinSet::new();
         for sync_path in paths {
             let mut path_config = config.clone();
             path_config
@@ -1019,31 +1028,49 @@ pub async fn daemon(
                 .remote_path
                 .clone_from(&sync_path.remote);
             let local_path = sync_path.local.clone();
+            workers.spawn(supervise_live_worker(local_path, path_config));
+        }
 
-            handles.push(tokio::spawn(async move {
-                if let Err(e) = live_sync_path(local_path.clone(), path_config.clone()).await {
-                    error!("Live sync error for {}: {}", local_path.display(), e);
-                    notify_sync_error_telegram(
-                        &path_config,
-                        Some(&local_path),
-                        &format!("Live sync error: {e}"),
-                    )
-                    .await;
-                    notify_sync_error_matrix(
-                        &path_config,
-                        Some(&local_path),
-                        &format!("Live sync error: {e}"),
-                    )
-                    .await;
+        // Run until Ctrl-C or a path worker gives up (bounded restart budget
+        // exhausted). A worker's death must not leave the daemon silently
+        // running with that path unmonitored.
+        let shutdown = tokio::signal::ctrl_c();
+        tokio::pin!(shutdown);
+        let mut result = Ok(());
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => {
+                    info!("Ctrl-C received; shutting down live sync workers");
+                    break;
                 }
-            }));
+                joined = workers.join_next() => {
+                    match joined {
+                        None => break, // all workers finished
+                        Some(Ok(Ok(()))) => {
+                            // A path worker completed cleanly; keep the daemon
+                            // running for the remaining paths.
+                            info!("A live sync worker completed cleanly");
+                        }
+                        Some(Ok(Err(e))) => {
+                            error!("Live sync worker failed after restart budget: {e}");
+                            result = Err(e);
+                            break;
+                        }
+                        Some(Err(join_err)) => {
+                            error!("Live sync worker task failed: {join_err}");
+                            result = Err(anyhow::anyhow!(
+                                "live sync worker task failed: {join_err}"
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
         }
 
-        tokio::signal::ctrl_c().await?;
-        for handle in handles {
-            handle.abort();
-        }
-        return Ok(());
+        // Cancel and join all owned workers so none is left running on shutdown.
+        workers.shutdown().await;
+        return result;
     }
 
     println!("CouchDB File Sync daemon started (interval: {interval}s)");
@@ -1129,8 +1156,14 @@ async fn daemon_sync(
     // Run sync
     let retention = (config.sync.tombstone_retention_secs > 0)
         .then(|| std::time::Duration::from_secs(config.sync.tombstone_retention_secs));
+    let orphan_grace = (config.sync.orphan_chunk_grace_secs > 0)
+        .then(|| std::time::Duration::from_secs(config.sync.orphan_chunk_grace_secs));
     let mut engine = SyncEngine::with_ignore(couchdb, local_db, root, ignore_matcher)
-        .with_tombstone_retention(retention);
+        .with_tombstone_retention(retention)
+        .with_orphan_chunk_collection(
+            orphan_grace,
+            u64::try_from(config.sync.batch_size).unwrap_or(1000),
+        );
     let report = engine.sync().await?;
 
     print_sync_report(&report, false);
@@ -1495,24 +1528,154 @@ async fn attempt_live_reconciliation(
     }
 }
 
+/// Maximum consecutive failures before a live sync worker gives up and the
+/// daemon exits nonzero.
+const MAX_LIVE_WORKER_RESTARTS: u32 = 3;
+/// Backoff between live sync worker restarts.
+const LIVE_WORKER_RESTART_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Run one path's live sync worker with a bounded restart budget. A source
+/// exit (clean `Ok` return, e.g. the feed closed) or a failure (`Err`) both
+/// restart the worker; exhausting the budget surfaces the error so the daemon
+/// exits nonzero instead of silently dropping the path.
+async fn supervise_live_worker(path: PathBuf, config: AppConfig) -> Result<()> {
+    run_with_restart_budget(
+        {
+            let path = path.clone();
+            let config = config.clone();
+            move || {
+                let path = path.clone();
+                let config = config.clone();
+                async move {
+                    let outcome = live_sync_path(path.clone(), config.clone()).await;
+                    let message = match &outcome {
+                        Ok(()) => format!("Live sync source for {} exited", path.display()),
+                        Err(e) => format!("Live sync error for {}: {e}", path.display()),
+                    };
+                    error!("{message}");
+                    notify_sync_error_telegram(&config, Some(&path), &message).await;
+                    notify_sync_error_matrix(&config, Some(&path), &message).await;
+                    outcome
+                }
+            }
+        },
+        "live sync worker",
+        MAX_LIVE_WORKER_RESTARTS,
+        LIVE_WORKER_RESTART_BACKOFF,
+    )
+    .await
+}
+
+/// Run `worker` to completion with a bounded restart budget. A clean source
+/// exit (`Ok`) and a failure (`Err`) both restart the worker; exhausting the
+/// budget surfaces an error so the daemon exits nonzero. `label` names the
+/// worker for logging; `max_attempts` and `backoff` bound the restart policy
+/// (split out for direct testing).
+async fn run_with_restart_budget<F, Fut>(
+    mut worker: F,
+    label: &str,
+    max_attempts: u32,
+    backoff: Duration,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let mut attempts: u32 = 0;
+    loop {
+        let outcome = worker().await;
+        attempts += 1;
+        if attempts >= max_attempts {
+            return Err(match outcome {
+                Ok(()) => anyhow::anyhow!("{label} exited cleanly {attempts} times; giving up"),
+                Err(e) => e,
+            });
+        }
+        info!("{label} restarted (attempt {attempts}/{max_attempts}); backing off {backoff:?}");
+        tokio::time::sleep(backoff).await;
+    }
+}
+
 async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
     info!("Starting live sync in: {}", path.display());
 
     let (ignore_matcher, mut engine) = build_live_sync_engine(&path, &config).await?;
+
+    // Watcher coverage BEFORE bootstrap: start the local watcher first so any
+    // edit made during the bootstrap sync (the bootstrap-to-watch transition)
+    // is captured by the watcher rather than silently missed. The remote feed
+    // starts only after bootstrap, which fixes the resume cursor.
+    let (local_tx, local_rx) = mpsc::channel::<Change>(256);
+    let (overflow_tx, overflow_rx) = mpsc::channel::<()>(1);
+    let local_handle = spawn_local_watcher_source(
+        config.clone(),
+        &resolve_sync_dir(&path)?,
+        ignore_matcher.clone(),
+        local_tx,
+        overflow_tx,
+    );
+
     let initial_since = bootstrap_live_sync(&mut engine).await?;
-    let LiveChangeChannels {
-        mut local_rx,
-        mut remote_rx,
-        ack_tx,
-        mut reconcile_rx,
-        mut overflow_rx,
-    } = spawn_live_change_sources(
+
+    // The consumer acknowledges each durably-applied sequence back to the
+    // producer (ordered ack), and can be asked to run a full reconciliation
+    // when the producer hits an invalid resume cursor.
+    let (remote_tx, remote_rx) = mpsc::channel::<ChangeFeedEntry>(256);
+    let (ack_tx, ack_rx) = mpsc::channel::<String>(256);
+    let (reconcile_tx, reconcile_rx) = mpsc::channel::<()>(1);
+    let remote_handle = spawn_remote_changes_source(
         config.clone(),
         &path,
-        ignore_matcher.clone(),
         initial_since.clone(),
-    )?;
+        remote_tx,
+        ack_rx,
+        reconcile_tx,
+    );
 
+    // Guard: on ANY exit (including cancellation of this worker by the daemon
+    // supervisor) abort the owned producers so no detached watcher/feed task
+    // leaks; on the normal return path `shutdown` also joins them.
+    let mut sources = LiveProducerGuard::new(vec![local_handle, remote_handle]);
+
+    let loop_result = run_live_loop(
+        &mut engine,
+        &config,
+        &path,
+        &ignore_matcher,
+        local_rx,
+        remote_rx,
+        ack_tx,
+        reconcile_rx,
+        overflow_rx,
+        initial_since,
+    )
+    .await;
+
+    // Cancel and join all owned producers before returning, so shutdown is
+    // complete (the guard still aborts them if this worker is itself cancelled
+    // mid-run by the daemon).
+    sources.shutdown().await;
+    loop_result
+}
+
+/// The live sync select-loop core. Owns the bounded reconciliation state and
+/// applies events from the local watcher and remote feed. Returns `Err` when a
+/// source channel closes (its producer exited) or a fatal error occurs, so the
+/// supervisor can apply the restart/failure policy; `Ok(())` only when the
+/// remote feed signals completion.
+#[allow(clippy::too_many_arguments)]
+async fn run_live_loop(
+    engine: &mut SyncEngine,
+    config: &AppConfig,
+    path: &Path,
+    ignore_matcher: &IgnoreMatcher,
+    mut local_rx: mpsc::Receiver<Change>,
+    mut remote_rx: mpsc::Receiver<ChangeFeedEntry>,
+    ack_tx: mpsc::Sender<String>,
+    mut reconcile_rx: mpsc::Receiver<()>,
+    mut overflow_rx: mpsc::Receiver<()>,
+    initial_since: String,
+) -> Result<()> {
     let mut touched = TouchTracker::new();
     let mut remote_cursor = RemoteFeedCursor::new(initial_since);
 
@@ -1528,43 +1691,80 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
     // drives the cadence rather than running a spurious first pass.
     rescan_timer.tick().await;
 
+    // Reconcile after bootstrap: now that the watcher and feed are both live,
+    // run one pass so any change that landed during the bootstrap-to-watch
+    // transition converges immediately rather than waiting for the next event.
+    if let Some(r) = reconcile.as_mut() {
+        r.mark_full_rescan();
+        attempt_live_reconciliation(engine, Some(r), config, path).await;
+    } else {
+        let _ = engine.sync().await;
+    }
+
     loop {
         tokio::select! {
-            Some(change) = local_rx.recv() => {
+            change = local_rx.recv() => {
+                // A closed channel means its producer (the local watcher)
+                // exited; surface that to the supervisor instead of silently
+                // disabling the branch and spinning on the remaining sources.
+                let Some(change) = change else {
+                    return Err(anyhow::anyhow!(
+                        "local watcher source for {} closed (source exited)",
+                        path.display()
+                    ));
+                };
                 apply_live_local_change(
-                    &mut engine,
+                    engine,
                     reconcile.as_mut(),
                     &touched,
                     &change,
-                    &config,
-                    &path,
+                    config,
+                    path,
                 )
                 .await;
             }
-            Some(entry) = remote_rx.recv() => {
+            entry = remote_rx.recv() => {
+                let Some(entry) = entry else {
+                    return Err(anyhow::anyhow!(
+                        "remote changes source for {} closed (source exited)",
+                        path.display()
+                    ));
+                };
                 if apply_live_remote_entry(
-                    &mut engine,
+                    engine,
                     &mut touched,
-                    &ignore_matcher,
+                    ignore_matcher,
                     entry,
                     &mut remote_cursor,
                     &ack_tx,
-                    &config,
-                    &path,
+                    config,
+                    path,
                 )
                 .await?
                 {
                     return Ok(());
                 }
             }
-            Some(()) = reconcile_rx.recv() => {
+            rec = reconcile_rx.recv() => {
+                let Some(()) = rec else {
+                    return Err(anyhow::anyhow!(
+                        "remote reconciliation source for {} closed (source exited)",
+                        path.display()
+                    ));
+                };
                 // The producer hit an invalid resume cursor; reconcile from a
                 // known-good position instead of jumping to "now".
-                if reconcile_live_remote_cursor(&mut engine, &ack_tx, &mut remote_cursor).await? {
+                if reconcile_live_remote_cursor(engine, &ack_tx, &mut remote_cursor).await? {
                     return Ok(());
                 }
             }
-            Some(()) = overflow_rx.recv() => {
+            ov = overflow_rx.recv() => {
+                let Some(()) = ov else {
+                    return Err(anyhow::anyhow!(
+                        "watcher overflow source for {} closed (source exited)",
+                        path.display()
+                    ));
+                };
                 if let Some(r) = reconcile.as_mut() {
                     r.mark_full_rescan();
                 }
@@ -1576,7 +1776,7 @@ async fn live_sync_path(path: PathBuf, config: AppConfig) -> Result<()> {
 
         // Attempt a bounded reconciliation whenever work is pending and the
         // cooldown has elapsed (runs after any event, and on each timer tick).
-        attempt_live_reconciliation(&mut engine, reconcile.as_mut(), &config, &path).await;
+        attempt_live_reconciliation(engine, reconcile.as_mut(), config, path).await;
     }
 }
 
@@ -1614,6 +1814,11 @@ async fn build_live_sync_engine(
         .with_tombstone_retention(
             (config.sync.tombstone_retention_secs > 0)
                 .then(|| std::time::Duration::from_secs(config.sync.tombstone_retention_secs)),
+        )
+        .with_orphan_chunk_collection(
+            (config.sync.orphan_chunk_grace_secs > 0)
+                .then(|| std::time::Duration::from_secs(config.sync.orphan_chunk_grace_secs)),
+            u64::try_from(config.sync.batch_size).unwrap_or(1000),
         );
 
     Ok((ignore_matcher, engine))
@@ -1653,39 +1858,53 @@ async fn bootstrap_live_sync(engine: &mut SyncEngine) -> Result<String> {
     Ok(initial_since)
 }
 
-/// Channels bridging the live changes-feed producer task and the consumer
-/// select-loop: the remote feed entries, plus the ordered-ack and
-/// reconciliation channels that keep the durable cursor replay-safe.
-struct LiveChangeChannels {
-    local_rx: mpsc::Receiver<Change>,
-    remote_rx: mpsc::Receiver<ChangeFeedEntry>,
-    ack_tx: mpsc::Sender<String>,
-    reconcile_rx: mpsc::Receiver<()>,
-    overflow_rx: mpsc::Receiver<()>,
+/// Owns the producer tasks (local watcher, remote changes feed) spawned by a
+/// live-sync worker. `shutdown` cancels and joins them on the normal exit
+/// path; `Drop` aborts them if the owning worker is itself cancelled (e.g.
+/// daemon Ctrl-C), so no detached producer is ever left running.
+struct LiveProducerGuard {
+    handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
-fn spawn_live_change_sources(
-    config: AppConfig,
-    path: &Path,
-    ignore_matcher: Arc<IgnoreMatcher>,
-    initial_since: String,
-) -> Result<LiveChangeChannels> {
-    let (local_tx, local_rx) = mpsc::channel::<Change>(256);
-    let (remote_tx, remote_rx) = mpsc::channel::<ChangeFeedEntry>(256);
-    // The consumer acknowledges each durably-applied sequence back to the
-    // producer (ordered ack), and can be asked to run a full reconciliation
-    // when the producer hits an invalid resume cursor.
-    let (ack_tx, ack_rx) = mpsc::channel::<String>(256);
-    let (reconcile_tx, reconcile_rx) = mpsc::channel::<()>(1);
-    // Capacity-1 notice signalled by the watcher when its internal event
-    // channel overflows and drops events, so the live loop schedules a bounded
-    // reconciliation rescan (coalesced: a burst yields one pending notice).
-    let (overflow_tx, overflow_rx) = mpsc::channel::<()>(1);
+impl LiveProducerGuard {
+    const fn new(handles: Vec<tokio::task::JoinHandle<()>>) -> Self {
+        Self { handles }
+    }
 
-    let watcher_root = resolve_sync_dir(path)?;
+    /// Cancel and join all owned producers.
+    async fn shutdown(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+        for handle in self.handles.drain(..) {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for LiveProducerGuard {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+
+/// Start the local filesystem watcher producer. Returns a handle to the owned
+/// task. A watcher startup failure ends the task and closes its channel, which
+/// the live loop surfaces so the supervisor can apply the restart/failure
+/// policy instead of silently continuing without coverage.
+fn spawn_local_watcher_source(
+    config: AppConfig,
+    root: &SyncDirPath,
+    ignore_matcher: Arc<IgnoreMatcher>,
+    local_tx: mpsc::Sender<Change>,
+    overflow_tx: mpsc::Sender<()>,
+) -> tokio::task::JoinHandle<()> {
+    let watcher_root = root.clone();
     let watcher_ignore = ignore_matcher;
     let debounce_ms = config.sync.debounce_ms;
-    let watcher_config = config.clone();
+    let watcher_config = config;
     tokio::spawn(async move {
         if let Err(e) = run_local_watcher(
             watcher_root.clone(),
@@ -1710,20 +1929,26 @@ fn spawn_live_change_sources(
             )
             .await;
         }
-    });
+    })
+}
 
+/// Start the remote `CouchDB` changes-feed producer, resuming from `since`.
+/// Returns a handle to the owned task; the feed runs until the consumer is
+/// gone.
+fn spawn_remote_changes_source(
+    config: AppConfig,
+    path: &Path,
+    since: String,
+    remote_tx: mpsc::Sender<ChangeFeedEntry>,
+    ack_rx: mpsc::Receiver<String>,
+    reconcile_tx: mpsc::Sender<()>,
+) -> tokio::task::JoinHandle<()> {
     let remote_config = config;
     let remote_config_notify = remote_config.clone();
     let remote_root = path.to_path_buf();
     tokio::spawn(async move {
-        if let Err(e) = run_remote_changes(
-            remote_config,
-            initial_since,
-            remote_tx,
-            ack_rx,
-            reconcile_tx,
-        )
-        .await
+        if let Err(e) =
+            run_remote_changes(remote_config, since, remote_tx, ack_rx, reconcile_tx).await
         {
             error!("Remote changes feed error: {}", e);
             notify_sync_error_telegram(
@@ -1739,14 +1964,6 @@ fn spawn_live_change_sources(
             )
             .await;
         }
-    });
-
-    Ok(LiveChangeChannels {
-        local_rx,
-        remote_rx,
-        ack_tx,
-        reconcile_rx,
-        overflow_rx,
     })
 }
 
@@ -1866,6 +2083,26 @@ async fn handle_local_change(
     touched: &TouchTracker,
     change: &Change,
 ) -> Result<()> {
+    // A directory-scoped watcher event (a rename/move-in/move-out of a
+    // populated directory) carries only the top-level directory path, never
+    // its children. It cannot be applied as a single file — an upload would
+    // try to read the directory and fail, and a directory delete is not a
+    // tracked file. Route it into the bounded full reconciliation rescan,
+    // which expands the event into tracked subtree reconciliation (removing
+    // old remote child paths, uploading new ones) and safely orders filesystem
+    // type transitions.
+    if engine.is_directory_scoped(change).await? {
+        if let Some(r) = reconcile {
+            r.mark_full_rescan();
+        }
+        info!(
+            "Directory-scoped local change ({}); routing to subtree reconciliation: {}",
+            change.change_type(),
+            change.path()
+        );
+        return Ok(());
+    }
+
     // Only hash paths the tool may have just written; ordinary user edits of
     // arbitrary files skip the (potentially expensive) content check.
     let current_hash = if touched.contains(change.path()) {
@@ -3280,6 +3517,159 @@ mod tests {
         assert!(
             !reconcile.pending(),
             "reconciliation must clear pending work"
+        );
+    }
+
+    // ── Live worker supervision + source closure (#6349) ────────────────
+
+    #[tokio::test]
+    async fn live_worker_restart_budget_restarts_failures_then_gives_up() {
+        // A source failure restarts the worker up to the budget, then surfaces
+        // the error so the daemon exits nonzero instead of silently dropping
+        // the path.
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls_clone = calls.clone();
+        let worker = move || {
+            let calls_clone = calls_clone.clone();
+            async move {
+                calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(anyhow::anyhow!("injected source failure"))
+            }
+        };
+        let err = run_with_restart_budget(worker, "test-worker", 3, Duration::ZERO)
+            .await
+            .expect_err("budget exhaustion must surface an error");
+        assert!(err.to_string().contains("injected source failure"));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "worker must run exactly up to the restart budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_worker_restart_budget_restarts_clean_exit_then_gives_up() {
+        // A clean source exit (feed closed) is also a restart trigger: it must
+        // not silently end the path's monitoring.
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls_clone = calls.clone();
+        let worker = move || {
+            let calls_clone = calls_clone.clone();
+            async move {
+                calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        };
+        let err = run_with_restart_budget(worker, "test-worker", 3, Duration::ZERO)
+            .await
+            .expect_err("a clean source exit is also a restart trigger");
+        assert!(err.to_string().contains("giving up"));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "clean source exits must still restart up to the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_loop_surfaces_closed_source_instead_of_spinning() {
+        // A closed local watcher source (producer exited) must surface as an
+        // error so the supervisor can restart it, not leave the loop spinning
+        // on the remaining channels.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let mut engine = live_engine_with_transient_failures(
+            LocalDb::open_in_memory().expect("in-memory LocalDb"),
+            root.clone(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let (local_tx, local_rx) = mpsc::channel::<Change>(1);
+        drop(local_tx); // watcher producer gone
+        let (_remote_tx, remote_rx) = mpsc::channel::<ChangeFeedEntry>(1);
+        let (ack_tx, _ack_rx) = mpsc::channel::<String>(1);
+        let (_reconcile_tx, reconcile_rx) = mpsc::channel::<()>(1);
+        let (_overflow_tx, overflow_rx) = mpsc::channel::<()>(1);
+        let mut config = AppConfig::default();
+        config.sync.rescan_interval_secs = 0;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_live_loop(
+                &mut engine,
+                &config,
+                dir.path(),
+                &IgnoreMatcher::empty(),
+                local_rx,
+                remote_rx,
+                ack_tx,
+                reconcile_rx,
+                overflow_rx,
+                "0".to_string(),
+            ),
+        )
+        .await
+        .expect("live loop must return on a closed source, not spin");
+
+        assert!(
+            result.is_err(),
+            "a closed source must surface an error to the supervisor"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_loop_reconciles_edit_during_bootstrap_transition() {
+        // An edit that lands during the bootstrap-to-watch transition (captured
+        // by the watcher started before bootstrap) must be reconciled by the
+        // after-bootstrap pass rather than left stranded.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(dir.path().join("transition.txt"), "hi").unwrap();
+
+        let mut engine = live_engine_with_transient_failures(
+            LocalDb::open_in_memory().expect("in-memory LocalDb"),
+            root.clone(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let (local_tx, local_rx) = mpsc::channel::<Change>(1);
+        drop(local_tx); // closed source so the loop returns after the reconcile pass
+        let (_remote_tx, remote_rx) = mpsc::channel::<ChangeFeedEntry>(1);
+        let (ack_tx, _ack_rx) = mpsc::channel::<String>(1);
+        let (_reconcile_tx, reconcile_rx) = mpsc::channel::<()>(1);
+        let (_overflow_tx, overflow_rx) = mpsc::channel::<()>(1);
+        let mut config = AppConfig::default();
+        config.sync.rescan_interval_secs = 0;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_live_loop(
+                &mut engine,
+                &config,
+                dir.path(),
+                &IgnoreMatcher::empty(),
+                local_rx,
+                remote_rx,
+                ack_tx,
+                reconcile_rx,
+                overflow_rx,
+                "0".to_string(),
+            ),
+        )
+        .await
+        .expect("live loop must return after the reconcile pass");
+
+        assert!(result.is_err(), "closed source surfaces as an error");
+
+        // The after-bootstrap reconcile pass must have uploaded and tracked the
+        // transition-window edit.
+        assert!(
+            engine
+                .get_file_state("transition.txt")
+                .await
+                .unwrap()
+                .is_some(),
+            "edit landed during bootstrap must be reconciled after bootstrap"
         );
     }
 }

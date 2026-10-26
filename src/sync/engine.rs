@@ -1,8 +1,8 @@
 use crate::couchdb::CouchDb;
 use crate::local::{LocalDb, Scanner, compute_bytes_hash, compute_file_hash};
 use crate::models::{
-    Change, ChangeType, Checkpoint, Conflict, CouchRev, DownloadCount, ExpectedRemote, FileState,
-    IgnoreMatcher, RemoteState, ResolutionStrategy, SyncDirPath, UploadCount,
+    Change, ChangeType, Checkpoint, Conflict, CouchRev, DownloadCount, ExpectedRemote, FileDoc,
+    FileState, IgnoreMatcher, RemoteState, ResolutionStrategy, SyncDirPath, UploadCount,
 };
 use crate::sync::triage;
 use anyhow::Result;
@@ -31,6 +31,14 @@ pub struct SyncEngine {
     /// Optional retention window for soft-delete tombstones. When set, each
     /// non-dry-run sync cycle prunes tombstones older than this window.
     tombstone_retention: Option<std::time::Duration>,
+    /// Optional in-flight publication grace period for orphan chunk
+    /// collection. When set, each non-dry-run sync cycle reclaims unreferenced
+    /// chunks older than this grace window.
+    orphan_chunk_grace: Option<std::time::Duration>,
+    /// Per-cycle bound on the number of orphan chunks collected. Unreferenced
+    /// chunks beyond this limit are deferred to a later cycle so collection
+    /// stays bounded and resumable.
+    orphan_chunk_batch: u64,
 }
 
 /// Report from a sync operation
@@ -330,6 +338,31 @@ impl ApplyWorker {
         };
 
         let file_path = self.root_dir.join_contained(local_path)?;
+        // Filesystem type transition: an incoming remote file arriving where a
+        // directory currently exists (a remote directory replaced by a file, or
+        // a leftover empty directory from a move). Remove an empty directory so
+        // the file can be installed; preserve a nonempty directory because its
+        // untracked local content must never be destroyed by a download.
+        if file_path.is_dir() {
+            let empty = tokio::fs::read_dir(&file_path)
+                .await?
+                .next_entry()
+                .await?
+                .is_none();
+            if empty {
+                debug!(
+                    "[DOWNLOAD] Replacing empty local directory {:?} with remote file {}",
+                    file_path, remote_path
+                );
+                tokio::fs::remove_dir(&file_path).await?;
+            } else {
+                warn!(
+                    "Preserving nonempty local directory {:?} for incoming remote file {} (untracked content must not be removed)",
+                    file_path, remote_path
+                );
+                return Ok(None);
+            }
+        }
         if let Some(parent) = file_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -504,7 +537,26 @@ impl ApplyWorker {
                     "[LOCAL DELETE] Remote: {}, Local: {:?}",
                     remote_path, file_path
                 );
-                if file_path.exists() {
+                if file_path.is_dir() {
+                    // Directory-to-file transition on the delete side: a remote
+                    // file was replaced such that only an empty leftover local
+                    // directory remains. Remove it to converge; preserve a
+                    // nonempty directory because its untracked local content
+                    // must never be destroyed.
+                    let empty = tokio::fs::read_dir(&file_path)
+                        .await?
+                        .next_entry()
+                        .await?
+                        .is_none();
+                    if empty {
+                        tokio::fs::remove_dir(&file_path).await?;
+                    } else {
+                        warn!(
+                            "Preserving nonempty local directory {:?} for remote delete of {} (untracked content must not be removed)",
+                            file_path, remote_path
+                        );
+                    }
+                } else if file_path.is_file() {
                     tokio::fs::remove_file(&file_path).await?;
                 }
                 self.local_db.delete_file_state(&local_path).await?;
@@ -713,6 +765,8 @@ impl SyncEngine {
             root_dir,
             ignore_matcher,
             tombstone_retention: None,
+            orphan_chunk_grace: None,
+            orphan_chunk_batch: 0,
         }
     }
 
@@ -731,6 +785,8 @@ impl SyncEngine {
             root_dir,
             ignore_matcher,
             tombstone_retention: None,
+            orphan_chunk_grace: None,
+            orphan_chunk_batch: 0,
         }
     }
 
@@ -743,6 +799,48 @@ impl SyncEngine {
     ) -> Self {
         self.tombstone_retention = retention;
         self
+    }
+
+    /// Enable orphan chunk collection with an in-flight publication grace
+    /// period. When `grace` is `Some`, each non-dry-run sync cycle reclaims
+    /// unreferenced chunks older than `grace`, deferring younger ones so a
+    /// concurrent in-flight publication is never collected. `batch` bounds the
+    /// number of orphans collected per cycle (unreferenced chunks beyond it
+    /// are deferred to a later cycle). Pass `None` (or omit) to disable
+    /// collection.
+    #[must_use]
+    pub const fn with_orphan_chunk_collection(
+        mut self,
+        grace: Option<std::time::Duration>,
+        batch: u64,
+    ) -> Self {
+        self.orphan_chunk_grace = grace;
+        self.orphan_chunk_batch = batch;
+        self
+    }
+
+    /// Best-effort orphan chunk collection. Runs after uploads/downloads (so
+    /// this cycle's publications are committed) and after tombstone pruning.
+    /// Reclaims unreferenced chunks older than the in-flight grace window; a
+    /// failure is logged, never fatal to the sync.
+    async fn collect_orphans(&self) {
+        let Some(grace) = self.orphan_chunk_grace else {
+            return;
+        };
+        match self
+            .couchdb
+            .collect_orphan_chunks(self.orphan_chunk_batch, grace)
+            .await
+        {
+            Ok(result) if result.collected > 0 => {
+                info!(
+                    "Collected {} orphan chunk(s) ({} scanned, {} deferred)",
+                    result.collected, result.scanned, result.deferred
+                );
+            }
+            Ok(_) => {}
+            Err(e) => warn!("Orphan chunk collection failed: {e}"),
+        }
     }
 
     /// Cheap handle to the per-file apply state used by the bounded-concurrency
@@ -896,6 +994,15 @@ impl SyncEngine {
                 Ok(_) => {}
                 Err(e) => warn!("Tombstone pruning failed: {e}"),
             }
+        }
+
+        // 9. Collect orphan chunks (skipped in dry-run). Pruning a tombstone
+        //    hard-deletes only the metadata, orphaning the chunks it referenced,
+        //    and a failed metadata publication leaves freshly-uploaded chunks
+        //    unreferenced. Reclaim those unreferenced chunks without touching
+        //    live, shared, recoverable, or in-flight content.
+        if !dry_run {
+            self.collect_orphans().await;
         }
 
         if dry_run {
@@ -1883,6 +1990,38 @@ impl SyncEngine {
         Ok(true)
     }
 
+    /// Whether a local watcher change targets a directory rather than a single
+    /// tracked file.
+    ///
+    /// A rename/move-in/move-out of a populated directory surfaces from the
+    /// watcher as events for the top-level directory path only — never for its
+    /// children. Such an event cannot be applied as a single file (an upload
+    /// would try to read the directory and fail), so the live loop routes it
+    /// into the bounded full reconciliation rescan, which expands it into a
+    /// tracked subtree reconciliation (removing old remote child paths and
+    /// uploading new ones) and safely orders filesystem type transitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the local path cannot be resolved against the root.
+    pub(crate) async fn is_directory_scoped(&self, change: &Change) -> Result<bool> {
+        match change.change_type() {
+            ChangeType::Created | ChangeType::Modified => {
+                Ok(self.root_dir.join_contained(change.path())?.is_dir())
+            }
+            ChangeType::Deleted => {
+                // A tracked file delete is a normal single-file event. A path
+                // that is neither tracked nor present as a file is a
+                // directory-scoped event (a directory move-out or delete): the
+                // directory itself is never tracked as a file, and the top-level
+                // path no longer exists on disk after the move.
+                let tracked = self.get_file_state(change.path()).await?.is_some();
+                let on_disk = self.root_dir.join_contained(change.path())?.is_file();
+                Ok(!tracked && !on_disk)
+            }
+        }
+    }
+
     /// Apply a local change immediately (live sync)
     ///
     /// # Errors
@@ -1976,20 +2115,160 @@ impl SyncEngine {
             .should_ignore(std::path::Path::new(local_path))
     }
 
-    /// Resolve a conflict
-    /// Note: `local_path` is the local file path (stored in conflict), which gets
-    /// converted to remote path when interacting with `CouchDB`
+    /// Whether the live remote has advanced to a non-deleted version the user
+    /// did NOT preview (per the conflict snapshot). Used to guard destructive
+    /// keep-local resolution: we never overwrite a remote version that changed
+    /// since the conflict was detected. A missing remote (`None`) or a
+    /// tombstone carries no content, so there is nothing unseen to clobber —
+    /// those are always safe to proceed with.
+    fn remote_version_changed(live: Option<&FileDoc>, snapshot: &RemoteState) -> bool {
+        let Some(doc) = live else {
+            return false;
+        };
+        if doc.deleted {
+            // Tombstone: no content on the remote to clobber.
+            return false;
+        }
+        // Live remote has content. Changed if the snapshot was a tombstone
+        // (unseen content is now present) or the revision/content moved on.
+        if snapshot.deleted {
+            return true;
+        }
+        let snap_rev = snapshot.couch_rev.as_str();
+        if snap_rev != CouchRev::DEFAULT_REV && !snap_rev.is_empty() {
+            return doc.rev.as_deref() != Some(snap_rev);
+        }
+        if !snapshot.hash.is_empty() {
+            return !doc.hash.is_empty() && doc.hash != snapshot.hash;
+        }
+        false
+    }
+
+    /// Whether the local file's current content differs from the conflict
+    /// snapshot (i.e. was edited after the conflict was previewed). A file that
+    /// existed at preview but is now gone is also a change. Used to guard
+    /// destructive keep-remote resolution.
+    fn local_version_changed(current_hash: Option<&str>, snapshot: &FileState) -> bool {
+        // File present: changed iff its content differs from the snapshot; file
+        // absent: changed iff the snapshot represented present content.
+        current_hash.map_or(!snapshot.hash.is_empty(), |h| h != snapshot.hash.as_str())
+    }
+
+    /// Current on-disk content hash of `local_path`, or `None` if the file is
+    /// absent. Detects local edits made after the conflict was previewed.
+    async fn current_local_hash(&self, local_path: &str) -> Result<Option<String>> {
+        let file_path = self.root_dir.join_contained(local_path)?;
+        if !file_path.exists() {
+            return Ok(None);
+        }
+        let state = self.get_local_state(local_path).await?;
+        Ok(Some(state.hash))
+    }
+
+    /// Build the remote state currently live on the server (metadata + content
+    /// hash), mirroring conflict-detection so a refreshed conflict shows the
+    /// version the user must re-review.
+    async fn live_remote_state(&self, remote_path: &str) -> Result<Option<RemoteState>> {
+        let Some(doc) = self.couchdb.fetch_metadata(remote_path).await? else {
+            return Ok(None);
+        };
+        let content = self.couchdb.get_file_content(remote_path).await?;
+        let hash = compute_bytes_hash(&content);
+        let modified_at = Utc
+            .timestamp_millis_opt(i64::try_from(doc.mtime.as_u64()).unwrap_or(i64::MAX))
+            .single()
+            .unwrap_or_else(Utc::now);
+        Ok(Some(RemoteState {
+            hash,
+            size: content.len() as u64,
+            modified_at,
+            couch_rev: CouchRev::new(doc.rev.as_deref().unwrap_or(CouchRev::DEFAULT_REV))
+                .unwrap_or_default(),
+            deleted: doc.deleted,
+        }))
+    }
+
+    /// Write the remote version's content to a unique, deliberately local-only
+    /// preservation copy. The destination is dot-prefixed so the default ignore
+    /// matcher excludes it from scanning/upload; a free numeric suffix keeps it
+    /// collision-safe so an existing backup always survives. No file state is
+    /// recorded, so it is never queued for any remote path. Returns the
+    /// relative local path written.
+    async fn write_keep_both_preservation(
+        &self,
+        local_path: &str,
+        remote_path: &str,
+    ) -> Result<String> {
+        let content = self.couchdb.get_file_content(remote_path).await?;
+
+        let (dir, name) = match local_path.rsplit_once('/') {
+            Some((d, n)) => (d, n),
+            None => ("", local_path),
+        };
+        let first = if dir.is_empty() {
+            format!(".{name}.remote")
+        } else {
+            format!("{dir}/.{name}.remote")
+        };
+        let mut candidate = first.clone();
+        let mut n = 1u64;
+        while self.root_dir.join_contained(&candidate)?.exists() {
+            candidate = if dir.is_empty() {
+                format!(".{name}.remote.{n}")
+            } else {
+                format!("{dir}/.{name}.remote.{n}")
+            };
+            n += 1;
+        }
+
+        let target = self.root_dir.join_contained(&candidate)?;
+        let parent = target
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine parent for preservation copy"))?;
+        tokio::fs::create_dir_all(parent).await?;
+        let staging = parent.join(format!(
+            ".{}.{}.{}.preserve",
+            target
+                .file_name()
+                .and_then(|x| x.to_str())
+                .unwrap_or("copy"),
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default(),
+        ));
+        {
+            let mut f = tokio::fs::File::create(&staging).await?;
+            f.write_all(&content).await?;
+            f.flush().await?;
+            f.sync_all().await?;
+        }
+        if let Err(e) = tokio::fs::rename(&staging, &target).await {
+            let _ = tokio::fs::remove_file(&staging).await;
+            return Err(e.into());
+        }
+        Ok(candidate)
+    }
+
+    /// Returns an error if no conflict exists for the path, if a destructive
+    /// resolution detects that the side being overwritten changed since the
+    /// conflict was previewed, or if the chosen strategy fails to apply.
     ///
     /// # Errors
     ///
-    /// Returns an error if no conflict exists for the path or the chosen
-    /// resolution strategy fails to apply.
+    /// - `No conflict found for path: {local_path}` if there is no stored
+    ///   conflict for the path.
+    /// - A refresh error when **keep-local** would overwrite a remote version
+    ///   that changed since preview, or **keep-remote** would overwrite a local
+    ///   edit made after preview (the conflict is refreshed for re-review).
+    /// - Any upload/download/filesystem error from applying the strategy.
     pub async fn resolve_conflict(
         &mut self,
         local_path: &str,
         strategy: ResolutionStrategy,
     ) -> Result<()> {
-        let Some(_conflict) = self.local_db.get_conflict(local_path).await? else {
+        let Some(conflict) = self.local_db.get_conflict(local_path).await? else {
             anyhow::bail!("No conflict found for path: {local_path}");
         };
 
@@ -2001,14 +2280,26 @@ impl SyncEngine {
         // so "keep remote" / "keep both" delete or skip rather than resurrecting
         // the tombstone's stale content. The stored conflict does not persist
         // this, so it is re-read from the live remote at resolution time.
-        let remote_is_tombstone = self
-            .couchdb
-            .fetch_metadata(&remote_path)
-            .await?
-            .is_some_and(|doc| doc.deleted);
+        let remote_doc = self.couchdb.fetch_metadata(&remote_path).await?;
+        let remote_is_tombstone = remote_doc.as_ref().is_some_and(|doc| doc.deleted);
 
         match strategy {
             ResolutionStrategy::KeepLocal => {
+                // Keep-local overwrites/removes the remote side, so it must not
+                // clobber a remote version that changed since the conflict was
+                // previewed. If it did, refresh the conflict's remote snapshot
+                // and bail so the user re-reviews before a destructive apply.
+                if Self::remote_version_changed(remote_doc.as_ref(), &conflict.remote_state) {
+                    if let Some(fresh) = self.live_remote_state(&remote_path).await? {
+                        let mut refreshed = conflict.clone();
+                        refreshed.remote_state = fresh;
+                        self.local_db.store_conflict(&refreshed).await?;
+                    }
+                    anyhow::bail!(
+                        "Remote changed since the conflict was previewed; conflict refreshed. \
+                         Re-review before resolving (keep-local would overwrite a newer remote version)."
+                    );
+                }
                 if local_exists {
                     // Keep the local edit: upload it (re-creating the remote
                     // file with the edited content). Keep-local is an explicit
@@ -2031,6 +2322,23 @@ impl SyncEngine {
                 }
             }
             ResolutionStrategy::KeepRemote => {
+                // Keep-remote overwrites/deletes the local side, so it must not
+                // clobber a local edit made after the conflict was previewed.
+                let current_local_hash = self.current_local_hash(local_path).await?;
+                if Self::local_version_changed(current_local_hash.as_deref(), &conflict.local_state)
+                {
+                    if let Some(hash) = current_local_hash {
+                        // Refresh the conflict's local snapshot so the next
+                        // preview reflects the current local version.
+                        let mut refreshed = conflict.clone();
+                        refreshed.local_state.hash = hash;
+                        self.local_db.store_conflict(&refreshed).await?;
+                    }
+                    anyhow::bail!(
+                        "Local file changed since the conflict was previewed; conflict refreshed. \
+                         Re-review before resolving (keep-remote would overwrite a newer local edit)."
+                    );
+                }
                 if remote_is_tombstone {
                     // The remote side is a tombstone: "keep remote" means
                     // deleting the local file to match — NOT resurrecting the
@@ -2059,14 +2367,25 @@ impl SyncEngine {
                         local_path
                     );
                 } else {
-                    // Save remote as .remote file
-                    let local_remote_path = format!("{local_path}.remote");
-                    self.download_remote_file(&remote_path, &local_remote_path, true, false)
+                    // Preserve the remote version as a unique, deliberately
+                    // local-only copy (dot-prefixed → excluded from sync). Never
+                    // clobber an existing backup and never mark it as synced to
+                    // a remote path it does not own.
+                    let preserved = self
+                        .write_keep_both_preservation(local_path, &remote_path)
                         .await?;
-                    info!("Saved remote version as: {}", local_remote_path);
+                    info!("Saved remote version as: {}", preserved);
 
-                    // Local file stays as-is
-                    // User can manually merge/compare
+                    // Keep the local file and converge its sync state so the
+                    // next cycle does not re-upload the kept local version over
+                    // the preserved remote one.
+                    let mut state = self.get_local_state(local_path).await?;
+                    state.couch_rev = remote_doc
+                        .as_ref()
+                        .and_then(|d| d.rev.as_deref())
+                        .and_then(CouchRev::new);
+                    state.last_sync_at = Utc::now();
+                    self.local_db.save_file_state(&state).await?;
                 }
             }
             ResolutionStrategy::Skip => {
@@ -3160,6 +3479,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_runs_orphan_collection_when_enabled_and_skips_when_disabled() {
+        // An empty cycle with orphan collection disabled must not invoke the
+        // collector, and enabling it must invoke it once per non-dry-run cycle
+        // without failing the sync (reachable content is never at risk because
+        // the collector only touches unreferenced chunks).
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+
+        // Disabled (default): the collector is not invoked.
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", CannedCouch::default()),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+        let report = engine.sync().await.expect("sync with collection disabled");
+        assert!(report.errors.is_empty());
+        assert_eq!(
+            engine.couchdb.test_write_calls(),
+            0,
+            "orphan collection is disabled by default"
+        );
+
+        // Enabled: the collector runs each non-dry-run cycle without breaking
+        // the sync.
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", CannedCouch::default()),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        )
+        .with_orphan_chunk_collection(Some(std::time::Duration::from_mins(5)), 100);
+        let report = engine.sync().await.expect("sync with collection enabled");
+        assert!(report.errors.is_empty());
+        assert_eq!(
+            engine.couchdb.test_write_calls(),
+            1,
+            "orphan collection runs once when enabled"
+        );
+    }
+
+    #[tokio::test]
     async fn upload_force_overwrite_bypasses_rev_check() {
         // Explicit force (keep-local resolution / remote rebuild) must still
         // overwrite regardless of the current remote revision.
@@ -3833,6 +4194,230 @@ mod tests {
         assert_eq!(
             stored.hash, stored_hash,
             "FileState hash must equal the verified remote hash"
+        );
+    }
+
+    /// A local create/modify change for a path that is a directory on disk is
+    /// directory-scoped: it must be routed to subtree reconciliation, not
+    /// applied as a single file.
+    #[tokio::test]
+    async fn is_directory_scoped_created_directory_is_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::create_dir_all(root.as_path().join("moved")).unwrap();
+
+        let engine = SyncEngine::new(test_couchdb(), test_local_db(), root);
+        assert!(
+            engine
+                .is_directory_scoped(&Change::local_created("moved".into(), String::new(), 0))
+                .await
+                .unwrap(),
+            "a created directory must be directory-scoped"
+        );
+    }
+
+    /// A local create/modify change for a path that is a real file is a normal
+    /// single-file event and must not be routed to reconciliation.
+    #[tokio::test]
+    async fn is_directory_scoped_created_file_is_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(root.as_path().join("f.txt"), b"content").unwrap();
+
+        let engine = SyncEngine::new(test_couchdb(), test_local_db(), root);
+        assert!(
+            !engine
+                .is_directory_scoped(&Change::local_created("f.txt".into(), String::new(), 0))
+                .await
+                .unwrap(),
+            "a created file must not be directory-scoped"
+        );
+    }
+
+    /// A local delete of a tracked file is a normal single-file event.
+    #[tokio::test]
+    async fn is_directory_scoped_deleted_tracked_file_is_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let local = test_local_db();
+        let stored = FileState::new("gone.txt".to_string(), "h".to_string(), 3, Utc::now());
+        local.save_file_state(&stored).unwrap();
+
+        let engine = SyncEngine::new(test_couchdb(), local, root);
+        assert!(
+            !engine
+                .is_directory_scoped(&Change::local_deleted("gone.txt".into()))
+                .await
+                .unwrap(),
+            "a tracked file delete must not be directory-scoped"
+        );
+    }
+
+    /// A local delete of a path that is neither tracked nor present as a file
+    /// is a directory-scoped event (a directory move-out or delete).
+    #[tokio::test]
+    async fn is_directory_scoped_deleted_missing_path_is_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+
+        let engine = SyncEngine::new(test_couchdb(), test_local_db(), root);
+        assert!(
+            engine
+                .is_directory_scoped(&Change::local_deleted("moved".into()))
+                .await
+                .unwrap(),
+            "a deleted untracked/missing path must be directory-scoped"
+        );
+    }
+
+    /// Downloading a remote file onto an existing empty local directory must
+    /// remove the leftover directory and install the file (directory-to-file
+    /// transition converges).
+    #[tokio::test]
+    async fn download_replaces_empty_local_directory_with_remote_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::create_dir_all(root.as_path().join("dl.txt")).unwrap();
+
+        let remote_path = "prefix/dl.txt";
+        let content: Vec<u8> = b"file replaces dir".to_vec();
+        let mut remote_doc =
+            FileDoc::new(remote_path.to_string(), String::new(), content.len() as u64);
+        remote_doc.rev = Some("1-abc".to_string());
+        remote_doc.path = remote_path.to_string();
+
+        let canned = CannedCouch {
+            changes: Vec::new(),
+            last_seq: "1".to_string(),
+            metadata: std::collections::HashMap::from([(remote_path.to_string(), remote_doc)]),
+            contents: std::collections::HashMap::from([(remote_path.to_string(), content.clone())]),
+            content_errors: std::collections::HashSet::new(),
+            ..CannedCouch::default()
+        };
+        let engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let bytes = engine
+            .download_remote_file(remote_path, "dl.txt", true, true)
+            .await
+            .expect("download should succeed")
+            .expect("download should write content");
+
+        assert_eq!(bytes, content.len());
+        assert!(
+            root.as_path().join("dl.txt").is_file(),
+            "the empty directory must be replaced by the downloaded file"
+        );
+        assert_eq!(
+            std::fs::read(root.as_path().join("dl.txt")).unwrap(),
+            content,
+            "downloaded file must hold the remote content"
+        );
+    }
+
+    /// Downloading a remote file onto a nonempty local directory must preserve
+    /// the directory and its untracked content, not destroy it.
+    #[tokio::test]
+    async fn download_preserves_nonempty_local_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::create_dir_all(root.as_path().join("dl.txt")).unwrap();
+        std::fs::write(root.as_path().join("dl.txt/child.txt"), b"untracked").unwrap();
+
+        let remote_path = "prefix/dl.txt";
+        let content: Vec<u8> = b"file replaces dir".to_vec();
+        let mut remote_doc =
+            FileDoc::new(remote_path.to_string(), String::new(), content.len() as u64);
+        remote_doc.rev = Some("1-abc".to_string());
+        remote_doc.path = remote_path.to_string();
+
+        let canned = CannedCouch {
+            changes: Vec::new(),
+            last_seq: "1".to_string(),
+            metadata: std::collections::HashMap::from([(remote_path.to_string(), remote_doc)]),
+            contents: std::collections::HashMap::from([(remote_path.to_string(), content)]),
+            content_errors: std::collections::HashSet::new(),
+            ..CannedCouch::default()
+        };
+        let engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let result = engine
+            .download_remote_file(remote_path, "dl.txt", true, true)
+            .await
+            .expect("preserving a nonempty directory must not error");
+
+        assert!(result.is_none(), "nothing should be written");
+        assert!(
+            root.as_path().join("dl.txt").is_dir(),
+            "the nonempty directory must be preserved"
+        );
+        assert_eq!(
+            std::fs::read(root.as_path().join("dl.txt/child.txt")).unwrap(),
+            b"untracked",
+            "untracked content inside the directory must survive"
+        );
+    }
+
+    /// A remote delete converging onto an empty leftover local directory must
+    /// remove it (directory-to-file transition on the delete side).
+    #[tokio::test]
+    async fn remote_delete_removes_empty_local_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::create_dir_all(root.as_path().join("gone")).unwrap();
+
+        let mut engine = SyncEngine::new(test_couchdb(), test_local_db(), root.clone());
+        engine
+            .apply_remote_change(&Change::remote_deleted(
+                "gone".into(),
+                None,
+                Some("2-abc".into()),
+            ))
+            .await
+            .expect("delete of an empty directory should succeed");
+
+        assert!(
+            !root.as_path().join("gone").exists(),
+            "the empty leftover directory must be removed"
+        );
+    }
+
+    /// A remote delete converging onto a nonempty local directory must preserve
+    /// the directory and its untracked content.
+    #[tokio::test]
+    async fn remote_delete_preserves_nonempty_local_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::create_dir_all(root.as_path().join("gone")).unwrap();
+        std::fs::write(root.as_path().join("gone/child.txt"), b"untracked").unwrap();
+
+        let mut engine = SyncEngine::new(test_couchdb(), test_local_db(), root.clone());
+        engine
+            .apply_remote_change(&Change::remote_deleted(
+                "gone".into(),
+                None,
+                Some("2-abc".into()),
+            ))
+            .await
+            .expect("delete over a nonempty directory should not error");
+
+        assert!(
+            root.as_path().join("gone").is_dir(),
+            "the nonempty directory must be preserved"
+        );
+        assert_eq!(
+            std::fs::read(root.as_path().join("gone/child.txt")).unwrap(),
+            b"untracked",
+            "untracked content must survive the delete"
         );
     }
 
@@ -4891,7 +5476,7 @@ mod tests {
         let local = test_local_db();
         let local_state = FileState::new(
             local_path.to_string(),
-            "localhash".to_string(),
+            compute_bytes_hash(b"local edit"),
             10,
             Utc::now() - Duration::days(1),
         );
@@ -4988,6 +5573,413 @@ mod tests {
         assert!(
             engine.get_conflicts().await.unwrap().is_empty(),
             "conflict must be removed after resolution"
+        );
+    }
+
+    /// Build a `CannedCouch` whose remote doc for `remote_path` carries
+    /// `content` at the given revision and hash.
+    fn resolve_canned_couch(remote_path: &str, content: &[u8], rev: &str) -> CannedCouch {
+        let mut meta = FileDoc::new(remote_path.to_string(), String::new(), content.len() as u64);
+        meta.rev = Some(rev.to_string());
+        meta.path = remote_path.to_string();
+        meta.hash = compute_bytes_hash(content);
+        CannedCouch {
+            metadata: std::collections::HashMap::from([(remote_path.to_string(), meta)]),
+            contents: std::collections::HashMap::from([(
+                remote_path.to_string(),
+                content.to_vec(),
+            )]),
+            ..CannedCouch::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_conflict_keep_both_preserves_unique_local_only_copy_and_converges() {
+        // Keep-both must preserve the remote version under a unique,
+        // deliberately local-only (dot-prefixed) name without clobbering an
+        // existing `.remote` backup, leave the local file intact, and converge
+        // its sync state so the next cycle does not re-upload the kept local
+        // version over the preserved remote one.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let state_db = db_dir.path().join("state.db");
+
+        // Nested path so we prove the dot-prefix lands on the filename, not the
+        // parent directory.
+        let local_path = "docs/conflict.txt";
+        let local_full = root.as_path().join(local_path);
+        std::fs::create_dir_all(local_full.parent().unwrap()).unwrap();
+        std::fs::write(&local_full, b"LOCAL-B").unwrap();
+
+        let local = LocalDb::open(&state_db).unwrap();
+        // Stored state reflects the last-synced remote version (divergent from
+        // the on-disk LOCAL-B), as in a real conflict.
+        seed_file_state(&local, local_path, &compute_bytes_hash(b"REMOTE-A"), 8);
+        let remote_state = RemoteState {
+            hash: compute_bytes_hash(b"REMOTE-A"),
+            size: 8,
+            modified_at: Utc::now(),
+            couch_rev: CouchRev::new("2-bbb").unwrap(),
+            deleted: false,
+        };
+        let local_state = local.get_file_state(local_path).unwrap().unwrap();
+        local
+            .store_conflict(&Conflict::new(
+                local_path.to_string(),
+                local_state,
+                remote_state,
+            ))
+            .unwrap();
+
+        let remote_path = format!("test-prefix/{local_path}");
+        let mut engine = SyncEngine::new(
+            test_canned_couch(
+                "test-prefix/",
+                resolve_canned_couch(&remote_path, b"REMOTE-A", "2-bbb"),
+            ),
+            LocalDb::open(&state_db).unwrap(),
+            root.clone(),
+        );
+        engine
+            .resolve_conflict(local_path, ResolutionStrategy::KeepBoth)
+            .await
+            .expect("keep-both should succeed");
+
+        // Conflict resolved; local file untouched.
+        assert!(
+            engine.get_conflicts().await.unwrap().is_empty(),
+            "keep-both must remove the conflict record"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&local_full).unwrap(),
+            "LOCAL-B",
+            "local version is kept"
+        );
+
+        // A unique, dot-prefixed preservation copy holds the remote content and
+        // the pre-existing backup survives untouched.
+        let preserved = root.as_path().join("docs/.conflict.txt.remote");
+        assert_eq!(
+            std::fs::read_to_string(&preserved).unwrap(),
+            "REMOTE-A",
+            "remote version preserved under a unique local-only name"
+        );
+
+        // The preservation copy is deliberately local-only: no sync state is
+        // recorded for it, so it is never queued for any remote path.
+        assert!(
+            engine
+                .get_file_state("docs/.conflict.txt.remote")
+                .await
+                .unwrap()
+                .is_none(),
+            "preservation copy must not be tracked as a synced download"
+        );
+
+        // The kept local version's state converges so the next sync does not
+        // re-upload it over the preserved remote version.
+        let synced = engine
+            .get_file_state(local_path)
+            .await
+            .unwrap()
+            .expect("local state recorded");
+        assert_eq!(synced.hash, compute_bytes_hash(b"LOCAL-B"));
+
+        // A follow-up cycle with an empty remote feed makes no change: the kept
+        // local file is no longer seen as pending and the dot-prefixed
+        // preservation copy is ignored entirely.
+        let mut engine2 = SyncEngine::new(
+            test_canned_couch(
+                "test-prefix/",
+                CannedCouch {
+                    changes: Vec::new(),
+                    last_seq: "1".to_string(),
+                    ..CannedCouch::default()
+                },
+            ),
+            LocalDb::open(&state_db).unwrap(),
+            root.clone(),
+        );
+        let report = engine2.sync().await.unwrap();
+        assert_eq!(report.uploaded.0, 0, "kept local must not re-upload");
+        assert_eq!(report.downloaded.0, 0);
+        assert_eq!(report.conflicts, 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_conflict_keep_both_uses_numeric_suffix_when_preservation_exists() {
+        // A second keep-both on the same path (same unique base) must not
+        // clobber the first preservation copy: it picks the next free suffix.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let local_path = "doc.txt";
+        std::fs::write(root.as_path().join(local_path), b"LOCAL-B").unwrap();
+        // A pre-existing (non-dot) .remote backup must survive resolution — the
+        // new dot-prefixed preservation name never collides with it.
+        let legacy_backup = root.as_path().join("doc.txt.remote");
+        std::fs::write(&legacy_backup, b"old backup").unwrap();
+
+        let local = test_local_db();
+        seed_file_state(&local, local_path, &compute_bytes_hash(b"REMOTE-A"), 8);
+        let remote_state = RemoteState {
+            hash: compute_bytes_hash(b"REMOTE-A"),
+            size: 8,
+            modified_at: Utc::now(),
+            couch_rev: CouchRev::new("2-bbb").unwrap(),
+            deleted: false,
+        };
+        let local_state = local.get_file_state(local_path).unwrap().unwrap();
+        local
+            .store_conflict(&Conflict::new(
+                local_path.to_string(),
+                local_state,
+                remote_state,
+            ))
+            .unwrap();
+
+        // First resolution writes .doc.txt.remote.
+        let remote_path = format!("test-prefix/{local_path}");
+        let mut engine = SyncEngine::new(
+            test_canned_couch(
+                "test-prefix/",
+                resolve_canned_couch(&remote_path, b"REMOTE-A", "2-bbb"),
+            ),
+            local,
+            root.clone(),
+        );
+        engine
+            .resolve_conflict(local_path, ResolutionStrategy::KeepBoth)
+            .await
+            .unwrap();
+
+        // Re-store a conflict and resolve again with a different remote version.
+        let local2 = test_local_db();
+        seed_file_state(&local2, local_path, &compute_bytes_hash(b"REMOTE-A"), 8);
+        local2
+            .store_conflict(&Conflict::new(
+                local_path.to_string(),
+                local2.get_file_state(local_path).unwrap().unwrap(),
+                RemoteState {
+                    hash: compute_bytes_hash(b"REMOTE-C"),
+                    size: 8,
+                    modified_at: Utc::now(),
+                    couch_rev: CouchRev::new("3-ccc").unwrap(),
+                    deleted: false,
+                },
+            ))
+            .unwrap();
+        let mut engine2 = SyncEngine::new(
+            test_canned_couch(
+                "test-prefix/",
+                resolve_canned_couch(&remote_path, b"REMOTE-C", "3-ccc"),
+            ),
+            local2,
+            root.clone(),
+        );
+        engine2
+            .resolve_conflict(local_path, ResolutionStrategy::KeepBoth)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.as_path().join(".doc.txt.remote")).unwrap(),
+            "REMOTE-A",
+            "first preservation copy survives"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.as_path().join(".doc.txt.remote.1")).unwrap(),
+            "REMOTE-C",
+            "second preservation copy uses the next free suffix"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&legacy_backup).unwrap(),
+            "old backup",
+            "pre-existing non-dot .remote backup must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_conflict_keep_both_preserves_binary_remote_content() {
+        // Keep-both must preserve arbitrary (non-UTF-8) remote bytes verbatim in
+        // the local-only preservation copy — the remote version is never
+        // decoded or truncated.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let local_path = "blob.bin";
+        std::fs::write(root.as_path().join(local_path), b"LOCAL-B").unwrap();
+
+        let local = test_local_db();
+        seed_file_state(&local, local_path, &compute_bytes_hash(b"LOCAL-B"), 7);
+        let remote_state = RemoteState {
+            hash: compute_bytes_hash(b"\x00\x01\x02\xff\xfe"),
+            size: 5,
+            modified_at: Utc::now(),
+            couch_rev: CouchRev::new("2-bbb").unwrap(),
+            deleted: false,
+        };
+        local
+            .store_conflict(&Conflict::new(
+                local_path.to_string(),
+                local.get_file_state(local_path).unwrap().unwrap(),
+                remote_state,
+            ))
+            .unwrap();
+
+        let remote_path = format!("test-prefix/{local_path}");
+        let mut engine = SyncEngine::new(
+            test_canned_couch(
+                "test-prefix/",
+                resolve_canned_couch(&remote_path, b"\x00\x01\x02\xff\xfe", "2-bbb"),
+            ),
+            local,
+            root.clone(),
+        );
+        engine
+            .resolve_conflict(local_path, ResolutionStrategy::KeepBoth)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(root.as_path().join(".blob.bin.remote")).unwrap(),
+            b"\x00\x01\x02\xff\xfe",
+            "binary remote bytes preserved verbatim"
+        );
+        assert_eq!(
+            std::fs::read(root.as_path().join(local_path)).unwrap(),
+            b"LOCAL-B",
+            "local binary version kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_conflict_keep_local_refuses_when_remote_changed_since_preview() {
+        // A destructive keep-local must not overwrite a remote version that
+        // advanced after the conflict was previewed: it refreshes the conflict's
+        // remote snapshot and bails so the user re-reviews.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let local_path = "doc.txt";
+        std::fs::write(root.as_path().join(local_path), b"LOCAL-B").unwrap();
+
+        let local = test_local_db();
+        seed_file_state(&local, local_path, &compute_bytes_hash(b"LOCAL-B"), 7);
+        // Snapshot the user previewed: remote at rev 2-bbb (REMOTE-A).
+        let remote_state = RemoteState {
+            hash: compute_bytes_hash(b"REMOTE-A"),
+            size: 8,
+            modified_at: Utc::now(),
+            couch_rev: CouchRev::new("2-bbb").unwrap(),
+            deleted: false,
+        };
+        local
+            .store_conflict(&Conflict::new(
+                local_path.to_string(),
+                local.get_file_state(local_path).unwrap().unwrap(),
+                remote_state,
+            ))
+            .unwrap();
+
+        // Live remote has since advanced to 3-ccc (REMOTE-C) — unseen by the
+        // user who previewed 2-bbb.
+        let remote_path = format!("test-prefix/{local_path}");
+        let mut engine = SyncEngine::new(
+            test_canned_couch(
+                "test-prefix/",
+                resolve_canned_couch(&remote_path, b"REMOTE-C", "3-ccc"),
+            ),
+            local,
+            root.clone(),
+        );
+        let err = engine
+            .resolve_conflict(local_path, ResolutionStrategy::KeepLocal)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Remote changed since the conflict was previewed"),
+            "unexpected error: {err}"
+        );
+
+        // The conflict is NOT resolved; its remote snapshot is refreshed so the
+        // next preview shows the current remote version.
+        let conflicts = engine.get_conflicts().await.unwrap();
+        assert_eq!(conflicts.len(), 1, "conflict must remain for re-review");
+        assert_eq!(
+            conflicts[0].remote_state.couch_rev.as_str(),
+            "3-ccc",
+            "conflict snapshot refreshed to the current remote version"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.as_path().join(local_path)).unwrap(),
+            "LOCAL-B",
+            "local file untouched after refused keep-local"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_conflict_keep_remote_refuses_when_local_edited_since_preview() {
+        // A destructive keep-remote must not overwrite a local edit made after
+        // the conflict was previewed: it refreshes the conflict's local snapshot
+        // and bails so the user re-reviews.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let local_path = "doc.txt";
+        // Snapshot the user previewed: local content "original".
+        std::fs::write(root.as_path().join(local_path), b"original").unwrap();
+
+        let local = test_local_db();
+        seed_file_state(&local, local_path, &compute_bytes_hash(b"original"), 8);
+        let remote_state = RemoteState {
+            hash: compute_bytes_hash(b"REMOTE-A"),
+            size: 8,
+            modified_at: Utc::now(),
+            couch_rev: CouchRev::new("2-bbb").unwrap(),
+            deleted: false,
+        };
+        local
+            .store_conflict(&Conflict::new(
+                local_path.to_string(),
+                local.get_file_state(local_path).unwrap().unwrap(),
+                remote_state,
+            ))
+            .unwrap();
+
+        // The user edited the local file after previewing (before resolving).
+        std::fs::write(root.as_path().join(local_path), b"edited later").unwrap();
+
+        let remote_path = format!("test-prefix/{local_path}");
+        let mut engine = SyncEngine::new(
+            test_canned_couch(
+                "test-prefix/",
+                resolve_canned_couch(&remote_path, b"REMOTE-A", "2-bbb"),
+            ),
+            local,
+            root.clone(),
+        );
+        let err = engine
+            .resolve_conflict(local_path, ResolutionStrategy::KeepRemote)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Local file changed since the conflict was previewed"),
+            "unexpected error: {err}"
+        );
+
+        // The conflict is NOT resolved and the newer local edit is preserved;
+        // the local snapshot is refreshed for re-review.
+        let conflicts = engine.get_conflicts().await.unwrap();
+        assert_eq!(conflicts.len(), 1, "conflict must remain for re-review");
+        assert_eq!(
+            conflicts[0].local_state.hash,
+            compute_bytes_hash(b"edited later"),
+            "conflict local snapshot refreshed to the current local version"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.as_path().join(local_path)).unwrap(),
+            "edited later",
+            "newer local edit preserved after refused keep-remote"
         );
     }
 

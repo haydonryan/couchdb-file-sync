@@ -46,6 +46,13 @@ sync:
   # Default: 604800 (7 days)
   tombstone_retention_secs: 604800
 
+  # Grace period (seconds) protecting in-flight chunk publication during orphan
+  # collection. Each cycle reclaims unreferenced chunks left by failed uploads
+  # and pruned tombstones, but a chunk younger than this window is deferred in
+  # case a concurrent client is mid-publication. 0 disables collection.
+  # Default: 300 (5 minutes)
+  orphan_chunk_grace_secs: 300
+
 # Ignore patterns (alternative to .sync-ignore file)
 ignore:
   patterns:

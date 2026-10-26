@@ -30,9 +30,40 @@ const FILE_ID_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'~');
 
 /// True if `id` is a chunk document id (generated as `h:<hex><hex>`).
+///
+/// A chunk id is exactly `h:` followed by a non-empty run of hex digits (the
+/// timestamp and random suffix produced by `generate_chunk_id`). A tracked
+/// file whose path merely *begins* with `h:` (e.g. `h:report.md`) is NOT a
+/// chunk: hard-deleting it must surface as a file deletion, never be discarded
+/// as chunk cleanup.
 #[must_use]
 fn is_chunk_id(id: &str) -> bool {
-    id.starts_with("h:")
+    let Some(hex_part) = id.strip_prefix("h:") else {
+        return false;
+    };
+    !hex_part.is_empty() && hex_part.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// True if `id` is a `CouchDB` system document (a design doc `_design/...` or
+/// a local doc `_local/...`). These are server bookkeeping records, never user
+/// files, so they must be excluded from the change stream before any
+/// document-kind decision.
+#[must_use]
+fn is_system_doc_id(id: &str) -> bool {
+    id.starts_with("_design/") || id.starts_with("_local/")
+}
+
+/// Result of one orphan-chunk collection pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChunkCollectionResult {
+    /// Total chunk documents examined during the pass.
+    pub scanned: usize,
+    /// Unreachable chunks hard-deleted during the pass.
+    pub collected: usize,
+    /// Unreachable chunks left in place (still within the in-flight grace
+    /// period, missing a revision, deferred to respect the per-pass bound, or
+    /// whose delete failed).
+    pub deferred: usize,
 }
 
 /// Transport headroom (ms) reserved between the long-poll server wait and the
@@ -430,8 +461,12 @@ impl CouchDb {
             ),
         };
 
+        // Decode the feed as raw JSON envelopes first so an unrelated or
+        // unsupported document can never fail deserialization of the whole
+        // response. Each in-scope row is then inspected by id and document
+        // kind, and only validated file records are decoded into `FileDoc`.
         let body = self
-            .retry_transient::<_, _, ChangesResponse<FileDoc>, anyhow::Error>(|| {
+            .retry_transient::<_, _, ChangesResponse<Value>, anyhow::Error>(|| {
                 let mut request = self.http_client.get(&url).query(&[
                     ("since", since),
                     ("include_docs", "true"),
@@ -448,7 +483,7 @@ impl CouchDb {
                 async move {
                     let response = request.send().await?.error_for_status()?;
                     response
-                        .json::<ChangesResponse<FileDoc>>()
+                        .json::<ChangesResponse<Value>>()
                         .await
                         .map_err(Into::into)
                 }
@@ -457,58 +492,106 @@ impl CouchDb {
 
         let mut entries = Vec::new();
         for row in body.results {
-            if !self.is_path_allowed(&row.id) {
-                continue;
+            if let Some(entry) = self.change_from_row(&row)? {
+                entries.push(entry);
             }
-
-            if row.deleted.unwrap_or(false) {
-                // Hard-deleted rows carry no body, so `doc.is_file()` cannot be
-                // consulted here. Chunk documents (ids like `h:...`) are
-                // hard-deleted whenever a file is overwritten; they must not
-                // surface as file deletions in the change stream.
-                if is_chunk_id(&row.id) {
-                    continue;
-                }
-                entries.push(ChangeFeedEntry {
-                    change: Change::remote_deleted(
-                        row.id,
-                        None,
-                        row.changes.first().map(|c| c.rev.clone()),
-                    ),
-                    seq: seq_to_string(&row.seq),
-                });
-                continue;
-            }
-
-            let Some(doc) = row.doc else {
-                continue;
-            };
-
-            if !doc.is_file() {
-                continue;
-            }
-
-            if doc.deleted {
-                entries.push(ChangeFeedEntry {
-                    change: Change::remote_deleted(
-                        doc.id.clone(),
-                        Some(doc.delete_time()),
-                        doc.rev.clone(),
-                    ),
-                    seq: seq_to_string(&row.seq),
-                });
-                continue;
-            }
-
-            let mtime = doc.modified_at();
-            let rev = doc.rev.clone().unwrap_or_default();
-            entries.push(ChangeFeedEntry {
-                change: Change::remote_modified(doc.id, String::new(), doc.size, mtime, rev),
-                seq: seq_to_string(&row.seq),
-            });
         }
 
         Ok((entries, seq_to_string(&body.last_seq)))
+    }
+
+    /// Classify a single raw `_changes` row into a [`ChangeFeedEntry`], or
+    /// `Ok(None)` when the row is out of scope or is not a file record.
+    ///
+    /// Raw JSON envelopes are inspected here rather than deserializing the
+    /// whole feed as `FileDoc`, so an unrelated or unsupported document can
+    /// never fail the feed. Out-of-scope ids and non-file documents (chunk
+    /// `leaf` docs, design/system docs, unknown `type` values) are dropped;
+    /// only validated in-scope file records are decoded into `FileDoc`.
+    fn change_from_row(&self, row: &ChangeRow<Value>) -> Result<Option<ChangeFeedEntry>> {
+        // Out-of-scope ids are dropped before any document-kind decision so
+        // unrelated remote records never surface or break the feed.
+        if !self.is_path_allowed(&row.id) {
+            return Ok(None);
+        }
+
+        if row.deleted.unwrap_or(false) {
+            // Hard-deleted rows carry no body, so the document kind is
+            // unavailable. Chunk documents (ids like `h:<hex><hex>`) are
+            // hard-deleted whenever a file is overwritten; they must not
+            // surface as file deletions. Only a `h:` id whose remainder is
+            // pure hex is a chunk — a tracked file that merely begins with
+            // `h:` is still a real file deletion.
+            if is_chunk_id(&row.id) {
+                return Ok(None);
+            }
+            return Ok(Some(ChangeFeedEntry {
+                change: Change::remote_deleted(
+                    row.id.clone(),
+                    None,
+                    row.changes.first().map(|c| c.rev.clone()),
+                ),
+                seq: seq_to_string(&row.seq),
+            }));
+        }
+
+        let Some(doc) = row.doc.as_ref() else {
+            return Ok(None);
+        };
+
+        // Design/local system documents are never user files.
+        if is_system_doc_id(&row.id) {
+            return Ok(None);
+        }
+
+        // Only `plain` documents — or documents with no `type`, which defaults
+        // to `plain` — are file records. Chunk (`leaf`) documents and any
+        // unknown/unsupported `type` value are not files: skip them rather
+        // than letting one unrelated record fail the feed.
+        let is_file_doc = match doc.get("type") {
+            None => true,
+            Some(Value::String(t)) => t == "plain",
+            Some(_) => false,
+        };
+        if !is_file_doc {
+            return Ok(None);
+        }
+
+        // In-scope, file-typed record: decode the applicable schema. A
+        // malformed body here is an actionable error, never a silent drop —
+        // returning Err leaves the checkpoint unadvanced so the malformed file
+        // cannot be lost.
+        let file_doc: FileDoc = serde_json::from_value(doc.clone()).map_err(|e| {
+            anyhow::anyhow!(
+                "Malformed in-scope file document `{}` in changes feed: {e}",
+                row.id
+            )
+        })?;
+
+        let entry = if file_doc.deleted {
+            ChangeFeedEntry {
+                change: Change::remote_deleted(
+                    file_doc.id.clone(),
+                    Some(file_doc.delete_time()),
+                    file_doc.rev,
+                ),
+                seq: seq_to_string(&row.seq),
+            }
+        } else {
+            let mtime = file_doc.modified_at();
+            let rev = file_doc.rev.clone().unwrap_or_default();
+            ChangeFeedEntry {
+                change: Change::remote_modified(
+                    file_doc.id,
+                    String::new(),
+                    file_doc.size,
+                    mtime,
+                    rev,
+                ),
+                seq: seq_to_string(&row.seq),
+            }
+        };
+        Ok(Some(entry))
     }
 
     /// Check if a path is within the configured remote path
@@ -1083,6 +1166,7 @@ impl CouchDb {
             rev: None,
             data: content,
             doc_type: crate::models::DocType::Leaf,
+            created_at: crate::models::TimestampMillis::now(),
         };
 
         self.save_chunk(&chunk).await?;
@@ -1191,6 +1275,140 @@ impl CouchDb {
             }
         }
         Ok(pruned)
+    }
+
+    /// Ensure a Mango index on the `type` field exists so chunk enumeration
+    /// via `_find` is available. `Idempotent`: `CouchDB` returns success with
+    /// `result: "exists"` when the index is already present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `_index` request fails.
+    async fn ensure_chunk_type_index(&self) -> Result<()> {
+        let fields = couch_rs::types::index::IndexFields::new(vec![
+            couch_rs::types::find::SortSpec::Simple("type".to_string()),
+        ]);
+        self.db
+            .insert_index("chunk-type-index", fields, None, None)
+            .await?;
+        Ok(())
+    }
+
+    /// Collect orphan (unreachable) chunk documents, reclaiming content left
+    /// behind by failed metadata publications and pruned tombstones.
+    ///
+    /// A chunk is an orphan when its id is not referenced by any file document
+    /// (live file *or* not-yet-pruned tombstone). Two failure modes produce
+    /// such orphans:
+    ///
+    /// - A failed publication: `upload_file_content` saves new chunks *before*
+    ///   `save_file` publishes the metadata, so a failed/failed-to-commit save
+    ///   leaves the freshly uploaded chunks with no referencing document.
+    /// - Tombstone pruning: `prune_tombstones` hard-deletes obsolete delete
+    ///   tombstones (metadata only), orphaning the chunks they referenced.
+    ///
+    /// Collection is **bounded**: at most `batch_size` orphans are hard-deleted
+    /// per pass; any remainder is left in place for a later pass. It is
+    /// **resumable**: unreferenced chunks persist until collected, so an
+    /// interrupted pass continues on the next cycle. To protect a concurrent
+    /// in-flight publication — a chunk just uploaded by another client whose
+    /// metadata save has not landed yet — an unreferenced chunk younger than
+    /// `grace` is deferred rather than collected. Every delete targets the
+    /// specific revision observed during enumeration, so a chunk that changed
+    /// (or became referenced) since is never removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index setup, file-document fetch, or chunk
+    /// enumeration fails. Individual delete failures are logged and counted as
+    /// deferred rather than aborting the pass.
+    pub async fn collect_orphan_chunks(
+        &self,
+        batch_size: u64,
+        grace: Duration,
+    ) -> Result<ChunkCollectionResult> {
+        #[cfg(test)]
+        if self.test_state.is_some() {
+            self.test_write_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Ok(ChunkCollectionResult::default());
+        }
+
+        self.ensure_chunk_type_index().await?;
+
+        let batch = usize::try_from(batch_size.max(1)).unwrap_or(1000);
+
+        let now_ms = crate::models::TimestampMillis::now().as_u64();
+        let grace_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX);
+        // Only collect chunks created strictly before the grace window opens.
+        // created_at == 0 (older/externally-created chunks) is treated as old:
+        // its age is unknown but it is unreferenced, and deferring it forever
+        // would never reclaim pre-existing orphans.
+        let cutoff = now_ms.saturating_sub(grace_ms);
+
+        // Referenced chunk ids from every file document (live files and
+        // not-yet-pruned tombstones). Chunks referenced by a surviving
+        // tombstone are "recoverable" and must survive.
+        let all_files = self.get_all_files().await?;
+        let referenced: HashSet<&str> = all_files
+            .iter()
+            .flat_map(|d| d.children.iter().map(String::as_str))
+            .collect();
+
+        let mut result = ChunkCollectionResult::default();
+        let mut bookmark: Option<String> = None;
+        loop {
+            let mut query =
+                couch_rs::types::find::FindQuery::new(serde_json::json!({ "type": "leaf" }))
+                    .fields(vec![
+                        "_id".to_string(),
+                        "_rev".to_string(),
+                        "created_at".to_string(),
+                    ])
+                    .limit(u64::try_from(batch).unwrap_or(1000))
+                    .stable(true);
+            if let Some(b) = &bookmark {
+                query = query.bookmark(b);
+            }
+            let collection = self.db.find::<ChunkDoc>(&query).await?;
+
+            for chunk in &collection.rows {
+                result.scanned += 1;
+                if referenced.contains(chunk.id.as_str()) {
+                    continue;
+                }
+                let created = chunk.created_at.as_u64();
+                if created != 0 && created > cutoff {
+                    // Still inside the in-flight publication grace window.
+                    result.deferred += 1;
+                    continue;
+                }
+                if result.collected >= batch {
+                    // Per-pass bound reached; leave the rest for a later pass.
+                    result.deferred += 1;
+                    continue;
+                }
+                let Some(rev) = chunk.rev.as_deref() else {
+                    warn!("Skipping orphan chunk {} without a revision", chunk.id);
+                    result.deferred += 1;
+                    continue;
+                };
+                match self.delete_doc(&chunk.id, rev).await {
+                    Ok(()) => result.collected += 1,
+                    Err(e) => {
+                        warn!("Failed to collect orphan chunk {}: {e}", chunk.id);
+                        result.deferred += 1;
+                    }
+                }
+            }
+
+            match collection.bookmark {
+                Some(next) if next != bookmark.as_deref().unwrap_or("") => bookmark = Some(next),
+                _ => break,
+            }
+        }
+
+        Ok(result)
     }
 }
 
@@ -1934,6 +2152,110 @@ mod tests {
         Ok(response)
     }
 
+    /// Serve a `_changes` feed from raw JSON row objects so tests can inject
+    /// unknown types, system docs, malformed docs, and other non-`FileDoc`
+    /// records without ever round-tripping through `FileDoc` serialization.
+    ///
+    /// Rows are served with `1`-based sequences derived from their position,
+    /// filtered to sequences strictly greater than the `since` query parameter
+    /// (mirroring [`spawn_fake_changes_couch`]).
+    fn spawn_fake_raw_changes_couch(
+        rows: Vec<serde_json::Value>,
+    ) -> (
+        String,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake raw changes couch");
+        let addr = listener.local_addr().expect("fake raw changes addr");
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_thread = shutdown.clone();
+        let rows_thread = rows;
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("fake raw changes runtime");
+            runtime.block_on(async move {
+                listener
+                    .set_nonblocking(true)
+                    .expect("set fake raw changes nonblocking");
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .expect("fake raw changes tokio listener");
+                loop {
+                    if shutdown_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    match tokio::time::timeout(Duration::from_millis(10), listener.accept()).await {
+                        Ok(Ok((stream, _))) => {
+                            let rows = rows_thread.clone();
+                            let service = hyper::service::service_fn(move |req| {
+                                handle_fake_raw_changes_couch_req(req, rows.clone())
+                            });
+                            tokio::spawn(async move {
+                                let io = hyper_util::rt::TokioIo::new(stream);
+                                let _ = hyper::server::conn::http1::Builder::new()
+                                    .serve_connection(io, service)
+                                    .await;
+                            });
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_) => {}
+                    }
+                }
+            });
+        });
+        (format!("http://{addr}"), handle, shutdown)
+    }
+
+    /// Serve the `_changes` endpoint from raw JSON rows (see
+    /// [`spawn_fake_raw_changes_couch`]).
+    #[allow(clippy::unused_async)]
+    async fn handle_fake_raw_changes_couch_req(
+        req: hyper::Request<hyper::body::Incoming>,
+        rows: Vec<serde_json::Value>,
+    ) -> Result<hyper::Response<http_body_util::Full<hyper::body::Bytes>>, hyper::Error> {
+        let (parts, _body) = req.into_parts();
+        let mut response =
+            hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::new()));
+        let method = parts.method.clone();
+        let path = parts.uri.path().to_string();
+        match (method, path.as_str()) {
+            (hyper::Method::GET, p) if p.ends_with("_changes") => {
+                let since = parts
+                    .uri
+                    .query()
+                    .and_then(|q| {
+                        q.split('&').find_map(|kv| {
+                            let (k, v) = kv.split_once('=')?;
+                            (k == "since").then(|| v.to_string())
+                        })
+                    })
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let results: Vec<serde_json::Value> = rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| (*i as u64) + 1 > since)
+                    .map(|(i, row)| {
+                        let mut r = row.clone();
+                        r["seq"] = serde_json::json!(((i as u64) + 1).to_string());
+                        r
+                    })
+                    .collect();
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(
+                    serde_json::json!({ "results": results, "last_seq": rows.len().to_string() })
+                        .to_string(),
+                ));
+            }
+            _ => {
+                *response.status_mut() = hyper::StatusCode::NOT_FOUND;
+            }
+        }
+        Ok(response)
+    }
+
     /// Parameters for a stateful fake `CouchDB` that models writes landing
     /// concurrently with a first-run bootstrap.
     ///
@@ -2463,6 +2785,222 @@ mod tests {
         assert_eq!(seq, "2", "bootstrap checkpoints the DB update_seq");
     }
 
+    /// Build a raw `_changes` row with an optional body and optional hard-delete
+    /// flag, for [`spawn_fake_raw_changes_couch`].
+    fn raw_row(id: &str, deleted: bool, doc: Option<serde_json::Value>) -> serde_json::Value {
+        let mut row = serde_json::json!({
+            "id": id,
+            "changes": [{ "rev": "1-abc" }],
+        });
+        if deleted {
+            row["deleted"] = serde_json::json!(true);
+        }
+        if let Some(doc) = doc {
+            row["doc"] = doc;
+        }
+        row
+    }
+
+    /// Build a well-formed `plain` `FileDoc` body for a raw feed row.
+    fn raw_file_doc(id: &str, mtime_ms: u64) -> serde_json::Value {
+        serde_json::json!({
+            "_id": id,
+            "_rev": "1-abc",
+            "type": "plain",
+            "path": id,
+            "children": [],
+            "mtime": mtime_ms,
+            "ctime": 0,
+            "size": 1,
+            "deleted": false,
+            "deleted_at": 0,
+            "hash": "",
+        })
+    }
+
+    #[test]
+    fn is_chunk_id_requires_pure_hex_suffix() {
+        assert!(is_chunk_id("h:deadbeefcafe"));
+        assert!(is_chunk_id("h:0"));
+        assert!(
+            !is_chunk_id("h:report.md"),
+            "a tracked file path with an extension is not a chunk"
+        );
+        assert!(
+            !is_chunk_id("h:"),
+            "a bare `h:` with no hex suffix is not a chunk"
+        );
+        assert!(
+            !is_chunk_id("notes/h:thing.md"),
+            "a scoped file id is not a chunk"
+        );
+        assert!(!is_chunk_id("not-a-chunk"));
+    }
+
+    #[tokio::test]
+    async fn get_changes_mixed_types_do_not_break_scoped_feed() {
+        // A scoped changes feed containing unrelated/unsupported records must
+        // not fail: unknown types, design docs, and leaf chunks are isolated;
+        // only validated file records (plus tracked h:-named files) surface.
+        let rows = vec![
+            raw_row(
+                "notes/good.md",
+                false,
+                Some(raw_file_doc("notes/good.md", 1000)),
+            ),
+            // design/system doc must be excluded
+            raw_row(
+                "_design/notes",
+                false,
+                Some(serde_json::json!({ "_id": "_design/notes" })),
+            ),
+            // unknown type must not break the feed
+            raw_row(
+                "notes/custom.md",
+                false,
+                Some(serde_json::json!({
+                    "_id": "notes/custom.md", "type": "custom", "path": "notes/custom.md"
+                })),
+            ),
+            // leaf chunk without an h: id is not a file
+            raw_row(
+                "notes/leaf-no-h.md",
+                false,
+                Some(serde_json::json!({
+                    "_id": "notes/leaf-no-h.md", "type": "leaf", "children": []
+                })),
+            ),
+            // no `type` field -> defaults to plain -> a file
+            raw_row(
+                "notes/no-type.md",
+                false,
+                Some(serde_json::json!({
+                    "_id": "notes/no-type.md", "path": "notes/no-type.md",
+                    "children": [], "mtime": 2000, "size": 2,
+                    "deleted": false, "deleted_at": 0, "hash": "",
+                })),
+            ),
+            // hard-deleted chunk id (pure hex) -> chunk cleanup, not a file delete
+            raw_row("h:deadbeefcafe", true, None),
+            // hard-deleted tracked file whose id begins with `h:` -> real delete
+            raw_row("h:report.md", true, None),
+            // out-of-scope doc is ignored entirely
+            raw_row(
+                "other.md",
+                false,
+                Some(serde_json::json!({ "_id": "other.md", "type": "custom" })),
+            ),
+        ];
+        let (addr, server, shutdown) = spawn_fake_raw_changes_couch(rows);
+        // Empty scope: root-level chunk ids and root-level h:-named files
+        // coexist, which is exactly where a `h:`-prefixed tracked file could be
+        // mistaken for a chunk.
+        let db = couchdb_at_full(&addr, "");
+
+        let (changes, seq) = db
+            .get_changes(Some("0"))
+            .await
+            .expect("mixed-type feed must not fail");
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake raw changes couch join");
+
+        let mut paths: Vec<&str> = changes.iter().map(Change::path).collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            vec!["h:report.md", "notes/good.md", "notes/no-type.md"],
+            "only validated in-scope files and tracked h:-named deletions surface"
+        );
+        assert!(
+            changes.iter().any(|c| matches!(
+                c,
+                Change::RemoteDeleted { path, .. } if path == "h:report.md"
+            )),
+            "tracked h:-named file deletion must not be discarded as a chunk delete"
+        );
+        assert_eq!(
+            seq, "8",
+            "the feed last_seq is still returned even when rows are skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_changes_malformed_in_scope_file_is_actionable_error() {
+        // A `plain`-typed in-scope document with a malformed body must produce
+        // an actionable error rather than silently dropping the change (which
+        // would advance the checkpoint past it without triage).
+        let rows = vec![
+            raw_row(
+                "notes/good.md",
+                false,
+                Some(raw_file_doc("notes/good.md", 1000)),
+            ),
+            // mtime is a non-numeric string -> FileDoc decode fails
+            raw_row(
+                "notes/broken.md",
+                false,
+                Some(serde_json::json!({
+                    "_id": "notes/broken.md", "type": "plain", "path": "notes/broken.md",
+                    "children": [], "mtime": "not-a-number", "size": 1,
+                })),
+            ),
+        ];
+        let (addr, server, shutdown) = spawn_fake_raw_changes_couch(rows);
+        let db = couchdb_at_full(&addr, "notes/");
+
+        let err = db
+            .get_changes(Some("0"))
+            .await
+            .expect_err("malformed in-scope file must error");
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake raw changes couch join");
+
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("notes/broken.md"),
+            "error must name the malformed file, got: {err_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_changes_malformed_out_of_scope_doc_is_ignored() {
+        // A malformed document outside the sync scope is filtered by id before
+        // any decode, so it neither surfaces nor fails the feed.
+        let rows = vec![
+            raw_row(
+                "outside/broken.md",
+                false,
+                Some(serde_json::json!({
+                    "_id": "outside/broken.md", "type": "plain", "mtime": "garbage"
+                })),
+            ),
+            raw_row(
+                "notes/good.md",
+                false,
+                Some(raw_file_doc("notes/good.md", 1000)),
+            ),
+        ];
+        let (addr, server, shutdown) = spawn_fake_raw_changes_couch(rows);
+        let db = couchdb_at_full(&addr, "notes/");
+
+        let (changes, _seq) = db
+            .get_changes(Some("0"))
+            .await
+            .expect("out-of-scope malformed doc must not break the feed");
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake raw changes couch join");
+
+        let paths: Vec<&str> = changes.iter().map(Change::path).collect();
+        assert_eq!(
+            paths,
+            vec!["notes/good.md"],
+            "only the in-scope valid file surfaces"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // obsolete_tombstones
     // -----------------------------------------------------------------------
@@ -2985,6 +3523,255 @@ mod tests {
         assert_eq!(
             round_tripped, original,
             "non-UTF-8 bytes must round-trip byte-identical through upload+download"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Orphan chunk collection (story 6352)
+    // -----------------------------------------------------------------------
+
+    /// Build a well-formed `plain` `FileDoc` row body for the `_all_docs`
+    /// response used by `get_all_files`. A `deleted: true` doc models a
+    /// soft-delete tombstone whose chunks are still recoverable.
+    fn orphan_file_row(id: &str, children: &[&str], deleted: bool, mtime_ms: u64) -> String {
+        let children_json = serde_json::to_string(children).expect("children json");
+        format!(
+            r#"{{"id":"{id}","key":null,"value":{{"rev":"1-{id}-rev"}},"doc":{{"_id":"{id}","_rev":"1-{id}-rev","path":"{id}","children":{children_json},"ctime":0,"mtime":{mtime_ms},"size":1,"type":"plain","deleted":{deleted},"deleted_at":{mtime_ms},"hash":""}}}}"#
+        )
+    }
+
+    /// Build a chunk document projection (`id`, `rev`, `created_at`) as served
+    /// by `_find`.
+    fn orphan_chunk_json(id: &str, rev: &str, created_at_ms: u64) -> String {
+        format!(r#"{{"_id":"{id}","_rev":"{rev}","created_at":{created_at_ms}}}"#)
+    }
+
+    /// Spawn a fake `CouchDB` server that serves the given file rows on
+    /// `POST /_all_docs`, the given chunk docs on `POST /_find`, answers
+    /// `POST /_index` with success (Mango index creation), and counts
+    /// `DELETE` requests (orphan collection). Returns the base database URL,
+    /// a delete counter, the server thread handle, and a shutdown flag.
+    #[allow(clippy::type_complexity)]
+    fn spawn_orphan_collection_couch(
+        file_rows: &[String],
+        chunk_docs: &[String],
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind orphan collection couch");
+        let addr = listener.local_addr().expect("orphan collection couch addr");
+        let base_db_url = format!("http://{addr}/test_db");
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delete_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shutdown_thread = shutdown.clone();
+        let delete_count_thread = delete_count.clone();
+        let rows_json = std::sync::Arc::new(file_rows.join(","));
+        let chunks_json = std::sync::Arc::new(chunk_docs.join(","));
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("orphan collection fake couch runtime");
+            runtime.block_on(async move {
+                listener
+                    .set_nonblocking(true)
+                    .expect("set orphan collection fake couch nonblocking");
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .expect("orphan collection tokio listener");
+                loop {
+                    if shutdown_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    match tokio::time::timeout(Duration::from_millis(10), listener.accept()).await {
+                        Ok(Ok((stream, _))) => {
+                            let delete_count_thread = delete_count_thread.clone();
+                            let rows_json = rows_json.clone();
+                            let chunks_json = chunks_json.clone();
+                            let service = hyper::service::service_fn(move |req| {
+                                let delete_count_thread = delete_count_thread.clone();
+                                let rows_json = rows_json.clone();
+                                let chunks_json = chunks_json.clone();
+                                async move {
+                                    handle_orphan_collection_couch_req(
+                                        req,
+                                        rows_json,
+                                        chunks_json,
+                                        delete_count_thread,
+                                    )
+                                    .await
+                                }
+                            });
+                            tokio::spawn(async move {
+                                let io = hyper_util::rt::TokioIo::new(stream);
+                                let _ = hyper::server::conn::http1::Builder::new()
+                                    .serve_connection(io, service)
+                                    .await;
+                            });
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_elapsed) => {}
+                    }
+                }
+            });
+        });
+        (base_db_url, delete_count, handle, shutdown)
+    }
+
+    /// Serve the endpoints used by `collect_orphan_chunks`: `_index`
+    /// (index creation), `_find` (chunk enumeration), `_all_docs` (file
+    /// documents for the referenced set) and `DELETE` (orphan hard-delete).
+    #[allow(clippy::unused_async)]
+    async fn handle_orphan_collection_couch_req(
+        req: hyper::Request<hyper::body::Incoming>,
+        rows_json: std::sync::Arc<String>,
+        chunks_json: std::sync::Arc<String>,
+        delete_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Result<hyper::Response<http_body_util::Full<hyper::body::Bytes>>, hyper::Error> {
+        let (parts, _body) = req.into_parts();
+        let mut response =
+            hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::new()));
+        let last_segment = parts
+            .uri
+            .path()
+            .split('/')
+            .next_back()
+            .unwrap_or("")
+            .to_string();
+        match (parts.method.as_str(), last_segment.as_str()) {
+            ("POST", "_index") => {
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from_static(
+                    br#"{"ok":true,"result":"created"}"#,
+                ));
+            }
+            ("POST", "_find") => {
+                let body = format!(
+                    r#"{{"docs":[{chunks}],"bookmark":"nil"}}"#,
+                    chunks = chunks_json.as_str()
+                );
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(body));
+            }
+            ("POST", "_all_docs") => {
+                let body = format!(
+                    r#"{{"total_rows":0,"offset":0,"rows":[{rows}]}}"#,
+                    rows = rows_json.as_str()
+                );
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(body));
+            }
+            ("DELETE", _) => {
+                delete_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                *response.body_mut() =
+                    http_body_util::Full::new(hyper::body::Bytes::from_static(br#"{"ok":true}"#));
+            }
+            _ => {
+                *response.status_mut() = hyper::StatusCode::NOT_FOUND;
+            }
+        }
+        Ok(response)
+    }
+
+    #[tokio::test]
+    async fn collect_orphan_chunks_reclaims_unreferenced_but_keeps_live_shared_and_recoverable() {
+        // Live file references h:live1; a surviving tombstone (recoverable
+        // until pruned) references h:rec1. h:orphan1/h:orphan2 are unreferenced
+        // orphans left by a failed publication or pruned tombstone.
+        let (base_db_url, delete_count, server, shutdown) = spawn_orphan_collection_couch(
+            &[
+                orphan_file_row("notes/a.md", &["h:live1"], false, 1000),
+                orphan_file_row("notes/b.md", &["h:rec1"], true, 1000),
+            ],
+            &[
+                orphan_chunk_json("h:live1", "1-a", 1000),
+                orphan_chunk_json("h:rec1", "1-b", 1000),
+                orphan_chunk_json("h:orphan1", "1-c", 1000),
+                orphan_chunk_json("h:orphan2", "1-d", 1000),
+            ],
+        );
+        let db = couchdb_at_ephemeral(&base_db_url);
+
+        let result = db
+            .collect_orphan_chunks(100, Duration::ZERO)
+            .await
+            .expect("collect orphan chunks");
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake couch server join");
+
+        assert_eq!(result.scanned, 4, "all chunk docs should be examined");
+        assert_eq!(
+            result.collected, 2,
+            "only the two unreferenced chunks should be reclaimed"
+        );
+        assert_eq!(result.deferred, 0, "nothing should be deferred here");
+        assert_eq!(
+            delete_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly the two orphan chunks should be hard-deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_orphan_chunks_defers_chunks_within_in_flight_grace_period() {
+        // h:fresh is unreferenced but was created just now: a concurrent client
+        // may still be mid-publication, so it must be deferred, not collected.
+        let now_ms = crate::models::TimestampMillis::now().as_u64();
+        let (base_db_url, delete_count, server, shutdown) =
+            spawn_orphan_collection_couch(&[], &[orphan_chunk_json("h:fresh", "1-e", now_ms)]);
+        let db = couchdb_at_ephemeral(&base_db_url);
+
+        let result = db
+            .collect_orphan_chunks(100, std::time::Duration::from_hours(1))
+            .await
+            .expect("collect orphan chunks");
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake couch server join");
+
+        assert_eq!(result.collected, 0, "in-flight chunk must not be collected");
+        assert_eq!(result.deferred, 1, "in-flight chunk should be deferred");
+        assert_eq!(
+            delete_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no chunk should be hard-deleted while in the grace window"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_orphan_chunks_is_bounded_per_pass() {
+        // Two orphans but a batch bound of 1: only one is collected this pass,
+        // the other is deferred and reclaimed on a later (resumable) pass.
+        let (base_db_url, delete_count, server, shutdown) = spawn_orphan_collection_couch(
+            &[],
+            &[
+                orphan_chunk_json("h:orphan1", "1-f", 1000),
+                orphan_chunk_json("h:orphan2", "1-g", 1000),
+            ],
+        );
+        let db = couchdb_at_ephemeral(&base_db_url);
+
+        let result = db
+            .collect_orphan_chunks(1, Duration::ZERO)
+            .await
+            .expect("collect orphan chunks");
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake couch server join");
+
+        assert_eq!(
+            result.collected, 1,
+            "collection must respect the per-pass bound"
+        );
+        assert_eq!(
+            result.deferred, 1,
+            "the remaining orphan is deferred for a later pass"
+        );
+        assert_eq!(
+            delete_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one orphan should be hard-deleted this pass"
         );
     }
 }
