@@ -84,6 +84,16 @@ pub struct CannedCouch {
     /// Remote paths (doc ids) for which `save_file` should return an error,
     /// simulating a failed network/auth/server content upload.
     pub save_errors: std::collections::HashSet<String>,
+    /// Remote paths (doc ids) for which the FIRST `save_file` call returns an
+    /// error, simulating a transient upload failure. The path is removed after
+    /// the failure, so a subsequent retry (e.g. reconciliation) succeeds.
+    /// Interior mutability lets the retry succeed against the same shared
+    /// canned state.
+    pub save_errors_once: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Remote paths (doc ids) for which the FIRST `delete_file` call returns an
+    /// error, simulating a transient delete failure. The path is removed after
+    /// the failure so a subsequent retry (reconciliation) succeeds.
+    pub delete_errors_once: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// When set, each `save_file`/`get_file_content` call records itself in the
     /// probe and sleeps for `batch_delay`, letting tests observe how many
     /// per-file operations are in flight at once.
@@ -558,6 +568,16 @@ impl CouchDb {
             if state.save_errors.contains(&doc.id) {
                 anyhow::bail!("simulated save failure for {}", doc.id);
             }
+            // A one-shot transient failure: fail this call and clear the path
+            // so the next call (reconciliation retry) succeeds.
+            if let Ok(mut once) = state.save_errors_once.lock()
+                && once.remove(&doc.id)
+            {
+                anyhow::bail!(
+                    "simulated transient save failure for {doc_id}",
+                    doc_id = doc.id
+                );
+            }
             self.test_write_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let Some(probe) = &state.probe {
@@ -602,7 +622,14 @@ impl CouchDb {
     /// Returns an error if the `CouchDB` request fails.
     pub async fn delete_file(&self, path: &str) -> Result<()> {
         #[cfg(test)]
-        if self.test_state.is_some() {
+        if let Some(state) = &self.test_state {
+            // A one-shot transient failure: fail this call and clear the path
+            // so the next call (reconciliation retry) succeeds.
+            if let Ok(mut once) = state.delete_errors_once.lock()
+                && once.remove(path)
+            {
+                anyhow::bail!("simulated transient delete failure for {path}");
+            }
             self.test_write_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return Ok(());
