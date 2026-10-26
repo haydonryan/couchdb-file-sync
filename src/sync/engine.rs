@@ -4484,7 +4484,7 @@ mod tests {
             IgnoreMatcher::empty(),
         );
         let report = engine.sync().await.expect("sync with collection disabled");
-        assert!(report.errors.is_empty());
+        assert_eq!(report.errors, [] as [String; 0]);
         assert_eq!(
             engine.couchdb.test_write_calls(),
             0,
@@ -4501,7 +4501,7 @@ mod tests {
         )
         .with_orphan_chunk_collection(Some(std::time::Duration::from_mins(5)), 100);
         let report = engine.sync().await.expect("sync with collection enabled");
-        assert!(report.errors.is_empty());
+        assert_eq!(report.errors, [] as [String; 0]);
         assert_eq!(
             engine.couchdb.test_write_calls(),
             1,

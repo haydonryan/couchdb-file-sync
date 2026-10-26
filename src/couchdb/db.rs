@@ -4201,7 +4201,7 @@ mod tests {
                 // a reusable HTTP/1.1 state regardless of the response path.
                 let bytes = body.collect().await.expect("collect chunk body").to_bytes();
                 if remaining_puts
-                    .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                    .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
                     .is_err()
                 {
                     *response.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
