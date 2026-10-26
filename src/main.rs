@@ -182,13 +182,10 @@ async fn run() -> Result<()> {
 
     let config = load_config(&cli)?;
 
-    let enable_file_logging = matches!(
-        &cli.command,
-        Commands::Sync(_)
-            | Commands::RebuildRemote(_)
-            | Commands::RebuildLocal(_)
-            | Commands::Daemon(_)
-    );
+    // Dry-run sync must never create a log file: it is a no-write contract, so
+    // its logging is routed to stdout only.
+    let dry_run = matches!(&cli.command, Commands::Sync(cmd) if cmd.dry_run);
+    let enable_file_logging = should_enable_file_logging(&cli.command, dry_run);
 
     // Initialize logging
     let daemon_mode = matches!(&cli.command, Commands::Daemon(_));
@@ -506,6 +503,25 @@ fn paths_match(left: &std::path::Path, right: &std::path::Path) -> bool {
     }
 }
 
+/// Whether the command writes a detailed log file at all.
+const fn command_enables_file_logging(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Sync(_)
+            | Commands::RebuildRemote(_)
+            | Commands::RebuildLocal(_)
+            | Commands::Daemon(_)
+    )
+}
+
+/// Whether file logging should be enabled for the given command invocation.
+///
+/// A dry-run sync never writes a log file: it is a no-write contract, so its
+/// logging is routed to stdout only.
+const fn should_enable_file_logging(command: &Commands, dry_run: bool) -> bool {
+    !dry_run && command_enables_file_logging(command)
+}
+
 /// Initialize logging based on verbosity or `RUST_LOG` env var
 fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daemon_mode: bool) {
     use tracing_subscriber::EnvFilter;
@@ -569,7 +585,10 @@ fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daem
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, init_logging};
+    use super::{
+        Cli, Commands, ConflictsCommand, DaemonCommand, RebuildLocalCommand, RebuildRemoteCommand,
+        StatusCommand, SyncCommand, init_logging, should_enable_file_logging,
+    };
     use super::{
         apply_cli_overrides, default_user_config_file_if_exists, load_config, paths_match,
         resolve_daemon_interval, resolve_paths, resolved_config_path, validate_daemon_interval,
@@ -896,6 +915,69 @@ mod tests {
     fn init_logging_smoke_test_default_verbose() {
         let config = AppConfig::default();
         init_logging(0, &config, false, false);
+    }
+
+    // ============================================================
+    // should_enable_file_logging tests (dry-run never writes a log file)
+    // ============================================================
+
+    #[test]
+    fn file_logging_enabled_for_sync_non_dry_run() {
+        let cmd = Commands::Sync(SyncCommand {
+            path: None,
+            dry_run: false,
+        });
+        assert!(should_enable_file_logging(&cmd, false));
+    }
+
+    #[test]
+    fn file_logging_disabled_for_dry_run_sync() {
+        let cmd = Commands::Sync(SyncCommand {
+            path: None,
+            dry_run: true,
+        });
+        assert!(
+            !should_enable_file_logging(&cmd, true),
+            "dry-run sync must never write a log file"
+        );
+    }
+
+    #[test]
+    fn file_logging_enabled_for_rebuild_and_daemon() {
+        assert!(should_enable_file_logging(
+            &Commands::Daemon(DaemonCommand {
+                path: None,
+                interval: None,
+                live: false,
+            }),
+            false,
+        ));
+        assert!(should_enable_file_logging(
+            &Commands::RebuildRemote(RebuildRemoteCommand { path: None }),
+            false,
+        ));
+        assert!(should_enable_file_logging(
+            &Commands::RebuildLocal(RebuildLocalCommand { path: None }),
+            false,
+        ));
+    }
+
+    #[test]
+    fn file_logging_disabled_for_read_only_commands() {
+        assert!(!should_enable_file_logging(
+            &Commands::Status(StatusCommand {
+                path: None,
+                json: false,
+            }),
+            false,
+        ));
+        assert!(!should_enable_file_logging(
+            &Commands::Conflicts(ConflictsCommand {
+                path: None,
+                json: false,
+            }),
+            false,
+        ));
     }
 
     // ============================================================

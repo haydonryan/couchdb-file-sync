@@ -303,8 +303,12 @@ couchdb-file-sync sync ~/documents
 
 `--dry-run` walks the full sync pipeline (triage, upload/download/delete
 detection, and conflict identification) without writing anything to CouchDB,
-the local filesystem, or the state database, then prints a summary of what
-would be uploaded, downloaded, deleted, and conflicted.
+the local filesystem, the state database, or a log file, then prints a summary
+of what would be uploaded, downloaded, deleted, and conflicted. It honors this
+no-write contract end to end: no local state is created or migrated (an
+existing state database is opened read-only, and an ephemeral baseline is used
+when none exists), the remote database is never created, and no log file is
+written.
 
 ### `couchdb-file-sync daemon [PATH]`
 

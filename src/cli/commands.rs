@@ -447,9 +447,20 @@ async fn sync_identity_for(
 ///
 /// A database with no recorded identity (fresh or legacy) is conservatively
 /// bound to the current mapping and its state kept; a mapping change errors
-/// out, requiring an explicit reset/rebuild.
-fn validate_sync_mapping(local_db: &LocalDb, identity: &SyncIdentity) -> Result<()> {
-    match local_db.validate_sync_identity(identity)? {
+/// out, requiring an explicit reset/rebuild. When `persist_bind` is false
+/// (dry-run, against a read-only/ephemeral baseline) the conservative bind is
+/// NOT written to state, honoring the no-write contract.
+fn validate_sync_mapping(
+    local_db: &LocalDb,
+    identity: &SyncIdentity,
+    persist_bind: bool,
+) -> Result<()> {
+    let check = if persist_bind {
+        local_db.validate_sync_identity(identity)?
+    } else {
+        local_db.validate_sync_identity_read_only(identity)?
+    };
+    match check {
         SyncIdentityCheck::Matched => {}
         SyncIdentityCheck::Bound => {
             info!(
@@ -524,6 +535,7 @@ pub fn validate_unique_mappings(paths: &[SyncPath]) -> Result<()> {
 ///
 /// Returns an error if the local state DB cannot be opened, the `CouchDB`
 /// connection cannot be established, or the sync pipeline fails.
+#[allow(clippy::too_many_lines)] // single cohesive setup + cycle + reporting flow
 pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<SyncReport> {
     info!("Running sync in: {}", path.display());
 
@@ -534,25 +546,52 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
     // Load ignore patterns
     let ignore_matcher = load_ignore_patterns(&path, &config)?;
 
-    // Open local database
+    // Local state: dry-run must neither create nor migrate state. Use an
+    // existing baseline strictly read-only, or an ephemeral in-memory baseline
+    // when none exists, so the pipeline walks against state without ever
+    // touching the filesystem.
     let db_path = state_db_path(&path);
-    let local_db = LocalDb::open(&db_path)?;
+    let local_db = if dry_run {
+        if db_path.exists() {
+            LocalDb::open_read_only(&db_path)?
+        } else {
+            LocalDb::open_in_memory()?
+        }
+    } else {
+        LocalDb::open(&db_path)?
+    };
 
-    // Connect to CouchDB
-    let couchdb = CouchDb::new(
-        &config.couchdb.url,
-        config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
-        config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
-        &DatabaseName::new(&config.couchdb.database),
-        &RemotePath::new(&config.couchdb.remote_path),
-        config.couchdb.timeout_seconds,
-        config.couchdb.retry_attempts,
-    )
-    .await?
+    // Connect to CouchDB. Dry-run connects read-only so a missing remote
+    // database is never created (it surfaces as an explicit error instead).
+    let couchdb = if dry_run {
+        CouchDb::new_read_only(
+            &config.couchdb.url,
+            config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
+            config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
+            &DatabaseName::new(&config.couchdb.database),
+            &RemotePath::new(&config.couchdb.remote_path),
+            config.couchdb.timeout_seconds,
+            config.couchdb.retry_attempts,
+        )
+        .await?
+    } else {
+        CouchDb::new(
+            &config.couchdb.url,
+            config.couchdb.auth.as_ref().map(|a| a.username.as_str()),
+            config.couchdb.auth.as_ref().map(|a| a.password.as_str()),
+            &DatabaseName::new(&config.couchdb.database),
+            &RemotePath::new(&config.couchdb.remote_path),
+            config.couchdb.timeout_seconds,
+            config.couchdb.retry_attempts,
+        )
+        .await?
+    }
     .with_legacy_chunk_data(config.sync.legacy_chunk_data);
 
     // Validate that the stored state belongs to the current mapping before
-    // reusing it (conservatively binding fresh/legacy state).
+    // reusing it (conservatively binding fresh/legacy state). In dry-run the
+    // baseline is read-only/ephemeral, so the conservative bind is validated
+    // but not persisted (the no-write contract).
     let root = resolve_sync_dir(&path)?;
     let identity = sync_identity_for(
         &couchdb,
@@ -561,7 +600,7 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
         &config.couchdb.remote_path,
     )
     .await?;
-    validate_sync_mapping(&local_db, &identity)?;
+    validate_sync_mapping(&local_db, &identity, !dry_run)?;
 
     // Run sync (dry-run walks the pipeline without writing)
     let retention = (config.sync.tombstone_retention_secs > 0)
@@ -1143,7 +1182,7 @@ async fn daemon_sync(path: &Path, config: &AppConfig) -> Result<SyncReport> {
         &config.couchdb.remote_path,
     )
     .await?;
-    validate_sync_mapping(&local_db, &identity)?;
+    validate_sync_mapping(&local_db, &identity, true)?;
 
     // Run sync
     let retention = (config.sync.tombstone_retention_secs > 0)
@@ -1855,7 +1894,7 @@ async fn build_live_sync_engine(
         &config.couchdb.remote_path,
     )
     .await?;
-    validate_sync_mapping(&local_db, &identity)?;
+    validate_sync_mapping(&local_db, &identity, true)?;
 
     let initial_policy = ignore_policy
         .read()
@@ -2444,7 +2483,7 @@ pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
         &config.couchdb.remote_path,
     )
     .await?;
-    validate_sync_mapping(&local_db, &identity)?;
+    validate_sync_mapping(&local_db, &identity, true)?;
 
     let mut engine = SyncEngine::new(couchdb, local_db, root)
         .with_conflict_dir(config.conflicts.conflict_dir.clone());

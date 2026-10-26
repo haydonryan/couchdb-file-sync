@@ -118,6 +118,10 @@ pub struct CouchDb {
     /// Maximum total attempts (including the initial one) for a `CouchDB`
     /// operation before giving up on transient connectivity failures.
     retry_attempts: u32,
+    /// Whether the client was allowed to create the remote database on
+    /// connect. When `false` (dry-run), the remote DB is never created; a
+    /// missing database surfaces as an explicit error instead of a write.
+    create_db: bool,
     /// How to interpret legacy chunk `data` strings that carry no explicit
     /// codec (see [`LegacyChunkData`]).
     legacy_chunk_data: crate::models::LegacyChunkData,
@@ -268,6 +272,68 @@ impl CouchDb {
         timeout_seconds: u64,
         retry_attempts: u32,
     ) -> Result<Self> {
+        Self::connect(
+            url,
+            username,
+            password,
+            db_name,
+            remote_path,
+            timeout_seconds,
+            retry_attempts,
+            true,
+        )
+        .await
+    }
+
+    /// Create a read-only `CouchDB` client that never creates a missing remote
+    /// database.
+    ///
+    /// The database handle is built structurally (no `PUT` to create a missing
+    /// DB). A read against an absent database therefore 404s and is surfaced as
+    /// an explicit "remote database does not exist" error — dry-run sync uses
+    /// this so it walks the pipeline against an existing baseline and never
+    /// writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `couch_rs` client or reqwest client cannot be
+    /// created.
+    pub async fn new_read_only(
+        url: &str,
+        username: Option<&str>,
+        password: Option<&str>,
+        db_name: &str,
+        remote_path: &str,
+        timeout_seconds: u64,
+        retry_attempts: u32,
+    ) -> Result<Self> {
+        Self::connect(
+            url,
+            username,
+            password,
+            db_name,
+            remote_path,
+            timeout_seconds,
+            retry_attempts,
+            false,
+        )
+        .await
+    }
+
+    /// Shared connection builder. When `create_db` is true the remote database
+    /// is created on connect (via `couch_rs` `Client::db`); when false the
+    /// handle is built structurally so a missing database is never created.
+    #[allow(clippy::too_many_arguments)] // same connection settings as `new`/`new_read_only`
+    async fn connect(
+        url: &str,
+        username: Option<&str>,
+        password: Option<&str>,
+        db_name: &str,
+        remote_path: &str,
+        timeout_seconds: u64,
+        retry_attempts: u32,
+        create_db: bool,
+    ) -> Result<Self> {
         let timeout = Duration::from_secs(timeout_seconds);
         let client = match (username, password) {
             (Some(u), Some(p)) => {
@@ -276,8 +342,13 @@ impl CouchDb {
             _ => Client::new_with_timeout(url, None, None, Some(timeout_seconds))?,
         };
 
-        // Get or create database
-        let db = client.db(db_name).await?;
+        let db = if create_db {
+            // Get or create database (couch_rs `Client::db` creates a missing DB).
+            client.db(db_name).await?
+        } else {
+            // Structural handle only: never create the remote database.
+            couch_rs::database::Database::new(db_name.to_string(), client.clone())
+        };
 
         let auth = match (username, password) {
             (Some(u), Some(p)) => Some((u.to_string(), p.to_string())),
@@ -301,6 +372,7 @@ impl CouchDb {
             remote_path: RemotePath::new(remote_path.to_string()),
             timeout_seconds,
             retry_attempts,
+            create_db,
             legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             #[cfg(test)]
             test_state: None,
@@ -345,8 +417,19 @@ impl CouchDb {
                     request = request.basic_auth(username, Some(password));
                 }
                 async move {
-                    let response = request.send().await?.error_for_status()?;
+                    let response = request.send().await?;
+                    // A read-only client must not silently proceed against a
+                    // missing database: surface the absence explicitly instead
+                    // of ever issuing a write to create it.
+                    if !self.create_db && response.status() == reqwest::StatusCode::NOT_FOUND {
+                        return Err(anyhow::anyhow!(
+                            "remote database '{db}' does not exist (read-only/dry-run sync \
+                             never creates databases), so there is nothing to sync against",
+                            db = self.db_name,
+                        ));
+                    }
                     response
+                        .error_for_status()?
                         .json::<serde_json::Value>()
                         .await
                         .map_err(Into::into)
@@ -387,6 +470,7 @@ impl CouchDb {
             remote_path: RemotePath::new(remote_path.to_string()),
             timeout_seconds: 30,
             retry_attempts: 3,
+            create_db: true,
             legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             #[cfg(test)]
             test_state: None,
@@ -433,6 +517,7 @@ impl CouchDb {
             remote_path: RemotePath::new(remote_path.to_string()),
             timeout_seconds: 30,
             retry_attempts: 3,
+            create_db: true,
             legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             test_state: None,
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -1574,6 +1659,7 @@ mod tests {
             remote_path: RemotePath::new(remote_path.to_string()),
             timeout_seconds: 30,
             retry_attempts: 3,
+            create_db: true,
             legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             test_state: None,
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -1910,6 +1996,7 @@ mod tests {
             remote_path: RemotePath::new(String::new()),
             timeout_seconds: 30,
             retry_attempts: 3,
+            create_db: true,
             legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             test_state: None,
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -2086,6 +2173,7 @@ mod tests {
             remote_path: RemotePath::new(remote_path.to_string()),
             timeout_seconds: 30,
             retry_attempts: 3,
+            create_db: true,
             legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             test_state: None,
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -2112,6 +2200,7 @@ mod tests {
             remote_path: RemotePath::new(remote_path.to_string()),
             timeout_seconds,
             retry_attempts: 3,
+            create_db: true,
             legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             test_state: None,
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -3246,6 +3335,7 @@ mod tests {
             remote_path: RemotePath::new(String::new()),
             timeout_seconds: 30,
             retry_attempts: 3,
+            create_db: true,
             legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             test_state: None,
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),

@@ -2,7 +2,7 @@ use crate::models::{Checkpoint, Conflict, CouchRev, FileState, SyncIdentity};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tracing::info;
@@ -34,6 +34,26 @@ impl LocalDb {
         db.init_schema()?;
         info!("Local database initialized");
         Ok(db)
+    }
+
+    /// Open an existing local database strictly read-only, without creating or
+    /// migrating schema.
+    ///
+    /// Dry-run sync uses this so it can walk the full pipeline against an
+    /// existing baseline without creating tables, running migrations, or
+    /// writing anything. It fails if `path` does not exist — an absent
+    /// baseline is handled by the caller with an ephemeral in-memory database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database file cannot be opened read-only.
+    pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Self {
+            conn,
+            #[cfg(test)]
+            save_file_state_calls: std::cell::Cell::new(0),
+        })
     }
 
     /// Create an in-memory database (for testing)
@@ -617,6 +637,31 @@ impl LocalDb {
                 self.set_sync_identity(identity)?;
                 Ok(SyncIdentityCheck::Bound)
             }
+            Some(stored) if stored == *identity => Ok(SyncIdentityCheck::Matched),
+            Some(stored) => Ok(SyncIdentityCheck::Mismatched {
+                stored,
+                current: identity.clone(),
+            }),
+        }
+    }
+
+    /// Validate that stored state may be reused for the given sync mapping
+    /// without writing anything.
+    ///
+    /// Dry-run sync uses this against a read-only or ephemeral baseline: a
+    /// database with no recorded identity (fresh or legacy) is accepted and its
+    /// state kept, but the conservative bind is NOT persisted, honoring the
+    /// no-write dry-run contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the identity cannot be read.
+    pub fn validate_sync_identity_read_only(
+        &self,
+        identity: &SyncIdentity,
+    ) -> Result<SyncIdentityCheck> {
+        match self.get_sync_identity()? {
+            None => Ok(SyncIdentityCheck::Bound),
             Some(stored) if stored == *identity => Ok(SyncIdentityCheck::Matched),
             Some(stored) => Ok(SyncIdentityCheck::Mismatched {
                 stored,
@@ -1404,6 +1449,66 @@ mod tests {
         assert_eq!(
             db.validate_sync_identity(&canonical).unwrap(),
             SyncIdentityCheck::Matched
+        );
+    }
+
+    // ── read-only open (dry-run baseline) ────────────────────────────────
+
+    #[test]
+    fn open_read_only_opens_existing_database_without_creating_schema() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("state.db");
+        // A real writable DB with full schema and a recorded state.
+        {
+            let writable = LocalDb::open(&db_path).expect("open writable db");
+            writable
+                .save_file_state(&make_file_state("/a.txt"))
+                .expect("save state");
+        }
+
+        // Read-only open must succeed against the existing file and still
+        // expose the recorded state.
+        let ro = LocalDb::open_read_only(&db_path).expect("open read-only db");
+        assert!(
+            ro.get_file_state("/a.txt").expect("read state").is_some(),
+            "read-only baseline must still expose existing state"
+        );
+    }
+
+    #[test]
+    fn open_read_only_does_not_create_schema_on_pristine_file() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("state.db");
+        // A pristine, table-less SQLite file (no schema init ever ran).
+        {
+            let conn = Connection::open(&db_path).expect("create empty sqlite file");
+            drop(conn);
+        }
+
+        // Read-only open of the pristine file must succeed without creating
+        // any schema (no table creation, no migration).
+        let ro = LocalDb::open_read_only(&db_path).expect("open read-only db");
+        let table_count: i64 = ro
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count tables");
+        assert_eq!(
+            table_count, 0,
+            "read-only open must not create/migrate schema"
+        );
+    }
+
+    #[test]
+    fn open_read_only_fails_on_absent_file() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let missing = tmp.path().join("does-not-exist.db");
+        assert!(
+            LocalDb::open_read_only(&missing).is_err(),
+            "read-only open of an absent baseline must fail (caller uses in-memory)"
         );
     }
 }
