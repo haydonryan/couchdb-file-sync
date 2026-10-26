@@ -954,6 +954,22 @@ impl SyncEngine {
 
         self.debug_local_changes(local_changes, &stored_states, &remote_by_path);
 
+        // ── Load persisted unresolved conflicts ───────────────────────────
+        // A path with an unresolved conflict is frozen: neither the local edit
+        // nor the remote version may be applied by a normal sync cycle, so a
+        // plain cycle can never implicitly resolve a stored conflict. The
+        // conflict record itself persists the pending remote state, so the
+        // path is released only by an explicit `resolve_conflict` call, which
+        // deletes the record. (In the cycle where a conflict is *first*
+        // detected it is not yet persisted, but its local/remote changes go to
+        // `needs_comparison`, not to the upload/download queues, so it is
+        // already excluded there.)
+        let persisted_conflicts = self.local_db.get_conflicts().await?;
+        let conflicted_paths: HashSet<&str> = persisted_conflicts
+            .iter()
+            .map(|c| c.path.as_str())
+            .collect();
+
         // ── Run the pure triage function ──────────────────────────────────
         let triage_result = triage::triage_changes(
             local_changes,
@@ -964,9 +980,26 @@ impl SyncEngine {
         );
 
         // Collect results
-        let local_to_upload = triage_result.uploads;
+        let mut local_to_upload = Vec::new();
         let mut remote_to_apply = triage_result.downloads;
         let mut conflicts: Vec<Conflict> = Vec::new();
+
+        // Hold back any clean local change for a path that still has an
+        // unresolved conflict. Otherwise, once the remote change feed has
+        // advanced past the conflicting remote edit, the next cycle would see
+        // the still-pending local edit as a plain upload and overwrite the
+        // remote version, silently resolving the conflict.
+        for change in triage_result.uploads {
+            if conflicted_paths.contains(change.path()) {
+                warn!(
+                    "Holding local change for unresolved conflict ({}): {}",
+                    change.path(),
+                    change.change_type()
+                );
+            } else {
+                local_to_upload.push(change);
+            }
+        }
 
         // ── Handle needs_comparison pairs (requires I/O) ──────────────────
         self.resolve_needs_comparison(&triage_result.needs_comparison, dry_run, &mut conflicts)
@@ -978,6 +1011,22 @@ impl SyncEngine {
             &stored_states,
             &mut remote_to_apply,
         )?;
+
+        // Hold back any remote change for a path that still has an unresolved
+        // conflict: overwriting the local file with the remote version would
+        // silently drop the pending local edit. The path is released only when
+        // the conflict is explicitly resolved (which deletes its record).
+        remote_to_apply.retain(|change| {
+            let keep = !conflicted_paths.contains(change.path());
+            if !keep {
+                warn!(
+                    "Holding remote change for unresolved conflict ({}): {}",
+                    change.path(),
+                    change.change_type()
+                );
+            }
+            keep
+        });
 
         // ── Debug skipped items ───────────────────────────────────────────
         for decision in &triage_result.skipped {
@@ -2970,6 +3019,170 @@ mod tests {
             cp.last_seq, "3",
             "first sync must checkpoint the remote seq"
         );
+    }
+
+    /// Seed client B's divergent local edit (LOCAL-B) against the earlier
+    /// remote-A sync, so the scanner sees it as a local modification.
+    fn seed_diverged_client(root: &SyncDirPath, state_db: &std::path::Path) {
+        std::fs::write(root.as_path().join("doc.txt"), b"LOCAL-B").unwrap();
+        let seed_db = LocalDb::open(state_db).unwrap();
+        seed_file_state(&seed_db, "doc.txt", &compute_bytes_hash(b"REMOTE-A"), 7);
+    }
+
+    /// Build the `CannedCouch` for the divergence: client A pushed remote-A (rev
+    /// 2-bbb) over the version the local client last synced.
+    fn diverged_canned_couch(remote_path: &str, remote_a: &[u8]) -> CannedCouch {
+        let mut meta = FileDoc::new(
+            remote_path.to_string(),
+            String::new(),
+            remote_a.len() as u64,
+        );
+        meta.rev = Some("2-bbb".to_string());
+        meta.path = remote_path.to_string();
+        CannedCouch {
+            changes: vec![Change::remote_modified(
+                remote_path.to_string(),
+                compute_bytes_hash(remote_a),
+                remote_a.len() as u64,
+                Utc::now(),
+                "2-bbb".to_string(),
+            )],
+            last_seq: "1".to_string(),
+            metadata: std::collections::HashMap::from([(remote_path.to_string(), meta)]),
+            contents: std::collections::HashMap::from([(
+                remote_path.to_string(),
+                remote_a.to_vec(),
+            )]),
+            ..CannedCouch::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolved_conflict_is_preserved_across_cycles_and_restarts() {
+        // Regression (#6337): a stored conflict used to be implicitly resolved
+        // on the next sync cycle — run_cycle stored the conflict and advanced
+        // the checkpoint, then triage re-scanned the still-pending local edit
+        // and, with the remote feed now empty, uploaded it over the remote
+        // version. An unresolved-conflict path must be held (neither uploaded
+        // nor downloaded) until explicit resolution; unrelated files keep syncing.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        // Keep the state DB outside the sync root so it is never scanned/uploaded.
+        let db_dir = tempfile::tempdir().unwrap();
+        let state_db = db_dir.path().join("state.db");
+        seed_diverged_client(&root, &state_db);
+
+        let remote_prefix = "prefix/";
+        let remote_path = format!("{remote_prefix}doc.txt");
+        let remote_a = b"REMOTE-A".to_vec();
+
+        // ── Cycle 1: the two clients diverge → conflict detected & stored ──
+        let mut engine1 = SyncEngine::new(
+            test_canned_couch(
+                remote_prefix,
+                diverged_canned_couch(&remote_path, &remote_a),
+            ),
+            LocalDb::open(&state_db).unwrap(),
+            root.clone(),
+        );
+        let report1 = engine1.sync().await.expect("cycle 1 sync");
+        assert_eq!(report1.conflicts, 1, "cycle 1 must detect the conflict");
+        assert_eq!(report1.uploaded.0, 0);
+        assert_eq!(report1.downloaded.0, 0);
+        assert_eq!(
+            engine1.couchdb.test_write_calls(),
+            0,
+            "no remote write in cycle 1"
+        );
+        let conflicts1 = engine1.get_conflicts().await.unwrap();
+        assert_eq!(conflicts1.len(), 1, "conflict must be persisted");
+        assert_eq!(conflicts1[0].path, "doc.txt");
+        // The persisted record preserves remote-A (the pending remote context)
+        // so the path stays protected after the checkpoint advances past it.
+        assert_eq!(
+            conflicts1[0].remote_state.hash,
+            compute_bytes_hash(b"REMOTE-A")
+        );
+
+        // ── Cycles 2 & 3 with a restart: remote feed now empty ─────────────
+        // The pending local edit must be held, not uploaded; a brand-new
+        // unrelated local file must still sync normally.
+        std::fs::write(root.as_path().join("unrelated.txt"), b"U").unwrap();
+        let empty = CannedCouch {
+            changes: Vec::new(),
+            last_seq: "1".to_string(),
+            ..CannedCouch::default()
+        };
+        for restart in 0..2 {
+            let mut engine = SyncEngine::new(
+                test_canned_couch(remote_prefix, empty.clone()),
+                // Fresh DB over the same state file simulates a process restart.
+                LocalDb::open(&state_db).unwrap(),
+                root.clone(),
+            );
+            let report = engine.sync().await.unwrap();
+            // Only the unrelated file uploads, and only on the first restart.
+            assert_eq!(
+                report.uploaded.0,
+                usize::from(restart == 0),
+                "pending conflict edit must be held (restart {restart})"
+            );
+            assert_eq!(report.conflicts, 0, "no *new* conflict with an empty feed");
+            assert_eq!(
+                std::fs::read_to_string(root.as_path().join("doc.txt")).unwrap(),
+                "LOCAL-B",
+                "local version survives (restart {restart})"
+            );
+            assert_eq!(
+                engine.get_conflicts().await.unwrap().len(),
+                1,
+                "conflict record persists across restarts"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_resolution_releases_an_unresolved_conflict_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let state_db = db_dir.path().join("state.db");
+        seed_diverged_client(&root, &state_db);
+
+        let remote_prefix = "prefix/";
+        let remote_path = format!("{remote_prefix}doc.txt");
+        let remote_a = b"REMOTE-A".to_vec();
+
+        // Detect & store the conflict first.
+        let mut engine = SyncEngine::new(
+            test_canned_couch(
+                remote_prefix,
+                diverged_canned_couch(&remote_path, &remote_a),
+            ),
+            LocalDb::open(&state_db).unwrap(),
+            root.clone(),
+        );
+        assert_eq!(engine.sync().await.unwrap().conflicts, 1);
+
+        // Only an explicit resolution removes the conflict record.
+        engine
+            .resolve_conflict("doc.txt", ResolutionStrategy::KeepLocal)
+            .await
+            .expect("resolve_conflict should succeed");
+        assert!(
+            engine.get_conflicts().await.unwrap().is_empty(),
+            "explicit resolution removes the conflict record"
+        );
+
+        // The path is now released and synced: a plain sync makes no change
+        // (KeepLocal already uploaded the edit during resolution).
+        let report = engine.sync().await.unwrap();
+        assert_eq!(
+            report.uploaded.0, 0,
+            "path no longer pending after resolution"
+        );
+        assert_eq!(report.downloaded.0, 0);
+        assert_eq!(report.conflicts, 0);
     }
 
     // ── Bounded-concurrency batch apply (#3006) ──────────────────────────
