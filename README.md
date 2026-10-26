@@ -303,8 +303,18 @@ couchdb-file-sync sync ~/documents
 
 `--dry-run` walks the full sync pipeline (triage, upload/download/delete
 detection, and conflict identification) without writing anything to CouchDB,
-the local filesystem, or the state database, then prints a summary of what
-would be uploaded, downloaded, deleted, and conflicted.
+the local filesystem, the state database, or a log file, then prints a summary
+of what would be uploaded, downloaded, deleted, and conflicted. It honors this
+no-write contract end to end: no local state is created or migrated (an
+existing state database is opened read-only, and an ephemeral baseline is used
+when none exists), the remote database is never created, and no log file is
+written.
+
+A one-shot `sync` exits `0` only when every queued change applied cleanly.
+If any apply fails (or a file is skipped, e.g. oversized), it processes and
+reports all configured roots, prints a partial-failure summary listing the
+errors, and exits nonzero so scripts can detect that synchronization did not
+fully complete.
 
 ### `couchdb-file-sync daemon [PATH]`
 
@@ -338,9 +348,20 @@ Replace the remote scope with the current local filesystem for that path. Every 
 couchdb-file-sync rebuild-remote ~/documents
 ```
 
+A rebuild is **resumable and safe to retry**. The declared plan is journaled
+and your existing tracked state is kept until publication completes, so an
+interrupted run (a failed upload/delete or a stopped process) never discards
+the previous baseline. Re-running `rebuild-remote` reconciles the plan to
+completion. While a rebuild is incomplete, a normal `sync`/`daemon` is refused
+rather than misclassifying the partially-published remote as ordinary edits —
+run `rebuild-remote` again to finish the authoritative mirror first. A rebuild
+also refuses to run at all when the local scan is incomplete (an unreadable
+subtree or missing/unmounted sync root), so it never tombstones remote files
+it could not see.
+
 ### `couchdb-file-sync rebuild-local [PATH]`
 
-Replace the local filesystem with the current remote scope for that path. Existing non-ignored local files are removed first, then live remote files are downloaded.
+Replace the local filesystem with the current remote scope for that path. Every live remote file is fetched and content-verified into a staging area first; only after all of it is verified are obsolete local files removed, the staged content installed, and the sync baseline reset — so a failed rebuild leaves the prior local tree and baseline intact. An interrupted rebuild resumes from its journal on the next run.
 
 ```bash
 couchdb-file-sync rebuild-local ~/documents
@@ -374,6 +395,27 @@ Show sync status.
 couchdb-file-sync status
 couchdb-file-sync status --json
 ```
+
+### Machine-readable output
+
+`status --json` and `conflicts --json` write **one valid JSON document** to
+stdout (diagnostics and per-root banners go to stderr). With a single
+configured root the shape is unchanged: `status` emits a status object and
+`conflicts` emits a conflict array. With multiple configured roots the commands
+emit a single aggregate document so the output stays parseable even when a
+root's state database cannot be read:
+
+```json
+{
+  "roots": [
+    { "path": "/srv/notes", "status": { "sync_directory": "/srv/notes", "tracked_files": 0, "local_files": 0, "pending_conflicts": 0, "last_sync": null } },
+    { "path": "/srv/broken", "error": "file is not a database" }
+  ]
+}
+```
+
+`status` entries carry `status`; `conflicts` entries carry `conflicts`. A root
+that fails to load carries an `error` string instead of its result.
 
 ### `couchdb-file-sync install`
 

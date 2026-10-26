@@ -2,6 +2,6 @@ pub mod db;
 pub mod scanner;
 pub mod watcher;
 
-pub use db::{LocalDb, SyncIdentityCheck};
+pub use db::{LocalDb, RemoteRebuildJournal, SyncIdentityCheck};
 pub use scanner::{Scanner, compute_bytes_hash, compute_file_hash};
 pub use watcher::{AsyncFileWatcher, FileWatcher, WatcherEvent};

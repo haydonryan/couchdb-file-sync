@@ -182,13 +182,10 @@ async fn run() -> Result<()> {
 
     let config = load_config(&cli)?;
 
-    let enable_file_logging = matches!(
-        &cli.command,
-        Commands::Sync(_)
-            | Commands::RebuildRemote(_)
-            | Commands::RebuildLocal(_)
-            | Commands::Daemon(_)
-    );
+    // Dry-run sync must never create a log file: it is a no-write contract, so
+    // its logging is routed to stdout only.
+    let dry_run = matches!(&cli.command, Commands::Sync(cmd) if cmd.dry_run);
+    let enable_file_logging = should_enable_file_logging(&cli.command, dry_run);
 
     // Initialize logging
     let daemon_mode = matches!(&cli.command, Commands::Daemon(_));
@@ -316,6 +313,11 @@ fn run_init(
 async fn run_sync(path: Option<PathBuf>, dry_run: bool, config: &AppConfig) -> Result<()> {
     let paths = resolve_paths_or_bail(path, config)?;
     cli::validate_unique_mappings(&paths)?;
+    // Every root is processed and reported before the aggregate outcome is
+    // decided, so a failure on one path never short-circuits the remaining
+    // roots. After all roots report, a partial failure yields a nonzero exit
+    // with a clear summary (the per-path report above already lists each error).
+    let mut failed = false;
     for sync_path in paths {
         let mut path_config = config.clone();
         path_config.couchdb.remote_path = sync_path.remote;
@@ -324,7 +326,15 @@ async fn run_sync(path: Option<PathBuf>, dry_run: bool, config: &AppConfig) -> R
             sync_path.local.display(),
             path_config.couchdb.remote_path
         );
-        cli::sync(sync_path.local, path_config, dry_run).await?;
+        let report = cli::sync(sync_path.local, path_config, dry_run).await?;
+        if !dry_run && !report.errors.is_empty() {
+            failed = true;
+        }
+    }
+    if failed {
+        anyhow::bail!(
+            "Sync finished with errors on one or more paths; see the per-path reports above"
+        );
     }
     Ok(())
 }
@@ -397,10 +407,34 @@ fn validate_daemon_interval(interval: u64) -> Result<()> {
 
 fn run_conflicts(path: Option<PathBuf>, json: bool, config: &AppConfig) -> Result<()> {
     let paths = resolve_paths_or_bail(path, config)?;
+    if json && paths.len() > 1 {
+        // Multi-root JSON: emit one aggregate document carrying per-root results
+        // or errors so stdout stays a single parseable JSON value even when a
+        // root's state DB cannot be read.
+        let mut roots = Vec::with_capacity(paths.len());
+        for sync_path in &paths {
+            let entry = match cli::conflicts_for(&sync_path.local) {
+                Ok(conflicts) => serde_json::json!({
+                    "path": sync_path.local,
+                    "conflicts": conflicts,
+                }),
+                Err(e) => serde_json::json!({
+                    "path": sync_path.local,
+                    "error": format!("{e:#}"),
+                }),
+            };
+            roots.push(entry);
+        }
+        let aggregate = serde_json::json!({ "roots": roots });
+        println!("{}", serde_json::to_string_pretty(&aggregate)?);
+        return Ok(());
+    }
     let multi = paths.len() > 1;
     for sync_path in &paths {
         if multi {
-            println!("\n=== {} ===", sync_path.local.display());
+            // Per-root banners are diagnostics, not machine output; keep stdout
+            // clean even in human-readable mode.
+            eprintln!("\n=== {} ===", sync_path.local.display());
         }
         cli::conflicts(&sync_path.local, json)?;
     }
@@ -423,10 +457,34 @@ async fn run_resolve(path: Option<PathBuf>, config: &AppConfig) -> Result<()> {
 
 fn run_status(path: Option<PathBuf>, json: bool, config: &AppConfig) -> Result<()> {
     let paths = resolve_paths_or_bail(path, config)?;
+    if json && paths.len() > 1 {
+        // Multi-root JSON: emit one aggregate document carrying per-root results
+        // or errors so stdout stays a single parseable JSON value even when a
+        // root's state DB cannot be read.
+        let mut roots = Vec::with_capacity(paths.len());
+        for sync_path in &paths {
+            let entry = match cli::status_summary(&sync_path.local) {
+                Ok(summary) => serde_json::json!({
+                    "path": sync_path.local,
+                    "status": summary.to_json(),
+                }),
+                Err(e) => serde_json::json!({
+                    "path": sync_path.local,
+                    "error": format!("{e:#}"),
+                }),
+            };
+            roots.push(entry);
+        }
+        let aggregate = serde_json::json!({ "roots": roots });
+        println!("{}", serde_json::to_string_pretty(&aggregate)?);
+        return Ok(());
+    }
     let multi = paths.len() > 1;
     for sync_path in &paths {
         if multi {
-            println!("\n=== {} ===", sync_path.local.display());
+            // Per-root banners are diagnostics, not machine output; keep stdout
+            // clean even in human-readable mode.
+            eprintln!("\n=== {} ===", sync_path.local.display());
         }
         cli::status(&sync_path.local, json, config)?;
     }
@@ -506,6 +564,25 @@ fn paths_match(left: &std::path::Path, right: &std::path::Path) -> bool {
     }
 }
 
+/// Whether the command writes a detailed log file at all.
+const fn command_enables_file_logging(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Sync(_)
+            | Commands::RebuildRemote(_)
+            | Commands::RebuildLocal(_)
+            | Commands::Daemon(_)
+    )
+}
+
+/// Whether file logging should be enabled for the given command invocation.
+///
+/// A dry-run sync never writes a log file: it is a no-write contract, so its
+/// logging is routed to stdout only.
+const fn should_enable_file_logging(command: &Commands, dry_run: bool) -> bool {
+    !dry_run && command_enables_file_logging(command)
+}
+
 /// Initialize logging based on verbosity or `RUST_LOG` env var
 fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daemon_mode: bool) {
     use tracing_subscriber::EnvFilter;
@@ -527,7 +604,9 @@ fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daem
         EnvFilter::new(format!("couchdb_file_sync={}", level.as_filter_str()))
     };
 
-    let stdout_layer = tracing_subscriber::fmt::layer().with_filter(filter);
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(filter);
 
     if enable_file_logging {
         let log_path = config
@@ -546,7 +625,7 @@ fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daem
             Ok(writer) => tracing_appender::non_blocking(writer),
             Err(err) => {
                 eprintln!("Failed to open log file {}: {}", log_path.display(), err);
-                tracing_subscriber::registry().with(stdout_layer).init();
+                tracing_subscriber::registry().with(stderr_layer).init();
                 return;
             }
         };
@@ -559,17 +638,20 @@ fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daem
             .with_filter(file_filter);
 
         tracing_subscriber::registry()
-            .with(stdout_layer)
+            .with(stderr_layer)
             .with(file_layer)
             .init();
     } else {
-        tracing_subscriber::registry().with(stdout_layer).init();
+        tracing_subscriber::registry().with(stderr_layer).init();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, init_logging};
+    use super::{
+        Cli, Commands, ConflictsCommand, DaemonCommand, RebuildLocalCommand, RebuildRemoteCommand,
+        StatusCommand, SyncCommand, init_logging, should_enable_file_logging,
+    };
     use super::{
         apply_cli_overrides, default_user_config_file_if_exists, load_config, paths_match,
         resolve_daemon_interval, resolve_paths, resolved_config_path, validate_daemon_interval,
@@ -896,6 +978,69 @@ mod tests {
     fn init_logging_smoke_test_default_verbose() {
         let config = AppConfig::default();
         init_logging(0, &config, false, false);
+    }
+
+    // ============================================================
+    // should_enable_file_logging tests (dry-run never writes a log file)
+    // ============================================================
+
+    #[test]
+    fn file_logging_enabled_for_sync_non_dry_run() {
+        let cmd = Commands::Sync(SyncCommand {
+            path: None,
+            dry_run: false,
+        });
+        assert!(should_enable_file_logging(&cmd, false));
+    }
+
+    #[test]
+    fn file_logging_disabled_for_dry_run_sync() {
+        let cmd = Commands::Sync(SyncCommand {
+            path: None,
+            dry_run: true,
+        });
+        assert!(
+            !should_enable_file_logging(&cmd, true),
+            "dry-run sync must never write a log file"
+        );
+    }
+
+    #[test]
+    fn file_logging_enabled_for_rebuild_and_daemon() {
+        assert!(should_enable_file_logging(
+            &Commands::Daemon(DaemonCommand {
+                path: None,
+                interval: None,
+                live: false,
+            }),
+            false,
+        ));
+        assert!(should_enable_file_logging(
+            &Commands::RebuildRemote(RebuildRemoteCommand { path: None }),
+            false,
+        ));
+        assert!(should_enable_file_logging(
+            &Commands::RebuildLocal(RebuildLocalCommand { path: None }),
+            false,
+        ));
+    }
+
+    #[test]
+    fn file_logging_disabled_for_read_only_commands() {
+        assert!(!should_enable_file_logging(
+            &Commands::Status(StatusCommand {
+                path: None,
+                json: false,
+            }),
+            false,
+        ));
+        assert!(!should_enable_file_logging(
+            &Commands::Conflicts(ConflictsCommand {
+                path: None,
+                json: false,
+            }),
+            false,
+        ));
     }
 
     // ============================================================
