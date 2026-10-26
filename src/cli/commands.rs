@@ -1,5 +1,5 @@
 use crate::config::{AppConfig, SyncPath, default_user_config_file};
-use crate::couchdb::{ChangeFeedEntry, CouchDb};
+use crate::couchdb::{ChangeFeedEntry, ChangesFeed, CouchDb};
 use crate::local::{AsyncFileWatcher, LocalDb, compute_file_hash};
 use crate::matrix::MatrixNotifier;
 use crate::models::{
@@ -1248,7 +1248,14 @@ async fn run_remote_changes(
     .await?;
 
     loop {
-        match couchdb.get_changes_feed(&since, 25_000).await {
+        // Budget the live long-poll wait from the configured timeout so it
+        // works with short timeouts, and let `get_changes_feed` leave
+        // transport headroom below the request client timeout.
+        let wait_budget_ms = couchdb.timeout_seconds().saturating_mul(1000);
+        match couchdb
+            .get_changes_feed(&since, ChangesFeed::LongPoll, wait_budget_ms)
+            .await
+        {
             Ok((entries, last_seq)) => {
                 since = last_seq;
                 for entry in entries {

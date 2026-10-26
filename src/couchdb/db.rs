@@ -34,6 +34,31 @@ fn is_chunk_id(id: &str) -> bool {
     id.starts_with("h:")
 }
 
+/// Transport headroom (ms) reserved between the long-poll server wait and the
+/// request client timeout.
+///
+/// The reqwest client used for `_changes` requests carries a timeout of
+/// exactly `timeout_seconds`. A long-poll that waits the full `timeout_seconds`
+/// on the server side returns right at the client timeout, so the response
+/// fails to decode (or times out) once transport latency is added. Budgeting
+/// the long-poll wait below `timeout_seconds` by this margin leaves room for
+/// the response to complete and decode before the client gives up.
+const LONGPOLL_TRANSPORT_HEADROOM_MS: u64 = 1000;
+
+/// Which `_changes` feed to request.
+///
+/// `Normal` is nonblocking: `CouchDB` returns immediately with the current
+/// set of changes and `last_seq`. It is used for periodic sync so an idle
+/// probe succeeds promptly instead of waiting out the full request timeout.
+/// `LongPoll` holds the connection open until a change arrives or the
+/// server-side `timeout` elapses; it is used by the live feed and is budgeted
+/// to leave transport headroom below the request client timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangesFeed {
+    Normal,
+    LongPoll,
+}
+
 /// `CouchDB` client wrapper
 pub struct CouchDb {
     client: Client,
@@ -294,7 +319,14 @@ impl CouchDb {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Fetch changes from `CouchDB` using the _changes feed (longpoll)
+    /// Fetch changes from `CouchDB` using the `_changes` feed.
+    ///
+    /// `feed` selects a nonblocking `normal` feed or a blocking `longpoll`
+    /// feed. For `LongPoll`, `timeout_ms` is the full wait budget and the
+    /// server-side `timeout` is budgeted to leave
+    /// [`LONGPOLL_TRANSPORT_HEADROOM_MS`] of headroom below the request client
+    /// timeout so the response can complete and decode before the client gives
+    /// up.
     ///
     /// # Errors
     ///
@@ -303,18 +335,40 @@ impl CouchDb {
     pub async fn get_changes_feed(
         &self,
         since: &str,
+        feed: ChangesFeed,
         timeout_ms: u64,
     ) -> Result<(Vec<ChangeFeedEntry>, String)> {
         let url = format!("{}/_changes", self.base_db_url);
+
+        let feed_name = match feed {
+            ChangesFeed::Normal => "normal",
+            ChangesFeed::LongPoll => "longpoll",
+        };
+
+        // Server-side long-poll wait, budgeted to leave transport headroom
+        // below the request client timeout (`timeout_seconds`). A tiny floor
+        // keeps the long-poll a valid short wait even when the configured
+        // timeout leaves little room for the margin.
+        let server_timeout: Option<String> = match feed {
+            ChangesFeed::Normal => None,
+            ChangesFeed::LongPoll => Some(
+                timeout_ms
+                    .saturating_sub(LONGPOLL_TRANSPORT_HEADROOM_MS)
+                    .max(1)
+                    .to_string(),
+            ),
+        };
 
         let body = self
             .retry_transient::<_, _, ChangesResponse<FileDoc>, anyhow::Error>(|| {
                 let mut request = self.http_client.get(&url).query(&[
                     ("since", since),
                     ("include_docs", "true"),
-                    ("feed", "longpoll"),
-                    ("timeout", &timeout_ms.to_string()),
+                    ("feed", feed_name),
                 ]);
+                if let Some(t) = &server_timeout {
+                    request = request.query(&[("timeout", t.as_str())]);
+                }
 
                 if let Some((username, password)) = &self.auth {
                     request = request.basic_auth(username, Some(password));
@@ -695,10 +749,17 @@ impl CouchDb {
         };
 
         // Incremental: resume the since-based `_changes` feed so we only pull
-        // changes that occurred after the checkpoint. The feed's `last_seq` is
-        // the scope-appropriate resume point for the next cycle.
+        // changes that occurred after the checkpoint. A nonblocking `normal`
+        // feed returns immediately with the current changes and `last_seq`, so
+        // an idle periodic cycle succeeds promptly instead of waiting out the
+        // full request timeout. The feed's `last_seq` is the scope-appropriate
+        // resume point for the next cycle.
         let (entries, seq) = self
-            .get_changes_feed(since, self.timeout_seconds.saturating_mul(1000))
+            .get_changes_feed(
+                since,
+                ChangesFeed::Normal,
+                self.timeout_seconds.saturating_mul(1000),
+            )
             .await?;
         let changes: Vec<Change> = entries.into_iter().map(|entry| entry.change).collect();
         debug!(
@@ -1570,6 +1631,31 @@ mod tests {
         }
     }
 
+    /// Like [`couchdb_at_full`], but with a real request client timeout so
+    /// tests can exercise the headroom between the long-poll server wait and
+    /// the client timeout (the fix for the idle-poll timeout bug).
+    fn couchdb_at_with_timeout(addr: &str, remote_path: &str, timeout_seconds: u64) -> CouchDb {
+        let client = Client::new_no_auth(addr).unwrap();
+        let db = Database::new("test_db".to_string(), client.clone());
+        CouchDb {
+            client,
+            db,
+            http_client: HttpClient::builder()
+                .timeout(Duration::from_secs(timeout_seconds))
+                .build()
+                .expect("build http client for test"),
+            base_db_url: format!("{addr}/test_db"),
+            db_name: DatabaseName::new("test_db"),
+            auth: None,
+            remote_path: RemotePath::new(remote_path.to_string()),
+            timeout_seconds,
+            retry_attempts: 3,
+            test_state: None,
+            test_write_calls: std::sync::atomic::AtomicUsize::new(0),
+            test_backoff: Duration::from_millis(1),
+        }
+    }
+
     /// Spawn an in-process fake `CouchDB` server backed by a real hyper HTTP
     /// server that serves the three endpoints `get_changes` touches:
     ///
@@ -1724,6 +1810,197 @@ mod tests {
             }
         }
         Ok(response)
+    }
+
+    /// Shared record of the `feed`/`timeout` query params received for each
+    /// `_changes` request, captured by [`spawn_recorded_changes_couch`].
+    type RecordedFeedQueries = std::sync::Arc<parking_lot::Mutex<Vec<(String, String)>>>;
+
+    /// Spawn an in-process fake `CouchDB` changes server that records the
+    /// `feed`/`timeout` query params of every `_changes` request and, for
+    /// `longpoll` feeds, simulates the server-side wait by sleeping the
+    /// requested `timeout` (capped at `longpoll_delay_cap_ms`).
+    ///
+    /// Returns the base URL, a shared record of `(feed, timeout)` pairs, the
+    /// server thread handle, and a shutdown flag.
+    fn spawn_recorded_changes_couch(
+        longpoll_delay_cap_ms: u64,
+    ) -> (
+        String,
+        RecordedFeedQueries,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind recorded changes couch");
+        let addr = listener.local_addr().expect("recorded changes addr");
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_thread = shutdown.clone();
+        let recorded = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorded_thread = recorded.clone();
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("recorded changes runtime");
+            runtime.block_on(async move {
+                listener
+                    .set_nonblocking(true)
+                    .expect("set recorded nonblocking");
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .expect("recorded changes tokio listener");
+                loop {
+                    if shutdown_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    match tokio::time::timeout(Duration::from_millis(10), listener.accept()).await {
+                        Ok(Ok((stream, _))) => {
+                            let recorded = recorded_thread.clone();
+                            let cap = longpoll_delay_cap_ms;
+                            let service = hyper::service::service_fn(move |req| {
+                                handle_recorded_changes_couch_req(req, recorded.clone(), cap)
+                            });
+                            tokio::spawn(async move {
+                                let io = hyper_util::rt::TokioIo::new(stream);
+                                let _ = hyper::server::conn::http1::Builder::new()
+                                    .serve_connection(io, service)
+                                    .await;
+                            });
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_) => {}
+                    }
+                }
+            });
+        });
+        (format!("http://{addr}"), recorded, handle, shutdown)
+    }
+
+    /// Serve `_changes` requests for [`spawn_recorded_changes_couch`], recording
+    /// the `feed`/`timeout` query params and simulating the long-poll wait.
+    #[allow(clippy::unused_async)]
+    async fn handle_recorded_changes_couch_req(
+        req: hyper::Request<hyper::body::Incoming>,
+        recorded: RecordedFeedQueries,
+        longpoll_delay_cap_ms: u64,
+    ) -> Result<hyper::Response<http_body_util::Full<hyper::body::Bytes>>, hyper::Error> {
+        let (parts, _body) = req.into_parts();
+        let mut response =
+            hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::new()));
+        let method = parts.method.clone();
+        let path = parts.uri.path().to_string();
+        if method == hyper::Method::GET && path.ends_with("_changes") {
+            let query = parts.uri.query().unwrap_or("");
+            let param = |key: &str| {
+                query.split('&').find_map(|kv| {
+                    let (k, v) = kv.split_once('=')?;
+                    (k == key).then(|| v.to_string())
+                })
+            };
+            let feed = param("feed").unwrap_or_default();
+            let timeout = param("timeout").unwrap_or_default();
+            recorded.lock().push((feed.clone(), timeout.clone()));
+            if feed == "longpoll" {
+                let wait = timeout
+                    .parse::<u64>()
+                    .unwrap_or(0)
+                    .min(longpoll_delay_cap_ms);
+                tokio::time::sleep(Duration::from_millis(wait)).await;
+            }
+            *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(
+                serde_json::json!({ "results": [], "last_seq": "0" }).to_string(),
+            ));
+            return Ok(response);
+        }
+        *response.status_mut() = hyper::StatusCode::NOT_FOUND;
+        Ok(response)
+    }
+
+    #[tokio::test]
+    async fn periodic_idle_sync_uses_nonblocking_feed_and_succeeds_promptly() {
+        // A fake server that would hold a long-poll open long enough to blow
+        // past a 1-second request client timeout. Periodic `get_changes` must
+        // use the nonblocking `normal` feed, so an idle cycle returns promptly
+        // (not waiting the full request timeout) with correct sequence
+        // semantics.
+        let (addr, recorded, server, shutdown) = spawn_recorded_changes_couch(1500);
+        let db = couchdb_at_with_timeout(&addr, "notes/", 1);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), db.get_changes(Some("0")))
+            .await
+            .expect("idle periodic sync must complete promptly, not wait the request timeout");
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("recorded changes couch join");
+
+        let (changes, seq) = result.expect("idle periodic sync must succeed");
+        assert!(changes.is_empty(), "idle poll has no changes");
+        assert_eq!(seq, "0", "empty poll retains correct sequence semantics");
+
+        let feeds: Vec<String> = recorded.lock().iter().map(|(f, _)| f.clone()).collect();
+        assert_eq!(
+            feeds,
+            vec!["normal".to_string()],
+            "periodic sync must use the nonblocking normal feed"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_longpoll_budgets_server_wait_below_client_timeout() {
+        // Live long-poll with the default 30s budget must ask the server to
+        // wait no more than budget - transport headroom, leaving headroom for
+        // the response to complete and decode below the 30s client timeout.
+        let (addr, recorded, server, shutdown) = spawn_recorded_changes_couch(0);
+        let db = couchdb_at_with_timeout(&addr, "notes/", 30);
+
+        let (entries, seq) = db
+            .get_changes_feed("0", ChangesFeed::LongPoll, 30_000)
+            .await
+            .expect("live long-poll must succeed");
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("recorded changes couch join");
+
+        assert!(entries.is_empty(), "empty poll has no entries");
+        assert_eq!(seq, "0", "empty poll retains correct sequence semantics");
+        let queries = recorded.lock();
+        let (feed, timeout) = &queries[0];
+        assert_eq!(feed, "longpoll", "live feed must use longpoll");
+        assert_eq!(
+            timeout.parse::<u64>().unwrap(),
+            30_000 - LONGPOLL_TRANSPORT_HEADROOM_MS,
+            "live long-poll must leave transport headroom below the client timeout"
+        );
+        drop(queries);
+    }
+
+    #[tokio::test]
+    async fn live_longpoll_short_timeout_has_headroom_and_succeeds() {
+        // With a 1-second configured timeout, the server-side wait is budgeted
+        // to the 1ms floor, so the poll returns with ~1s of transport headroom
+        // and succeeds instead of timing out while the response is in flight.
+        let (addr, recorded, server, shutdown) = spawn_recorded_changes_couch(1500);
+        let db = couchdb_at_with_timeout(&addr, "notes/", 1);
+
+        let (entries, seq) = db
+            .get_changes_feed("0", ChangesFeed::LongPoll, 1_000)
+            .await
+            .expect("live long-poll with a short timeout must succeed");
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("recorded changes couch join");
+
+        assert!(entries.is_empty(), "empty poll has no entries");
+        assert_eq!(seq, "0", "empty poll retains correct sequence semantics");
+        let queries = recorded.lock();
+        let (feed, timeout) = &queries[0];
+        assert_eq!(feed, "longpoll", "live feed must use longpoll");
+        assert_eq!(
+            timeout.parse::<u64>().unwrap(),
+            1,
+            "short timeout must floor the long-poll wait so it returns with headroom"
+        );
+        drop(queries);
     }
 
     #[tokio::test]

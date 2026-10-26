@@ -1,3 +1,3 @@
 pub mod db;
 
-pub use db::{ChangeFeedEntry, CouchDb, build_couch_url};
+pub use db::{ChangeFeedEntry, ChangesFeed, CouchDb, build_couch_url};
