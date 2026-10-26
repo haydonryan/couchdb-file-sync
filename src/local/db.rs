@@ -561,13 +561,58 @@ impl LocalDb {
     /// Remove tracked state that should not survive an authoritative rebuild.
     /// Reset all sync state (file states, conflicts, and checkpoint).
     ///
+    /// The three deletes run inside a single `SQLite` transaction so the reset is
+    /// atomic: an interruption mid-reset can never leave file states, conflicts
+    /// and the checkpoint in a partially-cleared, inconsistent state.
+    ///
     /// # Errors
     ///
     /// Returns an error if any of the reset operations fail.
     pub fn reset_sync_state(&self) -> Result<()> {
-        self.clear_file_states()?;
-        self.clear_conflicts()?;
-        self.clear_checkpoint()?;
+        // `unchecked_transaction` is safe here because callers (the engine's
+        // `AsyncLocalDb`) always hold the connection mutex, so no other thread
+        // can observe a half-committed reset.
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM file_states", [])?;
+        tx.execute("DELETE FROM conflicts", [])?;
+        tx.execute("DELETE FROM sync_checkpoint", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Atomically replace the tracked sync baseline with a freshly rebuilt one.
+    ///
+    /// Used by the authoritative local rebuild at the verified transition: it
+    /// clears all prior sync state (file states, conflicts, checkpoint) and
+    /// installs the new `states` in a single `SQLite` transaction, so the reset
+    /// and the new baseline commit or roll back together. Obsolete file states
+    /// are dropped only after their replacement content has been verified and
+    /// staged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction fails.
+    pub fn commit_rebuild_state(&self, states: &[FileState]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM file_states", [])?;
+        tx.execute("DELETE FROM conflicts", [])?;
+        tx.execute("DELETE FROM sync_checkpoint", [])?;
+        for state in states {
+            tx.execute(
+                "INSERT OR REPLACE INTO file_states
+                 (path, hash, size, modified_at, couch_rev, last_sync_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    &state.path,
+                    &state.hash,
+                    u64_to_i64(state.size)?,
+                    &state.modified_at,
+                    &state.couch_rev,
+                    &state.last_sync_at,
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1295,6 +1340,32 @@ mod tests {
         assert_eq!(db.get_all_file_states().expect("file states"), []);
         assert!(db.get_conflicts().expect("conflicts").is_empty());
         assert!(db.get_checkpoint().expect("checkpoint").is_none());
+    }
+
+    #[test]
+    fn test_commit_rebuild_state_replaces_baseline_atomically() {
+        let db = test_db();
+
+        // Prior baseline across all three tables.
+        db.save_file_state(&make_file_state("/old.txt"))
+            .expect("save old state");
+        db.store_conflict(&make_conflict("/old.txt"))
+            .expect("store conflict");
+        db.save_checkpoint("old-seq").expect("checkpoint");
+
+        // Commit a rebuilt baseline: stale states dropped, new ones installed.
+        db.commit_rebuild_state(&[make_file_state("/new.txt")])
+            .expect("commit rebuild state");
+
+        // Old state gone, new state present, conflicts + checkpoint cleared.
+        assert!(db.get_file_state("/old.txt").expect("old gone").is_none());
+        assert!(
+            db.get_file_state("/new.txt")
+                .expect("new present")
+                .is_some()
+        );
+        assert!(db.get_conflicts().expect("conflicts cleared").is_empty());
+        assert!(db.get_checkpoint().expect("checkpoint cleared").is_none());
     }
 
     // ── edge cases ───────────────────────────────────────────────────────
