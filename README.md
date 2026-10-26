@@ -331,7 +331,25 @@ couchdb-file-sync uninstall
 
 ## Ignore Patterns
 
-Create a `.sync-ignore` file in your sync root with gitignore-style patterns:
+Exclusions can come from several sources. The effective policy is the union
+of all configured sources, applied in precedence order (later sources override
+earlier ones, so a `!` negation in a later source can re-include a path an
+earlier source ignored):
+
+1. **`ignore.patterns`** — inline gitignore-style patterns in the YAML config.
+2. **`ignore.ignore_files`** — each listed file, read in order from the sync
+   root.
+3. **`.sync-ignore`** — always applied last (highest precedence), unless it is
+   already listed in `ignore.ignore_files`.
+
+When `ignore.ignore_files` is not configured, `.sync-ignore` alone is used, so
+existing setups behave as before.
+
+The policy fails closed: a malformed pattern in any source, or a configured
+`ignore.ignore_files` entry that is missing or unreadable, aborts the sync
+command with an error instead of silently degrading to "ignore nothing". The
+default `.sync-ignore` file is optional (a missing one is fine), but any
+explicitly configured ignore file must exist and be readable.
 
 ```gitignore
 # Ignore all log files
@@ -351,6 +369,11 @@ secret-config.toml
 # Match at any depth
 **/cache/
 ```
+
+In live (daemon) mode, editing an ignore file reloads the policy and triggers a
+reconciliation rescan, so rule changes take effect without restarting the
+daemon. A reload that fails (e.g. a malformed edit) keeps the previous policy
+and logs an error rather than exposing files.
 
 ## Conflict Resolution
 
