@@ -55,9 +55,38 @@ impl AppConfig {
 
         // Build and deserialize
         let config = config_builder.build()?;
-        let app_config: Self = config.try_deserialize()?;
+
+        // Expand `${VAR}` environment references (documented "environment
+        // variable substitution", e.g. `${COUCHDB_PASSWORD}`) across every
+        // resolved string value before deserializing. A referenced variable
+        // that is unset fails explicitly rather than silently producing the
+        // literal placeholder.
+        let mut value: serde_json::Value = config.try_deserialize()?;
+        Self::expand_env_references(&mut value)?;
+        let app_config: Self = serde_json::from_value(value)?;
 
         Ok(app_config)
+    }
+
+    /// Recursively expand `${VAR}` references in every string value.
+    fn expand_env_references(value: &mut serde_json::Value) -> Result<()> {
+        match value {
+            serde_json::Value::String(s) => {
+                *s = interpolate_env(s)?;
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    Self::expand_env_references(item)?;
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for item in map.values_mut() {
+                    Self::expand_env_references(item)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Find config file in current directory or parent directories
@@ -66,6 +95,37 @@ impl AppConfig {
             .into_iter()
             .find(|path| path.exists())
     }
+}
+
+/// Replace every `${VAR}` reference in `input` with the value of the
+/// environment variable `VAR`. A malformed empty reference or a reference to
+/// an unset variable is reported as an error so a misconfigured credential
+/// never silently reaches the runtime as a literal placeholder.
+fn interpolate_env(input: &str) -> Result<String> {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            // Unterminated reference: keep the rest verbatim.
+            out.push_str(&rest[start..]);
+            return Ok(out);
+        };
+        let name = &after[..end];
+        if name.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Empty environment reference '${{}}' in configuration"
+            ));
+        }
+        let value = std::env::var(name).map_err(|_| {
+            anyhow::anyhow!("Environment variable '{name}' referenced in configuration is not set")
+        })?;
+        out.push_str(&value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 pub fn default_user_config_dir() -> Option<PathBuf> {
@@ -957,5 +1017,111 @@ credentials:
 "#;
         let config: MatrixConfig = serde_norway::from_str(yaml).unwrap();
         assert_eq!(config.message_type, MatrixMessageType::Notice);
+    }
+
+    // ---- Environment reference interpolation ----
+
+    #[test]
+    fn test_load_interpolates_env_references() {
+        let old = std::env::var_os("CFS_TEST_PASSWORD");
+        unsafe {
+            std::env::set_var("CFS_TEST_PASSWORD", "s3cret-value");
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("test-config.yaml");
+        std::fs::write(
+            &config_path,
+            r#"
+couchdb:
+  url: "http://localhost:5984"
+  auth:
+    username: "admin"
+    password: "${CFS_TEST_PASSWORD}"
+  database: "couchdb_file_sync_files"
+"#,
+        )
+        .unwrap();
+
+        let config = AppConfig::load(Some(config_path)).unwrap();
+        let auth = config.couchdb.auth.expect("auth present");
+        assert_eq!(auth.username, "admin");
+        assert_eq!(
+            auth.password, "s3cret-value",
+            "${{CFS_TEST_PASSWORD}} should expand to the env value"
+        );
+
+        match old {
+            Some(v) => unsafe { std::env::set_var("CFS_TEST_PASSWORD", v) },
+            None => unsafe { std::env::remove_var("CFS_TEST_PASSWORD") },
+        }
+    }
+
+    #[test]
+    fn test_load_fails_explicitly_on_missing_env_reference() {
+        // Ensure the referenced variable is unset so the failure is deterministc.
+        unsafe {
+            std::env::remove_var("CFS_TEST_MISSING");
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("test-config.yaml");
+        std::fs::write(
+            &config_path,
+            r#"
+couchdb:
+  auth:
+    username: "admin"
+    password: "${CFS_TEST_MISSING}"
+"#,
+        )
+        .unwrap();
+
+        let err = AppConfig::load(Some(config_path)).expect_err("missing env reference must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("CFS_TEST_MISSING"),
+            "error should name the missing variable, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_diagnostics_never_leak_secret_values() {
+        // A present secret in the environment must never surface in an error
+        // diagnostic produced while resolving a *different* reference.
+        unsafe {
+            std::env::set_var("CFS_TEST_SECRET", "super-secret-token");
+        }
+        unsafe {
+            std::env::remove_var("CFS_TEST_MISSING_OTHER");
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("test-config.yaml");
+        std::fs::write(
+            &config_path,
+            r#"
+couchdb:
+  auth:
+    username: "admin"
+    password: "${CFS_TEST_MISSING_OTHER}"
+"#,
+        )
+        .unwrap();
+
+        let err = AppConfig::load(Some(config_path)).expect_err("missing reference must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("CFS_TEST_MISSING_OTHER"),
+            "error should name the missing variable: {msg}"
+        );
+        assert!(
+            !msg.contains("super-secret-token"),
+            "error diagnostics must not leak secret values: {msg}"
+        );
+
+        unsafe {
+            std::env::remove_var("CFS_TEST_SECRET");
+        }
     }
 }

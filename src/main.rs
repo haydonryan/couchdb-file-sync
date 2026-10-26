@@ -222,13 +222,27 @@ fn apply_cli_overrides(config: &mut AppConfig, cli: &Cli) {
             password: password.clone(),
         });
     } else if let Some(user) = cli.db_user.as_ref() {
+        // Username-only override: preserve the configured password.
+        let password = config
+            .couchdb
+            .auth
+            .as_ref()
+            .map(|a| a.password.clone())
+            .unwrap_or_default();
         config.couchdb.auth = Some(couchdb_file_sync::config::CouchDbAuth {
             username: user.clone(),
-            password: String::new(),
+            password,
         });
     } else if let Some(pass) = cli.db_pass.as_ref() {
+        // Password-only override: preserve the configured username.
+        let username = config
+            .couchdb
+            .auth
+            .as_ref()
+            .map(|a| a.username.clone())
+            .unwrap_or_default();
         config.couchdb.auth = Some(couchdb_file_sync::config::CouchDbAuth {
-            username: String::new(),
+            username,
             password: pass.clone(),
         });
     }
@@ -525,8 +539,8 @@ fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daem
 mod tests {
     use super::{Cli, Commands, init_logging};
     use super::{
-        apply_cli_overrides, default_user_config_file_if_exists, paths_match, resolve_paths,
-        resolved_config_path,
+        apply_cli_overrides, default_user_config_file_if_exists, load_config, paths_match,
+        resolve_paths, resolved_config_path,
     };
     use argy::FromArgs;
     use couchdb_file_sync::config::{AppConfig, SyncPath};
@@ -1195,5 +1209,121 @@ mod tests {
 
         assert_eq!(config.couchdb.url, "original");
         assert!(config.couchdb.auth.is_none());
+    }
+
+    #[test]
+    fn apply_cli_overrides_username_only_preserves_configured_password() {
+        let cli =
+            Cli::from_args(&["couchdb-file-sync"], &["--db-user", "alice", "status"]).unwrap();
+
+        let mut config = AppConfig::default();
+        config.couchdb.auth = Some(couchdb_file_sync::config::CouchDbAuth {
+            username: "admin".to_string(),
+            password: "cfg-secret".to_string(),
+        });
+
+        apply_cli_overrides(&mut config, &cli);
+
+        let auth = config.couchdb.auth.as_ref().expect("auth present");
+        assert_eq!(auth.username, "alice");
+        assert_eq!(
+            auth.password, "cfg-secret",
+            "username-only override must preserve the configured password"
+        );
+    }
+
+    #[test]
+    fn apply_cli_overrides_password_only_preserves_configured_username() {
+        let cli = Cli::from_args(
+            &["couchdb-file-sync"],
+            &["--db-pass", "cli-secret", "status"],
+        )
+        .unwrap();
+
+        let mut config = AppConfig::default();
+        config.couchdb.auth = Some(couchdb_file_sync::config::CouchDbAuth {
+            username: "admin".to_string(),
+            password: "cfg-secret".to_string(),
+        });
+
+        apply_cli_overrides(&mut config, &cli);
+
+        let auth = config.couchdb.auth.as_ref().expect("auth present");
+        assert_eq!(auth.username, "admin");
+        assert_eq!(
+            auth.password, "cli-secret",
+            "password-only override must replace the password and keep the username"
+        );
+    }
+
+    #[test]
+    fn apply_cli_overrides_username_only_with_no_existing_auth_creates_empty_password() {
+        let cli =
+            Cli::from_args(&["couchdb-file-sync"], &["--db-user", "alice", "status"]).unwrap();
+
+        let mut config = AppConfig::default();
+
+        apply_cli_overrides(&mut config, &cli);
+
+        let auth = config.couchdb.auth.as_ref().expect("auth created");
+        assert_eq!(auth.username, "alice");
+        assert_eq!(auth.password, "");
+    }
+
+    #[test]
+    fn load_config_cli_wins_over_env_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_url = std::env::var_os("COUCHDB_FILE_SYNC__COUCHDB__URL");
+        let old_user = std::env::var_os("COUCHDB_FILE_SYNC__COUCHDB__AUTH__USERNAME");
+        let old_pass = std::env::var_os("COUCHDB_FILE_SYNC__COUCHDB__AUTH__PASSWORD");
+
+        // Env supplies credentials; CLI supplies the URL. CLI must win for the
+        // overlapping key, env fills the ones CLI leaves untouched.
+        unsafe {
+            std::env::set_var("COUCHDB_FILE_SYNC__COUCHDB__URL", "http://env:5984");
+            std::env::set_var("COUCHDB_FILE_SYNC__COUCHDB__AUTH__USERNAME", "env-user");
+            std::env::set_var("COUCHDB_FILE_SYNC__COUCHDB__AUTH__PASSWORD", "env-pass");
+        }
+
+        let cli = Cli::from_args(
+            &["couchdb-file-sync"],
+            &["--db-url", "http://cli:5984", "status"],
+        )
+        .unwrap();
+
+        let config = load_config(&cli).unwrap();
+        assert_eq!(config.couchdb.url, "http://cli:5984");
+        let auth = config.couchdb.auth.as_ref().expect("env auth merged");
+        assert_eq!(auth.username, "env-user");
+        assert_eq!(auth.password, "env-pass");
+
+        let restore = |old: Option<std::ffi::OsString>, name: &str| match old {
+            Some(v) => unsafe { std::env::set_var(name, v) },
+            None => unsafe { std::env::remove_var(name) },
+        };
+        restore(old_url, "COUCHDB_FILE_SYNC__COUCHDB__URL");
+        restore(old_user, "COUCHDB_FILE_SYNC__COUCHDB__AUTH__USERNAME");
+        restore(old_pass, "COUCHDB_FILE_SYNC__COUCHDB__AUTH__PASSWORD");
+    }
+
+    #[test]
+    fn apply_cli_overrides_both_flags_replace_auth() {
+        let cli = Cli::from_args(
+            &["couchdb-file-sync"],
+            &["--db-user", "bob", "--db-pass", "new-secret", "status"],
+        )
+        .unwrap();
+
+        let mut config = AppConfig::default();
+        config.couchdb.auth = Some(couchdb_file_sync::config::CouchDbAuth {
+            username: "admin".to_string(),
+            password: "old-secret".to_string(),
+        });
+
+        apply_cli_overrides(&mut config, &cli);
+
+        let auth = config.couchdb.auth.as_ref().expect("auth replaced");
+        assert_eq!(auth.username, "bob");
+        assert_eq!(auth.password, "new-secret");
     }
 }

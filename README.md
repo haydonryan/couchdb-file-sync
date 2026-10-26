@@ -153,13 +153,24 @@ Configuration is loaded in this precedence order (highest to lowest):
 
 ### Environment Variables
 
+Environment variables use the `COUCHDB_FILE_SYNC` prefix with `__` separating
+each nesting level (matching the YAML keys below):
+
 ```bash
-export COUCHDB_FILE_SYNC_DB_URL="http://localhost:5984"
-export COUCHDB_FILE_SYNC_DB_USERNAME="admin"
-export COUCHDB_FILE_SYNC_DB_PASSWORD="secret"
-export COUCHDB_FILE_SYNC_DB_NAME="couchdb_file_sync_files"
+export COUCHDB_FILE_SYNC__COUCHDB__URL="http://localhost:5984"
+export COUCHDB_FILE_SYNC__COUCHDB__AUTH__USERNAME="admin"
+export COUCHDB_FILE_SYNC__COUCHDB__AUTH__PASSWORD="secret"
+export COUCHDB_FILE_SYNC__COUCHDB__DATABASE="couchdb_file_sync_files"
 export COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL="60"
 ```
+
+### Environment Variable Substitution
+
+Any string value in the YAML config may reference an environment variable with
+`${VAR}` syntax (for example `password: "${COUCHDB_PASSWORD}"`). References are
+expanded from the environment at load time. A referenced variable that is not
+set aborts configuration loading with an explicit error naming the variable —
+it never silently reaches the runtime as a literal placeholder.
 
 ### YAML Config
 

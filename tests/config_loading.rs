@@ -93,17 +93,28 @@ fn missing_default_config_permits_defaults() {
 #[test]
 fn shipped_template_loads() {
     // A copy of the exact shipped template named config.yaml must load without
-    // a config error; `init` needs no CouchDB so it exercises dispatch.
+    // a config error; `init` needs no CouchDB so it exercises dispatch. The
+    // template documents `${VAR}` environment substitution, so supply the
+    // variables it references (its active auth password is `${COUCHDB_PASSWORD}`).
     let dir = scratch_dir();
     let config = dir.path().join("config.yaml");
     std::fs::copy(SHIPPED_TEMPLATE, &config).expect("copy shipped template");
     let sync = dir.path().join("sync");
-    let out = run(&[
-        "--config",
-        config.to_str().unwrap(),
-        "init",
-        sync.to_str().unwrap(),
-    ]);
+    let out = Command::new(binary())
+        .env("COUCHDB_PASSWORD", "s3cret")
+        .env("TELEGRAM_BOT_TOKEN", "123:abc")
+        .env("TELEGRAM_CHAT_ID", "-456")
+        .env("MATRIX_HOMESERVER_URL", "https://matrix.example.com")
+        .env("MATRIX_ACCESS_TOKEN", "syt_token")
+        .env("MATRIX_ROOM_ID", "!room:example.com")
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "init",
+            sync.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn couchdb-file-sync binary");
     assert!(
         out.status.success(),
         "shipped template must load; status={:?} stdout={} stderr={}",
