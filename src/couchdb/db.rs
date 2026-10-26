@@ -355,6 +355,33 @@ impl CouchDb {
         client
     }
 
+    /// Create a `CouchDb` instance for testing that points its structural
+    /// `couch_rs` client and reqwest client at a caller-supplied base URL
+    /// (typically an in-process fake `CouchDB` server), with the given
+    /// remote-path scope and no canned state. Lets tests exercise the real HTTP
+    /// path against a stateful fixture (e.g. verifying shared chunks survive an
+    /// overwrite) without a live `CouchDB` server.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn for_test_at(addr: &str, remote_path: &str) -> Self {
+        let client = couch_rs::Client::new_no_auth(addr).expect("fake couch_rs client");
+        let db = couch_rs::database::Database::new("test_db".to_string(), client.clone());
+        Self {
+            client,
+            db,
+            http_client: reqwest::Client::new(),
+            base_db_url: format!("{addr}/test_db"),
+            db_name: DatabaseName::new("test_db"),
+            auth: None,
+            remote_path: RemotePath::new(remote_path.to_string()),
+            timeout_seconds: 30,
+            retry_attempts: 3,
+            test_state: None,
+            test_write_calls: std::sync::atomic::AtomicUsize::new(0),
+            test_backoff: Duration::from_millis(1),
+        }
+    }
+
     /// Number of write attempts issued against this test client.
     #[cfg(test)]
     #[must_use]

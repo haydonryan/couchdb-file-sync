@@ -225,8 +225,11 @@ impl ApplyWorker {
 
         // Fetch the current remote doc once. The planned baseline (carried from
         // the triage/live-arbitration decision) decides whether publication is
-        // still authorized; the current doc's chunks and ctime are preserved on
-        // the success path.
+        // still authorized; the current doc's ctime is preserved on the success
+        // path. The current children are NOT presumed to be owned exclusively by
+        // this document: they may be shared with other documents (e.g. a copied
+        // document), so they are deliberately left in place and never eagerly
+        // deleted here (see the cleanup note below).
         let current = self.couchdb.get_file(remote_path).await?;
 
         // Conditional publication: reject a stale baseline instead of
@@ -262,14 +265,13 @@ impl ApplyWorker {
             ExpectedRemote::Force => {}
         }
 
-        let (existing_rev, existing_ctime, old_chunk_ids) = if let Some(existing) = current {
+        let (existing_rev, existing_ctime) = if let Some(existing) = current {
             debug!("[UPLOAD] Existing doc found, rev: {:?}", existing.rev);
             debug!("[UPLOAD] Existing ctime: {} ms", existing.ctime.as_u64());
-            debug!("[UPLOAD] Existing chunks: {}", existing.children.len());
-            (existing.rev, existing.ctime.as_u64(), existing.children)
+            (existing.rev, existing.ctime.as_u64())
         } else {
             debug!("[UPLOAD] No existing doc, creating new");
-            (None, mtime, Vec::new())
+            (None, mtime)
         };
 
         let mut doc = crate::models::FileDoc {
@@ -289,10 +291,14 @@ impl ApplyWorker {
         self.couchdb.save_file(&mut doc).await?;
         debug!("[UPLOAD] Saved doc, new rev: {:?}", doc.rev);
 
-        if !old_chunk_ids.is_empty() {
-            debug!("[UPLOAD] Deleting {} old chunks", old_chunk_ids.len());
-            self.couchdb.delete_chunks(&old_chunk_ids).await?;
-        }
+        // Successful publication is recorded immediately, independent of any
+        // best-effort cleanup. The previous child chunk set is intentionally
+        // left in place rather than eagerly deleted: this document may not
+        // exclusively own those chunks (another document may share them, e.g.
+        // a copied document), so deleting them here would corrupt that other
+        // file. Collection of truly-unreachable chunks is a separate, dedicated
+        // garbage-collection outcome; keeping them here means a cleanup failure
+        // can never erase the record of this successful publication.
 
         let state = FileState {
             path: local_path.to_string(),
@@ -2082,7 +2088,9 @@ mod tests {
     use crate::couchdb::CouchDb;
     use crate::couchdb::db::{CannedCouch, ConcurrencyProbe};
     use crate::local::{LocalDb, compute_bytes_hash, compute_file_hash};
-    use crate::models::{Change, CouchRev, FileDoc, IgnoreMatcher, TimestampMillis};
+    use crate::models::{
+        Change, ChunkDoc, CouchRev, DocType, FileDoc, IgnoreMatcher, TimestampMillis,
+    };
     use chrono::{Duration, Utc};
     use std::path::PathBuf;
 
@@ -3115,7 +3123,8 @@ mod tests {
     #[tokio::test]
     async fn upload_conditional_overwrite_succeeds_when_rev_matches() {
         // Planned at 1-abc and the remote is still at 1-abc: authorized, the
-        // overwrite proceeds and the old chunk is cleaned up.
+        // overwrite proceeds. The old chunk is left in place (not deleted) so a
+        // document sharing it stays readable; chunk collection is a follow-on GC.
         let dir = tempfile::tempdir().unwrap();
         let root = SyncDirPath::new(dir.path()).unwrap();
         std::fs::write(root.as_path().join("up.txt"), b"local content").unwrap();
@@ -3146,8 +3155,8 @@ mod tests {
             .expect("a matching revision authorizes the overwrite");
         assert_eq!(bytes, b"local content".len());
         assert_eq!(rev, Some("1-abc".to_string()));
-        // chunk upload + save + old-chunk cleanup all ran.
-        assert_eq!(engine.couchdb.test_write_calls(), 3);
+        // chunk upload + save only; old chunks are NOT deleted (shared-safe).
+        assert_eq!(engine.couchdb.test_write_calls(), 2);
     }
 
     #[tokio::test]
@@ -3180,7 +3189,224 @@ mod tests {
             .expect("explicit force overwrites any remote revision");
         assert_eq!(bytes, b"local content".len());
         assert_eq!(rev, Some("9-zzz".to_string()));
-        assert_eq!(engine.couchdb.test_write_calls(), 3);
+        // chunk upload + save only; old chunks are NOT deleted (shared-safe).
+        assert_eq!(engine.couchdb.test_write_calls(), 2);
+    }
+
+    // ── Shared chunks: overwrite must not corrupt a copied doc (#6351) ──────
+
+    /// Spawn an in-process fake `CouchDB` that stores file documents and chunks
+    /// in memory, so a document overwrite can be exercised through the real HTTP
+    /// path. `seed` is the initial `{id -> JSON doc}` store. When `fail_delete`
+    /// is set, any DELETE returns 500, simulating a best-effort cleanup failure.
+    /// Returns the base database URL, the server thread handle, and a shutdown
+    /// flag.
+    fn spawn_stateful_couch(
+        seed: HashMap<String, serde_json::Value>,
+        fail_delete: bool,
+    ) -> (
+        String,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stateful couch");
+        let addr = listener.local_addr().expect("stateful couch addr");
+        let base_db_url = format!("http://{addr}/test_db");
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_thread = shutdown.clone();
+        let store: std::sync::Arc<parking_lot::Mutex<HashMap<String, serde_json::Value>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(seed));
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("stateful couch runtime");
+            runtime.block_on(async move {
+                listener
+                    .set_nonblocking(true)
+                    .expect("set stateful couch nonblocking");
+                let listener =
+                    tokio::net::TcpListener::from_std(listener).expect("stateful couch tokio listener");
+                loop {
+                    if shutdown_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(10),
+                        listener.accept(),
+                    )
+                    .await
+                    {
+                        Ok(Ok((stream, _))) => {
+                            let store = store.clone();
+                            let fail_delete = fail_delete;
+                            let service = hyper::service::service_fn(move |req| {
+                                let store = store.clone();
+                                async move { handle_stateful_couch_req(req, store, fail_delete).await }
+                            });
+                            tokio::spawn(async move {
+                                let io = hyper_util::rt::TokioIo::new(stream);
+                                let _ = hyper::server::conn::http1::Builder::new()
+                                    .serve_connection(io, service)
+                                    .await;
+                            });
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_elapsed) => {} // no connection yet; re-check shutdown
+                    }
+                }
+            });
+        });
+        (base_db_url, handle, shutdown)
+    }
+
+    /// Serve `GET`/`PUT`/`DELETE` for document ids under `/test_db/` from the
+    /// in-memory store. `PUT` upserts the JSON body; `GET` returns it (or 404);
+    /// `DELETE` removes it (or fails with 500 when `fail_delete`).
+    #[allow(clippy::unused_async)]
+    async fn handle_stateful_couch_req(
+        req: hyper::Request<hyper::body::Incoming>,
+        store: std::sync::Arc<parking_lot::Mutex<HashMap<String, serde_json::Value>>>,
+        fail_delete: bool,
+    ) -> Result<hyper::Response<http_body_util::Full<hyper::body::Bytes>>, hyper::Error> {
+        let (parts, body) = req.into_parts();
+        let mut response =
+            hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::new()));
+        let id = parts
+            .uri
+            .path()
+            .split('/')
+            .next_back()
+            .unwrap_or("")
+            .to_string();
+        match (parts.method, id.as_str()) {
+            (hyper::Method::PUT, id) if !id.is_empty() => {
+                use http_body_util::BodyExt;
+                let bytes = body.collect().await.expect("collect body").to_bytes();
+                let value: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("parse stored doc");
+                store.lock().insert(id.to_string(), value);
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(
+                    format!(r#"{{"ok":true,"id":"{id}","rev":"1-abc"}}"#),
+                ));
+            }
+            (hyper::Method::GET, id) if !id.is_empty() => {
+                let value = store.lock().get(id).cloned();
+                if let Some(value) = value {
+                    *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(
+                        serde_json::to_string(&value).expect("serialize stored doc"),
+                    ));
+                } else {
+                    *response.status_mut() = hyper::StatusCode::NOT_FOUND;
+                }
+            }
+            (hyper::Method::DELETE, _) if !id.is_empty() => {
+                if fail_delete {
+                    *response.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
+                    *response.body_mut() = http_body_util::Full::new(
+                        hyper::body::Bytes::from_static(br#"{"error":"simulated delete failure"}"#),
+                    );
+                } else {
+                    store.lock().remove(&id);
+                    *response.body_mut() = http_body_util::Full::new(
+                        hyper::body::Bytes::from_static(br#"{"ok":true}"#),
+                    );
+                }
+            }
+            _ => {
+                *response.status_mut() = hyper::StatusCode::NOT_FOUND;
+            }
+        }
+        Ok(response)
+    }
+
+    #[tokio::test]
+    async fn overwrite_of_doc_shared_with_another_preserves_other_docs_chunks() {
+        // Regression (#6351): uploading/overwriting one of two documents that
+        // share a child chunk must leave the other document readable. The old
+        // code eagerly deleted the overwritten doc's previous children, which
+        // corrupted a copied doc sharing those chunks. Old chunks are now left
+        // in place (collection of unreachable chunks is a separate follow-on GC),
+        // so the shared chunk survives. DELETE is injected to fail, so the test
+        // also proves publication state is recorded regardless of a best-effort
+        // cleanup failure.
+        let shared_chunk_id = "shared1";
+        let mut doc_a = FileDoc::new("docA".to_string(), String::new(), 5);
+        doc_a.rev = Some("1-aaa".to_string());
+        doc_a.path = "docA".to_string();
+        doc_a.children = vec![shared_chunk_id.to_string()];
+        let mut doc_b = FileDoc::new("docB".to_string(), String::new(), 5);
+        doc_b.rev = Some("1-bbb".to_string());
+        doc_b.path = "docB".to_string();
+        doc_b.children = vec![shared_chunk_id.to_string()];
+
+        let mut seed = HashMap::new();
+        seed.insert("docA".to_string(), serde_json::to_value(&doc_a).unwrap());
+        seed.insert("docB".to_string(), serde_json::to_value(&doc_b).unwrap());
+        let shared_chunk = ChunkDoc {
+            id: shared_chunk_id.to_string(),
+            rev: Some("1-ccc".to_string()),
+            data: b"aaaaa".to_vec(),
+            doc_type: DocType::Leaf,
+        };
+        seed.insert(
+            shared_chunk_id.to_string(),
+            serde_json::to_value(&shared_chunk).unwrap(),
+        );
+
+        // Best-effort cleanup failures are injected: a DELETE on any chunk fails.
+        let (base_db_url, server, shutdown) = spawn_stateful_couch(seed, true);
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(root.as_path().join("docA"), b"bbbbb").unwrap();
+        let local = test_local_db();
+        let engine = SyncEngine::with_ignore(
+            CouchDb::for_test_at(&base_db_url, ""),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        // Overwrite docA with new content: uploads a fresh chunk and repoints
+        // docA at it. docB's reference to the shared chunk must survive.
+        let (bytes, rev) = engine
+            .upload_local_file("docA", "docA", &ExpectedRemote::At("1-aaa".to_string()))
+            .await
+            .expect("overwrite of a matching rev must succeed");
+        assert_eq!(bytes, b"bbbbb".len());
+        assert!(rev.is_some(), "overwrite must return the new revision");
+
+        // docB remains readable: its shared chunk is intact.
+        let b_content = engine
+            .couchdb
+            .get_file_content("docB")
+            .await
+            .expect("docB must remain readable");
+        assert_eq!(
+            b_content, b"aaaaa",
+            "docB must still resolve the shared chunk after docA is overwritten"
+        );
+
+        // docA's new content is readable too.
+        let a_content = engine
+            .couchdb
+            .get_file_content("docA")
+            .await
+            .expect("docA must be readable after overwrite");
+        assert_eq!(a_content, b"bbbbb");
+
+        // Successful publication is recorded even though best-effort cleanup
+        // (deleting the old shared chunk) is injected to fail.
+        let state = engine
+            .get_file_state("docA")
+            .await
+            .unwrap()
+            .expect("docA's published state must be recorded");
+        assert_eq!(state.hash, compute_bytes_hash(b"bbbbb"));
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("stateful couch join");
     }
 
     #[tokio::test]
