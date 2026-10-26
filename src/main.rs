@@ -397,10 +397,34 @@ fn validate_daemon_interval(interval: u64) -> Result<()> {
 
 fn run_conflicts(path: Option<PathBuf>, json: bool, config: &AppConfig) -> Result<()> {
     let paths = resolve_paths_or_bail(path, config)?;
+    if json && paths.len() > 1 {
+        // Multi-root JSON: emit one aggregate document carrying per-root results
+        // or errors so stdout stays a single parseable JSON value even when a
+        // root's state DB cannot be read.
+        let mut roots = Vec::with_capacity(paths.len());
+        for sync_path in &paths {
+            let entry = match cli::conflicts_for(&sync_path.local) {
+                Ok(conflicts) => serde_json::json!({
+                    "path": sync_path.local,
+                    "conflicts": conflicts,
+                }),
+                Err(e) => serde_json::json!({
+                    "path": sync_path.local,
+                    "error": format!("{e:#}"),
+                }),
+            };
+            roots.push(entry);
+        }
+        let aggregate = serde_json::json!({ "roots": roots });
+        println!("{}", serde_json::to_string_pretty(&aggregate)?);
+        return Ok(());
+    }
     let multi = paths.len() > 1;
     for sync_path in &paths {
         if multi {
-            println!("\n=== {} ===", sync_path.local.display());
+            // Per-root banners are diagnostics, not machine output; keep stdout
+            // clean even in human-readable mode.
+            eprintln!("\n=== {} ===", sync_path.local.display());
         }
         cli::conflicts(&sync_path.local, json)?;
     }
@@ -423,10 +447,34 @@ async fn run_resolve(path: Option<PathBuf>, config: &AppConfig) -> Result<()> {
 
 fn run_status(path: Option<PathBuf>, json: bool, config: &AppConfig) -> Result<()> {
     let paths = resolve_paths_or_bail(path, config)?;
+    if json && paths.len() > 1 {
+        // Multi-root JSON: emit one aggregate document carrying per-root results
+        // or errors so stdout stays a single parseable JSON value even when a
+        // root's state DB cannot be read.
+        let mut roots = Vec::with_capacity(paths.len());
+        for sync_path in &paths {
+            let entry = match cli::status_summary(&sync_path.local) {
+                Ok(summary) => serde_json::json!({
+                    "path": sync_path.local,
+                    "status": summary.to_json(),
+                }),
+                Err(e) => serde_json::json!({
+                    "path": sync_path.local,
+                    "error": format!("{e:#}"),
+                }),
+            };
+            roots.push(entry);
+        }
+        let aggregate = serde_json::json!({ "roots": roots });
+        println!("{}", serde_json::to_string_pretty(&aggregate)?);
+        return Ok(());
+    }
     let multi = paths.len() > 1;
     for sync_path in &paths {
         if multi {
-            println!("\n=== {} ===", sync_path.local.display());
+            // Per-root banners are diagnostics, not machine output; keep stdout
+            // clean even in human-readable mode.
+            eprintln!("\n=== {} ===", sync_path.local.display());
         }
         cli::status(&sync_path.local, json, config)?;
     }
@@ -527,7 +575,9 @@ fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daem
         EnvFilter::new(format!("couchdb_file_sync={}", level.as_filter_str()))
     };
 
-    let stdout_layer = tracing_subscriber::fmt::layer().with_filter(filter);
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(filter);
 
     if enable_file_logging {
         let log_path = config
@@ -546,7 +596,7 @@ fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daem
             Ok(writer) => tracing_appender::non_blocking(writer),
             Err(err) => {
                 eprintln!("Failed to open log file {}: {}", log_path.display(), err);
-                tracing_subscriber::registry().with(stdout_layer).init();
+                tracing_subscriber::registry().with(stderr_layer).init();
                 return;
             }
         };
@@ -559,11 +609,11 @@ fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daem
             .with_filter(file_filter);
 
         tracing_subscriber::registry()
-            .with(stdout_layer)
+            .with(stderr_layer)
             .with(file_layer)
             .init();
     } else {
-        tracing_subscriber::registry().with(stdout_layer).init();
+        tracing_subscriber::registry().with(stderr_layer).init();
     }
 }
 

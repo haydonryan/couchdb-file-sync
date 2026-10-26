@@ -375,6 +375,27 @@ couchdb-file-sync status
 couchdb-file-sync status --json
 ```
 
+### Machine-readable output
+
+`status --json` and `conflicts --json` write **one valid JSON document** to
+stdout (diagnostics and per-root banners go to stderr). With a single
+configured root the shape is unchanged: `status` emits a status object and
+`conflicts` emits a conflict array. With multiple configured roots the commands
+emit a single aggregate document so the output stays parseable even when a
+root's state database cannot be read:
+
+```json
+{
+  "roots": [
+    { "path": "/srv/notes", "status": { "sync_directory": "/srv/notes", "tracked_files": 0, "local_files": 0, "pending_conflicts": 0, "last_sync": null } },
+    { "path": "/srv/broken", "error": "file is not a database" }
+  ]
+}
+```
+
+`status` entries carry `status`; `conflicts` entries carry `conflicts`. A root
+that fails to load carries an `error` string instead of its result.
+
 ### `couchdb-file-sync install`
 
 Install the current binary to the standard user location, create a user-level systemd service, and point it at `~/.config/couchdb-file-sync/couchdb-file-sync.yaml`.

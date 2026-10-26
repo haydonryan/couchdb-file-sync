@@ -2367,17 +2367,27 @@ async fn apply_live_remote_write(
     Ok(())
 }
 
-/// List conflicts
+/// Load the conflict list for a single root without rendering it.
+///
+/// Shared by the `conflicts` command and the multi-root JSON aggregator in the
+/// binary.
+///
+/// # Errors
+///
+/// Returns an error if the local state DB cannot be opened or read.
+pub fn conflicts_for(path: &Path) -> Result<Vec<Conflict>> {
+    let db_path = state_db_path(path);
+    let local_db = LocalDb::open(&db_path)?;
+    local_db.get_conflicts()
+}
+
 /// List conflicts for a sync directory.
 ///
 /// # Errors
 ///
 /// Returns an error if the local state DB cannot be opened or read.
 pub fn conflicts(path: &Path, json: bool) -> Result<()> {
-    let db_path = state_db_path(path);
-    let local_db = LocalDb::open(&db_path)?;
-
-    let conflicts = local_db.get_conflicts()?;
+    let conflicts = conflicts_for(path)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&conflicts)?);
@@ -2612,8 +2622,42 @@ fn truncate_str(s: &str, max_width: usize) -> String {
 ///
 /// # Errors
 ///
+/// Machine-readable sync status for a single root.
+///
+/// Exposed so the binary can aggregate per-root results into one JSON document
+/// for multi-root output while the single-root `status` command keeps its
+/// documented shape.
+#[derive(Clone, Debug)]
+pub struct StatusSummary {
+    pub sync_directory: PathBuf,
+    pub tracked_files: usize,
+    pub local_files: usize,
+    pub pending_conflicts: usize,
+    pub last_sync: Option<DateTime<Utc>>,
+    pub last_seq: Option<String>,
+}
+
+impl StatusSummary {
+    /// Render the single-root status document. The shape mirrors the previous
+    /// `status --json` output exactly so one-root compatibility is preserved.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "sync_directory": self.sync_directory,
+            "tracked_files": self.tracked_files,
+            "local_files": self.local_files,
+            "pending_conflicts": self.pending_conflicts,
+            "last_sync": self.last_sync,
+        })
+    }
+}
+
+/// Compute the status summary for a single root without rendering it.
+///
+/// # Errors
+///
 /// Returns an error if the local state DB cannot be opened or read.
-pub fn status(path: &Path, json: bool, _config: &AppConfig) -> Result<()> {
+pub fn status_summary(path: &Path) -> Result<StatusSummary> {
     let db_path = state_db_path(path);
     let local_db = LocalDb::open(&db_path)?;
 
@@ -2628,36 +2672,49 @@ pub fn status(path: &Path, json: bool, _config: &AppConfig) -> Result<()> {
         .filter(|e| e.file_type().is_file())
         .count();
 
+    Ok(StatusSummary {
+        sync_directory: path.to_path_buf(),
+        tracked_files: file_states.len(),
+        local_files: file_count,
+        pending_conflicts: conflicts.len(),
+        last_sync: checkpoint.as_ref().map(|cp| cp.last_sync_at),
+        last_seq: checkpoint.as_ref().map(|cp| cp.last_seq.clone()),
+    })
+}
+
+/// List the sync status for a sync directory.
+///
+/// # Errors
+///
+/// Returns an error if the local state DB cannot be opened or read.
+pub fn status(path: &Path, json: bool, _config: &AppConfig) -> Result<()> {
+    let summary = status_summary(path)?;
+
     if json {
-        let status = serde_json::json!({
-            "sync_directory": path,
-            "tracked_files": file_states.len(),
-            "local_files": file_count,
-            "pending_conflicts": conflicts.len(),
-            "last_sync": checkpoint.as_ref().map(|cp| cp.last_sync_at),
-        });
-        println!("{}", serde_json::to_string_pretty(&status)?);
+        println!("{}", serde_json::to_string_pretty(&summary.to_json())?);
     } else {
         println!("CouchDB File Sync Status");
         println!("==============");
-        println!("Sync directory: {}", path.display());
-        println!("Local files:    {file_count}");
-        println!("Tracked files:  {}", file_states.len());
-        println!("Pending conflicts: {}", conflicts.len());
+        println!("Sync directory: {}", summary.sync_directory.display());
+        println!("Local files:    {}", summary.local_files);
+        println!("Tracked files:  {}", summary.tracked_files);
+        println!("Pending conflicts: {}", summary.pending_conflicts);
 
-        if let Some(cp) = &checkpoint {
-            println!(
-                "Last sync:      {}",
-                cp.last_sync_at.format("%Y-%m-%d %H:%M:%S UTC")
-            );
-            println!("Last sequence:  {}", cp.last_seq);
+        if let Some(cp) = &summary.last_sync {
+            println!("Last sync:      {}", cp.format("%Y-%m-%d %H:%M:%S UTC"));
+            if let Some(seq) = &summary.last_seq {
+                println!("Last sequence:  {seq}");
+            }
         } else {
             println!("Last sync:      Never");
         }
 
-        if !conflicts.is_empty() {
+        if summary.pending_conflicts > 0 {
             println!();
-            println!("⚠️  {} conflict(s) need resolution", conflicts.len());
+            println!(
+                "⚠️  {} conflict(s) need resolution",
+                summary.pending_conflicts
+            );
         }
     }
 
