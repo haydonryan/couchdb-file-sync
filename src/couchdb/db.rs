@@ -271,6 +271,39 @@ impl CouchDb {
         Ok(info.update_seq)
     }
 
+    /// Fetch the remote database UUID.
+    ///
+    /// The UUID changes whenever the database is deleted and recreated, so it
+    /// is part of the sync identity: reusing stored local state for a recreated
+    /// database (with the same name and prefix) would silently reuse stale
+    /// file states and checkpoints.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database info request fails.
+    pub async fn get_db_uuid(&self) -> Result<String> {
+        let body = self
+            .retry_transient::<_, _, serde_json::Value, anyhow::Error>(|| {
+                let mut request = self.http_client.get(&self.base_db_url);
+                if let Some((username, password)) = &self.auth {
+                    request = request.basic_auth(username, Some(password));
+                }
+                async move {
+                    let response = request.send().await?.error_for_status()?;
+                    response
+                        .json::<serde_json::Value>()
+                        .await
+                        .map_err(Into::into)
+                }
+            })
+            .await?;
+        Ok(body
+            .get("uuid")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string())
+    }
+
     /// Create a `CouchDb` instance for testing without connecting to a real server.
     /// Only fields needed for path conversion and sync metadata are populated.
     ///

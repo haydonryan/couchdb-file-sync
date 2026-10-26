@@ -1,4 +1,4 @@
-use crate::models::{Checkpoint, Conflict, CouchRev, FileState};
+use crate::models::{Checkpoint, Conflict, CouchRev, FileState, SyncIdentity};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
@@ -522,6 +522,75 @@ impl LocalDb {
         )?;
         Ok(())
     }
+
+    /// Read the stored [`SyncIdentity`] this local state is bound to, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata query or deserialization fails.
+    pub fn get_sync_identity(&self) -> Result<Option<SyncIdentity>> {
+        let Some(raw) = self.get_meta(SYNC_IDENTITY_KEY)? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_str(&raw)?))
+    }
+
+    /// Persist the [`SyncIdentity`] this local state is bound to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the identity cannot be serialized or written.
+    pub fn set_sync_identity(&self, identity: &SyncIdentity) -> Result<()> {
+        let raw = serde_json::to_string(identity)?;
+        self.set_meta(SYNC_IDENTITY_KEY, &raw)
+    }
+
+    /// Validate that stored state may be reused for the given sync mapping.
+    ///
+    /// A database with no recorded identity (fresh, or pre-identity legacy
+    /// state) is conservatively bound to `identity` and its existing state is
+    /// kept; the binding is persisted so a later mapping change is detected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the identity cannot be read or the conservative
+    /// bind cannot be persisted.
+    pub fn validate_sync_identity(&self, identity: &SyncIdentity) -> Result<SyncIdentityCheck> {
+        match self.get_sync_identity()? {
+            None => {
+                self.set_sync_identity(identity)?;
+                Ok(SyncIdentityCheck::Bound)
+            }
+            Some(stored) if stored == *identity => Ok(SyncIdentityCheck::Matched),
+            Some(stored) => Ok(SyncIdentityCheck::Mismatched {
+                stored,
+                current: identity.clone(),
+            }),
+        }
+    }
+}
+
+/// Key in `sync_meta` storing the serialized [`SyncIdentity`] that local state
+/// is bound to.
+const SYNC_IDENTITY_KEY: &str = "sync_identity";
+
+/// Outcome of validating the current sync mapping against the stored identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncIdentityCheck {
+    /// Stored state is bound to the exact same mapping — safe to reuse.
+    Matched,
+    /// No identity was recorded (fresh or legacy database). The current
+    /// mapping is persisted so future changes are detected, and existing state
+    /// is conservatively kept.
+    Bound,
+    /// The mapping changed since the state was recorded; the stored state must
+    /// not be reused without an explicit reset/rebuild.
+    Mismatched {
+        /// The mapping the stored state was produced under.
+        stored: SyncIdentity,
+        /// The mapping the engine is about to sync.
+        current: SyncIdentity,
+    },
 }
 
 fn u64_to_i64(value: u64) -> Result<i64> {
@@ -1148,5 +1217,96 @@ mod tests {
         let db = test_db();
         let result = db.mark_conflict_notified("/nonexistent");
         assert!(result.is_ok());
+    }
+
+    // ── sync identity ────────────────────────────────────────────────────
+
+    fn identity(root: &str, db_name: &str, uuid: &str, prefix: &str) -> SyncIdentity {
+        SyncIdentity::new(root, db_name, uuid, prefix)
+    }
+
+    #[test]
+    fn legacy_state_is_conservatively_bound_and_kept() {
+        let db = test_db();
+        // Pre-identity database carries real file state.
+        db.save_file_state(&make_file_state("a.txt")).unwrap();
+
+        // First validation with no stored identity binds and keeps the state.
+        let current = identity("/root", "db", "uuid-1", "old/");
+        assert_eq!(
+            db.validate_sync_identity(&current).unwrap(),
+            SyncIdentityCheck::Bound
+        );
+        assert_eq!(db.get_sync_identity().unwrap(), Some(current));
+        assert_eq!(db.get_all_file_states().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unchanged_mapping_is_matched() {
+        let db = test_db();
+        let current = identity("/root", "db", "uuid-1", "notes/");
+        assert_eq!(
+            db.validate_sync_identity(&current).unwrap(),
+            SyncIdentityCheck::Bound
+        );
+        // Same mapping again is a match.
+        assert_eq!(
+            db.validate_sync_identity(&current).unwrap(),
+            SyncIdentityCheck::Matched
+        );
+    }
+
+    #[test]
+    fn changed_prefix_is_a_mismatch() {
+        let db = test_db();
+        db.validate_sync_identity(&identity("/root", "db", "uuid-1", "old/"))
+            .unwrap();
+
+        let new_prefix = identity("/root", "db", "uuid-1", "new/");
+        match db.validate_sync_identity(&new_prefix).unwrap() {
+            SyncIdentityCheck::Mismatched { stored, current } => {
+                assert_eq!(stored.prefix, "old/");
+                assert_eq!(current.prefix, "new/");
+            }
+            other => panic!("expected Mismatched, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn changed_database_is_a_mismatch() {
+        let db = test_db();
+        db.validate_sync_identity(&identity("/root", "db-a", "uuid-1", "notes/"))
+            .unwrap();
+        assert!(matches!(
+            db.validate_sync_identity(&identity("/root", "db-b", "uuid-1", "notes/"))
+                .unwrap(),
+            SyncIdentityCheck::Mismatched { .. }
+        ));
+    }
+
+    #[test]
+    fn recreated_remote_database_is_a_mismatch() {
+        let db = test_db();
+        // Same db NAME, but a fresh UUID signals the database was recreated.
+        db.validate_sync_identity(&identity("/root", "db", "uuid-1", "notes/"))
+            .unwrap();
+        assert!(matches!(
+            db.validate_sync_identity(&identity("/root", "db", "uuid-2", "notes/"))
+                .unwrap(),
+            SyncIdentityCheck::Mismatched { .. }
+        ));
+    }
+
+    #[test]
+    fn canonical_root_alias_binds_to_the_same_identity() {
+        let db = test_db();
+        // Two spellings that resolve to the same canonical root produce the
+        // same identity string, so the second is a match, not a mismatch.
+        let canonical = identity("/srv/root", "db", "uuid-1", "notes/");
+        db.validate_sync_identity(&canonical).unwrap();
+        assert_eq!(
+            db.validate_sync_identity(&canonical).unwrap(),
+            SyncIdentityCheck::Matched
+        );
     }
 }

@@ -301,6 +301,7 @@ fn run_init(
 
 async fn run_sync(path: Option<PathBuf>, dry_run: bool, config: &AppConfig) -> Result<()> {
     let paths = resolve_paths_or_bail(path, config)?;
+    cli::validate_unique_mappings(&paths)?;
     for sync_path in paths {
         let mut path_config = config.clone();
         path_config.couchdb.remote_path = sync_path.remote;

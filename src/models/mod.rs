@@ -11,5 +11,6 @@ pub use file::{ChunkDoc, CouchRev, DocType, FileDoc, FileState, RemoteState, Tim
 pub use ignore::IgnoreMatcher;
 pub use path::SyncDirPath;
 pub use primitives::{
-    Checkpoint, DatabaseName, DownloadCount, FileSize, RemotePath, TouchBucket, UploadCount,
+    Checkpoint, DatabaseName, DownloadCount, FileSize, RemotePath, SyncIdentity, TouchBucket,
+    UploadCount,
 };

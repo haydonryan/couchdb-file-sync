@@ -1,10 +1,10 @@
 use crate::config::{AppConfig, SyncPath, default_user_config_file};
 use crate::couchdb::{ChangeFeedEntry, ChangesFeed, CouchDb};
-use crate::local::{AsyncFileWatcher, LocalDb, compute_file_hash};
+use crate::local::{AsyncFileWatcher, LocalDb, SyncIdentityCheck, compute_file_hash};
 use crate::matrix::MatrixNotifier;
 use crate::models::{
     Change, ChangeType, Conflict, CouchRev, DatabaseName, ExpectedRemote, FileState, IgnoreMatcher,
-    RemotePath, RemoteState, ResolutionStrategy, SyncDirPath,
+    RemotePath, RemoteState, ResolutionStrategy, SyncDirPath, SyncIdentity,
 };
 use crate::sync::{SyncEngine, SyncReport, triage};
 use crate::telegram::TelegramNotifier;
@@ -419,6 +419,97 @@ fn resolve_sync_dir(path: &Path) -> Result<SyncDirPath> {
         .with_context(|| format!("cannot resolve sync directory '{}'", path.display()))
 }
 
+/// Build the validated sync-mapping identity for a local root, remote
+/// database, and (raw) remote prefix. The prefix is normalized via
+/// [`RemotePath`] so equivalent spellings always compare equal, and the remote
+/// database UUID is fetched so a recreated database is detected.
+async fn sync_identity_for(
+    couchdb: &CouchDb,
+    root: &SyncDirPath,
+    database: &str,
+    raw_prefix: &str,
+) -> Result<SyncIdentity> {
+    let db_uuid = couchdb.get_db_uuid().await?;
+    Ok(SyncIdentity::new(
+        root.as_path().display().to_string(),
+        database,
+        db_uuid,
+        RemotePath::new(raw_prefix).as_str(),
+    ))
+}
+
+/// Synchronously validate that stored local state may be reused for the given
+/// mapping. `LocalDb` is not `Sync`, so callers must fetch the identity (via
+/// [`sync_identity_for`]) before holding a `&LocalDb` across any await.
+///
+/// A database with no recorded identity (fresh or legacy) is conservatively
+/// bound to the current mapping and its state kept; a mapping change errors
+/// out, requiring an explicit reset/rebuild.
+fn validate_sync_mapping(local_db: &LocalDb, identity: &SyncIdentity) -> Result<()> {
+    match local_db.validate_sync_identity(identity)? {
+        SyncIdentityCheck::Matched => {}
+        SyncIdentityCheck::Bound => {
+            info!(
+                "Bound local state to sync mapping (root '{}', db '{}', prefix '{}')",
+                identity.root, identity.database, identity.prefix
+            );
+        }
+        SyncIdentityCheck::Mismatched { stored, current } => {
+            anyhow::bail!(
+                "Sync mapping changed since the local state was recorded: \
+                 stored root '{}', db '{}', prefix '{}'; current root '{}', db '{}', prefix '{}'. \
+                 Reusing the old state could miss or corrupt files. \
+                 Run `couchdb-file-sync rebuild-remote <path>` or `rebuild-local <path>` to \
+                 explicitly reset state for the new mapping.",
+                stored.root,
+                stored.database,
+                stored.prefix,
+                current.root,
+                current.database,
+                current.prefix
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Synchronously bind a freshly-reset local state DB to the current mapping.
+/// Used by the explicit rebuild commands, which are the sanctioned way to reset
+/// state after a mapping change.
+fn bind_sync_mapping(local_db: &LocalDb, identity: &SyncIdentity) -> Result<()> {
+    local_db.set_sync_identity(identity)
+}
+
+/// Reject duplicate or conflicting sync mappings before any worker starts.
+///
+/// Two mappings that resolve to the same canonical local root share the same
+/// state database and would double-sync (and mutually corrupt) each other, so
+/// they are an error rather than a silent overlap.
+///
+/// # Errors
+///
+/// Returns an error if any mapping's local root cannot be resolved, or if two
+/// mappings resolve to the same canonical root.
+pub fn validate_unique_mappings(paths: &[SyncPath]) -> Result<()> {
+    let mut seen: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
+    for p in paths {
+        let canonical = SyncDirPath::new(&p.local)?.as_path_buf().clone();
+        if let Some(prev_remote) = seen.insert(canonical.clone(), p.remote.clone()) {
+            anyhow::bail!(
+                "Duplicate sync mapping: '{}' (remote '{}') and '{}' (remote '{}') both resolve \
+                 to the same local root '{}'. Each sync root must have exactly one mapping; \
+                 remove or merge the duplicate.",
+                p.remote,
+                canonical.display(),
+                prev_remote,
+                p.local.display(),
+                canonical.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Run a one-time sync.
 ///
 /// When `dry_run` is true the full sync pipeline (triage, upload/download/
@@ -452,12 +543,23 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
     )
     .await?;
 
+    // Validate that the stored state belongs to the current mapping before
+    // reusing it (conservatively binding fresh/legacy state).
+    let root = resolve_sync_dir(&path)?;
+    let identity = sync_identity_for(
+        &couchdb,
+        &root,
+        &config.couchdb.database,
+        &config.couchdb.remote_path,
+    )
+    .await?;
+    validate_sync_mapping(&local_db, &identity)?;
+
     // Run sync (dry-run walks the pipeline without writing)
     let retention = (config.sync.tombstone_retention_secs > 0)
         .then(|| std::time::Duration::from_secs(config.sync.tombstone_retention_secs));
-    let mut engine =
-        SyncEngine::with_ignore(couchdb, local_db, resolve_sync_dir(&path)?, ignore_matcher)
-            .with_tombstone_retention(retention);
+    let mut engine = SyncEngine::with_ignore(couchdb, local_db, root, ignore_matcher)
+        .with_tombstone_retention(retention);
     let report = if dry_run {
         engine.sync_dry_run().await?
     } else {
@@ -507,8 +609,18 @@ pub async fn rebuild_remote(path: PathBuf, config: AppConfig) -> Result<SyncRepo
     )
     .await?;
 
-    let mut engine =
-        SyncEngine::with_ignore(couchdb, local_db, resolve_sync_dir(&path)?, ignore_matcher);
+    // Rebuild is the explicit decision to reset state for the current mapping.
+    let root = resolve_sync_dir(&path)?;
+    let identity = sync_identity_for(
+        &couchdb,
+        &root,
+        &config.couchdb.database,
+        &config.couchdb.remote_path,
+    )
+    .await?;
+    bind_sync_mapping(&local_db, &identity)?;
+
+    let mut engine = SyncEngine::with_ignore(couchdb, local_db, root, ignore_matcher);
     let report = engine.rebuild_remote_from_local().await?;
     print_sync_report(&report, false);
 
@@ -538,8 +650,18 @@ pub async fn rebuild_local(path: PathBuf, config: AppConfig) -> Result<SyncRepor
     )
     .await?;
 
-    let mut engine =
-        SyncEngine::with_ignore(couchdb, local_db, resolve_sync_dir(&path)?, ignore_matcher);
+    // Rebuild is the explicit decision to reset state for the current mapping.
+    let root = resolve_sync_dir(&path)?;
+    let identity = sync_identity_for(
+        &couchdb,
+        &root,
+        &config.couchdb.database,
+        &config.couchdb.remote_path,
+    )
+    .await?;
+    bind_sync_mapping(&local_db, &identity)?;
+
+    let mut engine = SyncEngine::with_ignore(couchdb, local_db, root, ignore_matcher);
     let report = engine.rebuild_local_from_remote().await?;
     print_sync_report(&report, false);
 
@@ -871,6 +993,10 @@ pub async fn daemon(
     interval: u64,
     live: bool,
 ) -> Result<()> {
+    // Reject duplicate/conflicting mappings before any worker starts: two
+    // mappings that share a canonical root would double-sync the same state DB.
+    validate_unique_mappings(&paths)?;
+
     let path_list: Vec<_> = paths
         .iter()
         .map(|p| p.local.display().to_string())
@@ -988,12 +1114,23 @@ async fn daemon_sync(
     )
     .await?;
 
+    // Validate that the stored state belongs to the current mapping before
+    // reusing it (conservatively binding fresh/legacy state).
+    let root = resolve_sync_dir(path)?;
+    let identity = sync_identity_for(
+        &couchdb,
+        &root,
+        &config.couchdb.database,
+        &config.couchdb.remote_path,
+    )
+    .await?;
+    validate_sync_mapping(&local_db, &identity)?;
+
     // Run sync
     let retention = (config.sync.tombstone_retention_secs > 0)
         .then(|| std::time::Duration::from_secs(config.sync.tombstone_retention_secs));
-    let mut engine =
-        SyncEngine::with_ignore(couchdb, local_db, resolve_sync_dir(path)?, ignore_matcher)
-            .with_tombstone_retention(retention);
+    let mut engine = SyncEngine::with_ignore(couchdb, local_db, root, ignore_matcher)
+        .with_tombstone_retention(retention);
     let report = engine.sync().await?;
 
     print_sync_report(&report, false);
@@ -1464,6 +1601,14 @@ async fn build_live_sync_engine(
     .await?;
 
     let sync_dir = resolve_sync_dir(path)?;
+    let identity = sync_identity_for(
+        &couchdb,
+        &sync_dir,
+        &config.couchdb.database,
+        &config.couchdb.remote_path,
+    )
+    .await?;
+    validate_sync_mapping(&local_db, &identity)?;
 
     let engine = SyncEngine::with_ignore(couchdb, local_db, sync_dir, (*ignore_matcher).clone())
         .with_tombstone_retention(
@@ -1959,6 +2104,7 @@ pub fn conflicts(path: &Path, json: bool) -> Result<()> {
 ///
 /// Returns an error if the local state DB cannot be opened or a conflict
 /// cannot be resolved.
+#[allow(clippy::too_many_lines)] // large interactive resolution flow; per-conflict UI dominates
 pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
     let db_path = state_db_path(&path);
     let local_db = LocalDb::open(&db_path)?;
@@ -1981,7 +2127,17 @@ pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
     )
     .await?;
 
-    let mut engine = SyncEngine::new(couchdb, local_db, resolve_sync_dir(&path)?);
+    let root = resolve_sync_dir(&path)?;
+    let identity = sync_identity_for(
+        &couchdb,
+        &root,
+        &config.couchdb.database,
+        &config.couchdb.remote_path,
+    )
+    .await?;
+    validate_sync_mapping(&local_db, &identity)?;
+
+    let mut engine = SyncEngine::new(couchdb, local_db, root);
 
     println!("Found {} conflict(s) to resolve:\n", conflicts.len());
 
@@ -2263,6 +2419,7 @@ mod tests {
     use super::*;
     use crate::couchdb::db::CannedCouch;
     use crate::models::{DownloadCount, FileDoc, UploadCount};
+    use tempfile::TempDir;
 
     // ── resolve_sync_dir (CLI path resolution) ────────────────────────────
 
@@ -2291,6 +2448,54 @@ mod tests {
         let resolved = resolve_sync_dir(&dir).expect("valid directory should resolve");
         assert_eq!(resolved.as_path(), dir.canonicalize().unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── validate_unique_mappings (duplicate canonical-root rejection) ────
+
+    #[test]
+    fn distinct_roots_are_accepted() {
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let paths = vec![
+            SyncPath {
+                local: a,
+                remote: "notes/".into(),
+            },
+            SyncPath {
+                local: b,
+                remote: "photos/".into(),
+            },
+        ];
+        assert!(validate_unique_mappings(&paths).is_ok());
+    }
+
+    #[test]
+    fn canonical_root_alias_is_rejected_as_duplicate() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("base");
+        let sub = base.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        // Two spellings that canonicalize to the same root are a duplicate.
+        let direct = base.clone();
+        let via_sub = base.join("sub").join("..");
+        let paths = vec![
+            SyncPath {
+                local: direct,
+                remote: "notes/".into(),
+            },
+            SyncPath {
+                local: via_sub,
+                remote: "notes/".into(),
+            },
+        ];
+        let err = validate_unique_mappings(&paths).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Duplicate sync mapping"),
+            "expected duplicate-mapping error, got: {err:#}"
+        );
     }
 
     // ── truncate_str ──────────────────────────────────────────────────────
