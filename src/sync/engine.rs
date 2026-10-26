@@ -322,6 +322,7 @@ impl ApplyWorker {
         Ok((content_len, doc.rev))
     }
 
+    #[allow(clippy::too_many_lines)] // staged-download pipeline spans many sequential steps
     async fn download_remote_file(
         &self,
         remote_path: &str,
@@ -336,6 +337,18 @@ impl ApplyWorker {
             warn!("Document not found in CouchDB: {}", remote_path);
             return Ok(None);
         };
+
+        // A soft-deleted tombstone is not downloadable content: it must not be
+        // materialized locally nor counted as a completed download. The change
+        // stream surfaces deletions as `Deleted` changes (routed elsewhere), but
+        // guard here too so a deleted doc can never be installed as a file.
+        if doc.deleted {
+            if require_doc {
+                anyhow::bail!("Document deleted in CouchDB: {remote_path}");
+            }
+            warn!("Document deleted in CouchDB: {}", remote_path);
+            return Ok(None);
+        }
 
         let file_path = self.root_dir.join_contained(local_path)?;
         // Filesystem type transition: an incoming remote file arriving where a
@@ -368,7 +381,7 @@ impl ApplyWorker {
         }
 
         debug!("[DOWNLOAD] Downloading {} chunks...", doc.children.len());
-        let content = match self.couchdb.get_file_content(remote_path).await {
+        let content = match self.couchdb.get_file_content_for_doc(&doc).await {
             Ok(data) => {
                 debug!("[DOWNLOAD] Downloaded {} bytes from chunks", data.len());
                 data
@@ -4196,6 +4209,269 @@ mod tests {
             stored.hash, stored_hash,
             "FileState hash must equal the verified remote hash"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Story 6355: downloads validate content against one consistent snapshot.
+    // These run against the real chunk-reassembly path (via spawn_stateful_couch
+    // + CouchDb::for_test_at) so the shape/length validation in
+    // get_file_content_for_doc is exercised, not the canned-content shortcut.
+    // -----------------------------------------------------------------------
+
+    /// Build a `FileDoc` seeded for the stateful fake couch (single-segment id,
+    /// hashless so the download is not short-circuited by the hash check).
+    fn stateful_doc(id: &str, size: u64, children: Vec<&str>) -> FileDoc {
+        let mut doc = FileDoc::new(id.to_string(), String::new(), size);
+        doc.rev = Some("1-abc".to_string());
+        doc.path = id.to_string();
+        doc.children = children.into_iter().map(str::to_string).collect();
+        doc
+    }
+
+    /// Build a `Leaf` chunk seeded for the stateful fake couch.
+    fn stateful_chunk(id: &str, data: &[u8]) -> ChunkDoc {
+        ChunkDoc {
+            id: id.to_string(),
+            rev: Some("1-abc".to_string()),
+            data: data.to_vec(),
+            doc_type: DocType::Leaf,
+            created_at: TimestampMillis::new(1000),
+        }
+    }
+
+    #[tokio::test]
+    async fn download_rejects_declared_nonempty_file_with_no_chunks() {
+        // The probe: a doc declaring size 123 with no chunks/hash must fail,
+        // not be accepted as an empty file.
+        let mut seed = HashMap::new();
+        seed.insert(
+            "ghost.txt".to_string(),
+            serde_json::to_value(stateful_doc("ghost.txt", 123, vec![])).unwrap(),
+        );
+        let (base_db_url, server, shutdown) = spawn_stateful_couch(seed, false);
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let engine = SyncEngine::with_ignore(
+            CouchDb::for_test_at(&base_db_url, ""),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let result = engine
+            .download_remote_file("ghost.txt", "ghost.txt", true, true)
+            .await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("stateful couch server join");
+
+        let err = result
+            .expect_err("a declared-nonempty file with no chunks must fail the download")
+            .to_string();
+        assert!(
+            err.contains("no chunks"),
+            "error must identify the absent content: {err}"
+        );
+        assert!(
+            !root.as_path().join("ghost.txt").exists(),
+            "failed download must not write an empty local file"
+        );
+        assert!(
+            engine.get_file_state("ghost.txt").await.unwrap().is_none(),
+            "failed download must not save FileState"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_rejects_truncated_bytes() {
+        // Hashless legacy doc declaring 10 bytes whose chunks only carry 6.
+        let mut seed = HashMap::new();
+        seed.insert(
+            "trunc.txt".to_string(),
+            serde_json::to_value(stateful_doc("trunc.txt", 10, vec!["h:c1", "h:c2"])).unwrap(),
+        );
+        seed.insert(
+            "h:c1".to_string(),
+            serde_json::to_value(stateful_chunk("h:c1", b"abc")).unwrap(),
+        );
+        seed.insert(
+            "h:c2".to_string(),
+            serde_json::to_value(stateful_chunk("h:c2", b"def")).unwrap(),
+        );
+        let (base_db_url, server, shutdown) = spawn_stateful_couch(seed, false);
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let engine = SyncEngine::with_ignore(
+            CouchDb::for_test_at(&base_db_url, ""),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let result = engine
+            .download_remote_file("trunc.txt", "trunc.txt", true, true)
+            .await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("stateful couch server join");
+
+        let err = result
+            .expect_err("truncated bytes must fail the download via the size mismatch")
+            .to_string();
+        assert!(
+            err.contains("size mismatch") && err.contains("10") && err.contains('6'),
+            "error must name expected/downloaded sizes: {err}"
+        );
+        assert!(!root.as_path().join("trunc.txt").exists());
+        assert!(engine.get_file_state("trunc.txt").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn download_rejects_wrong_type_chunk_record() {
+        let mut seed = HashMap::new();
+        seed.insert(
+            "wt.txt".to_string(),
+            serde_json::to_value(stateful_doc("wt.txt", 3, vec!["h:c1"])).unwrap(),
+        );
+        let mut bad = stateful_chunk("h:c1", b"abc");
+        bad.doc_type = DocType::Plain;
+        seed.insert("h:c1".to_string(), serde_json::to_value(bad).unwrap());
+        let (base_db_url, server, shutdown) = spawn_stateful_couch(seed, false);
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let engine = SyncEngine::with_ignore(
+            CouchDb::for_test_at(&base_db_url, ""),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let result = engine
+            .download_remote_file("wt.txt", "wt.txt", true, true)
+            .await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("stateful couch server join");
+
+        let err = result
+            .expect_err("a wrong-type chunk record must fail the download")
+            .to_string();
+        assert!(
+            err.contains("non-leaf"),
+            "error must name the wrong chunk type: {err}"
+        );
+        assert!(!root.as_path().join("wt.txt").exists());
+        assert!(engine.get_file_state("wt.txt").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn download_rejects_duplicate_chunk_ids() {
+        let mut seed = HashMap::new();
+        seed.insert(
+            "dup.txt".to_string(),
+            serde_json::to_value(stateful_doc("dup.txt", 3, vec!["h:c1", "h:c1"])).unwrap(),
+        );
+        seed.insert(
+            "h:c1".to_string(),
+            serde_json::to_value(stateful_chunk("h:c1", b"abc")).unwrap(),
+        );
+        let (base_db_url, server, shutdown) = spawn_stateful_couch(seed, false);
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let engine = SyncEngine::with_ignore(
+            CouchDb::for_test_at(&base_db_url, ""),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let result = engine
+            .download_remote_file("dup.txt", "dup.txt", true, true)
+            .await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("stateful couch server join");
+
+        let err = result
+            .expect_err("a duplicate chunk id must fail the download")
+            .to_string();
+        assert!(
+            err.contains("Duplicate chunk"),
+            "error must name the duplicate chunk: {err}"
+        );
+        assert!(!root.as_path().join("dup.txt").exists());
+        assert!(engine.get_file_state("dup.txt").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn download_accepts_zero_length_valid_file() {
+        let mut seed = HashMap::new();
+        seed.insert(
+            "empty.txt".to_string(),
+            serde_json::to_value(stateful_doc("empty.txt", 0, vec![])).unwrap(),
+        );
+        let (base_db_url, server, shutdown) = spawn_stateful_couch(seed, false);
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let engine = SyncEngine::with_ignore(
+            CouchDb::for_test_at(&base_db_url, ""),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let bytes = engine
+            .download_remote_file("empty.txt", "empty.txt", true, true)
+            .await
+            .expect("zero-length download should succeed")
+            .expect("zero-length download should write a file");
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("stateful couch server join");
+
+        assert_eq!(bytes, 0, "zero-length download should write 0 bytes");
+        assert_eq!(
+            std::fs::read(root.as_path().join("empty.txt")).unwrap(),
+            b"",
+            "zero-length doc must produce an empty local file"
+        );
+        let stored = engine
+            .get_file_state("empty.txt")
+            .await
+            .unwrap()
+            .expect("zero-length download should save FileState");
+        assert_eq!(stored.size, 0);
+    }
+
+    #[tokio::test]
+    async fn download_does_not_count_deleted_doc() {
+        // A soft-deleted tombstone must not be materialized nor counted as a
+        // completed download.
+        let mut doc = stateful_doc("gone.txt", 0, vec![]);
+        doc.deleted = true;
+        let mut seed = HashMap::new();
+        seed.insert("gone.txt".to_string(), serde_json::to_value(doc).unwrap());
+        let (base_db_url, server, shutdown) = spawn_stateful_couch(seed, false);
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let engine = SyncEngine::with_ignore(
+            CouchDb::for_test_at(&base_db_url, ""),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let result = engine
+            .download_remote_file("gone.txt", "gone.txt", false, true)
+            .await
+            .expect("a deleted doc must not error");
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("stateful couch server join");
+
+        assert!(
+            result.is_none(),
+            "a deleted doc must not be counted as a completed download"
+        );
+        assert!(
+            !root.as_path().join("gone.txt").exists(),
+            "a deleted doc must not be materialized locally"
+        );
+        assert!(engine.get_file_state("gone.txt").await.unwrap().is_none());
     }
 
     /// A local create/modify change for a path that is a directory on disk is

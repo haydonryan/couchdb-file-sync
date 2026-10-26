@@ -1057,16 +1057,50 @@ impl CouchDb {
         Ok(Some(chunk))
     }
 
-    /// Get file content by fetching and combining all chunks
+    /// Get file content by fetching and combining all chunks.
+    ///
+    /// Fetches the file's metadata, then reassembles content from that
+    /// snapshot. Callers that already hold a metadata snapshot should prefer
+    /// [`Self::get_file_content_for_doc`] so the download is validated against
+    /// the exact revision/children/size they selected, avoiding a mixed-revision
+    /// download if metadata changes between two separate fetches.
     ///
     /// # Errors
     ///
-    /// Returns an error if the file document or any chunk cannot be fetched.
+    /// Returns an error if the file document or any chunk cannot be fetched, or
+    /// if the content does not match the declared shape/length.
     pub async fn get_file_content(&self, path: &str) -> Result<Vec<u8>> {
+        let Some(doc) = self.get_file(path).await? else {
+            anyhow::bail!("File not found: {path}");
+        };
+        self.get_file_content_for_doc(&doc).await
+    }
+
+    /// Reassemble and validate file content from an already-selected metadata
+    /// snapshot.
+    ///
+    /// This is the single consistent snapshot a download is validated against:
+    /// it uses the caller's `FileDoc` (child list, declared size) rather than
+    /// re-fetching metadata, so a concurrent metadata change cannot mix two
+    /// revisions' chunk lists into one download.
+    ///
+    /// Validation performed before returning:
+    /// - A nonempty file (declared `size > 0`) must carry at least one chunk;
+    ///   an empty child list is only valid for a genuinely zero-length file.
+    /// - Every listed chunk must exist and be a `Leaf` (chunk) document per the
+    ///   format contract; a wrong-type record is rejected, not concatenated.
+    /// - Duplicate chunk IDs are rejected (they would double-count bytes).
+    /// - The combined byte length must equal the declared `size` exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any chunk cannot be fetched or the assembled content
+    /// violates the declared shape/length.
+    pub async fn get_file_content_for_doc(&self, doc: &FileDoc) -> Result<Vec<u8>> {
         #[cfg(test)]
         if let Some(state) = &self.test_state {
-            if state.content_errors.contains(path) {
-                anyhow::bail!("simulated content fetch failure for {path}");
+            if state.content_errors.contains(&doc.id) {
+                anyhow::bail!("simulated content fetch failure for {}", doc.id);
             }
             if let Some(probe) = &state.probe {
                 probe.enter();
@@ -1075,30 +1109,69 @@ impl CouchDb {
                 }
                 probe.leave();
             }
-            return Ok(state.contents.get(path).cloned().unwrap_or_default());
+            return Ok(state.contents.get(&doc.id).cloned().unwrap_or_default());
         }
 
-        // First get the file document to find chunk IDs
-        let Some(doc) = self.get_file(path).await? else {
-            anyhow::bail!("File not found: {path}");
-        };
-
         if doc.children.is_empty() {
-            debug!("File {} has no chunks, returning empty content", path);
+            // A declared-nonempty file with no chunks was never published (or
+            // its content was lost). Returning empty bytes would record a
+            // corrupt download as a valid zero-length file, so fail instead.
+            if doc.size > 0 {
+                anyhow::bail!(
+                    "File {} declares size {} but has no chunks; refusing to return empty content",
+                    doc.id,
+                    doc.size
+                );
+            }
+            debug!("File {} has no chunks, returning empty content", doc.id);
             return Ok(Vec::new());
         }
 
-        // Fetch each chunk and combine the data
+        // Fetch each chunk and combine the data.
         let mut content = Vec::with_capacity(usize::try_from(doc.size).unwrap_or(0));
+        let mut seen = HashSet::with_capacity(doc.children.len());
         for chunk_id in &doc.children {
+            // A duplicate chunk ID would double-count bytes and break the
+            // length invariant; reject it rather than assembling a corrupt file.
+            if !seen.insert(chunk_id) {
+                anyhow::bail!(
+                    "Duplicate chunk {chunk_id} listed for file {}; refusing to return corrupt content",
+                    doc.id
+                );
+            }
             let Some(chunk) = self.get_chunk(chunk_id).await? else {
                 // A missing chunk is a partial/corrupt download: fail it rather
                 // than silently truncating the file and recording it as synced.
                 anyhow::bail!(
-                    "Chunk {chunk_id} not found for file {path}; refusing to return partial content"
+                    "Chunk {chunk_id} not found for file {}; refusing to return partial content",
+                    doc.id
                 );
             };
+            // The format contract reserves `Leaf` for chunk records. A
+            // wrong-type record (e.g. a nested file doc) is not content and must
+            // be rejected rather than concatenated as bytes.
+            if chunk.doc_type != crate::models::DocType::Leaf {
+                anyhow::bail!(
+                    "Chunk {chunk_id} for file {} has non-leaf type {:?}; refusing to return content",
+                    doc.id,
+                    chunk.doc_type
+                );
+            }
             content.extend_from_slice(&chunk.data);
+        }
+
+        // The combined bytes must match the declared size exactly. A mismatch
+        // means the child list or a chunk changed underneath us (mixed
+        // revision) or the metadata was inconsistent; fail rather than record
+        // a corrupt download.
+        let len = u64::try_from(content.len()).unwrap_or(u64::MAX);
+        if len != doc.size {
+            anyhow::bail!(
+                "Content size mismatch for {}: expected {} bytes, downloaded {}; refusing partial/corrupt content",
+                doc.id,
+                doc.size,
+                len
+            );
         }
 
         Ok(content)
@@ -3379,6 +3452,285 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Story 6355: validate content against one consistent metadata snapshot
+    // -----------------------------------------------------------------------
+
+    /// Spawn a fake `CouchDB` serving an explicit set of file documents (raw
+    /// JSON bodies) and chunk documents, letting tests exercise the
+    /// content-validation logic against arbitrary shapes: declared-nonempty
+    /// files with no chunks, size mismatches, duplicate or wrong-type chunk
+    /// records, zero-length files, and supplied-snapshot reuse. Returns the
+    /// base database URL, the server thread handle, and a shutdown flag.
+    #[allow(clippy::type_complexity)]
+    fn spawn_fake_content_couch(
+        file_docs: std::collections::HashMap<String, String>,
+        chunks: std::collections::HashMap<String, ChunkDoc>,
+    ) -> (
+        String,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake content couch");
+        let addr = listener.local_addr().expect("fake content couch addr");
+        let base_db_url = format!("http://{addr}");
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_thread = shutdown.clone();
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("fake content couch runtime");
+            runtime.block_on(async move {
+                listener
+                    .set_nonblocking(true)
+                    .expect("set fake content couch nonblocking");
+                let listener =
+                    tokio::net::TcpListener::from_std(listener).expect("fake content couch listener");
+                loop {
+                    if shutdown_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    match tokio::time::timeout(Duration::from_millis(10), listener.accept()).await {
+                        Ok(Ok((stream, _))) => {
+                            let file_docs = file_docs.clone();
+                            let chunks = chunks.clone();
+                            let service = hyper::service::service_fn(move |req| {
+                                let file_docs = file_docs.clone();
+                                let chunks = chunks.clone();
+                                async move {
+                                    handle_fake_content_req(req, &file_docs, &chunks).await
+                                }
+                            });
+                            tokio::spawn(async move {
+                                let io = hyper_util::rt::TokioIo::new(stream);
+                                let _ = hyper::server::conn::http1::Builder::new()
+                                    .serve_connection(io, service)
+                                    .await;
+                            });
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_elapsed) => {}
+                    }
+                }
+            });
+        });
+        (base_db_url, handle, shutdown)
+    }
+
+    /// Serve a `GET` for the matching file document JSON or chunk document from
+    /// the supplied maps, `404` for anything unknown.
+    #[allow(clippy::unused_async)]
+    async fn handle_fake_content_req(
+        req: hyper::Request<hyper::body::Incoming>,
+        file_docs: &std::collections::HashMap<String, String>,
+        chunks: &std::collections::HashMap<String, ChunkDoc>,
+    ) -> Result<hyper::Response<http_body_util::Full<hyper::body::Bytes>>, hyper::Error> {
+        let (parts, _body) = req.into_parts();
+        let mut response =
+            hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::new()));
+        if parts.method == hyper::Method::GET {
+            let path = parts.uri.path();
+            if let Some((_, chunk)) = chunks.iter().find(|(id, _)| path.ends_with(id.as_str())) {
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(
+                    serde_json::to_string(chunk).expect("serialize chunk"),
+                ));
+            } else if let Some((_, body)) =
+                file_docs.iter().find(|(id, _)| path.ends_with(id.as_str()))
+            {
+                *response.body_mut() =
+                    http_body_util::Full::new(hyper::body::Bytes::from(body.as_bytes().to_vec()));
+            } else {
+                *response.status_mut() = hyper::StatusCode::NOT_FOUND;
+            }
+        } else {
+            *response.status_mut() = hyper::StatusCode::NOT_FOUND;
+        }
+        Ok(response)
+    }
+
+    fn leaf_chunk(id: &str, data: &[u8]) -> ChunkDoc {
+        ChunkDoc {
+            id: id.to_string(),
+            rev: Some("1-abc".to_string()),
+            data: data.to_vec(),
+            doc_type: crate::models::DocType::Leaf,
+            created_at: TimestampMillis::new(1000),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_file_content_rejects_declared_nonempty_file_with_no_chunks() {
+        let file_id = "ghost.md";
+        let file_json = format!(
+            r#"{{"_id":"{file_id}","_rev":"1-abc","children":[],"path":"{file_id}","type":"plain","size":123,"hash":""}}"#
+        );
+        let (base_db_url, server, shutdown) = spawn_fake_content_couch(
+            std::collections::HashMap::from([(file_id.to_string(), file_json)]),
+            std::collections::HashMap::new(),
+        );
+        let db = couchdb_at_full(&base_db_url, "");
+
+        let result = db.get_file_content(file_id).await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake content couch server join");
+
+        let err = result
+            .expect_err("a declared-nonempty file with no chunks must error, not return empty")
+            .to_string();
+        assert!(
+            err.contains("no chunks") && err.contains(file_id),
+            "error must identify the missing content: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_file_content_rejects_truncated_bytes_via_size_mismatch() {
+        let file_id = "trunc.md";
+        // Declares 10 bytes (hashless legacy) but its two chunks only carry 6.
+        let file_json = format!(
+            r#"{{"_id":"{file_id}","_rev":"1-abc","children":["h:c1","h:c2"],"path":"{file_id}","type":"plain","size":10,"hash":""}}"#
+        );
+        let chunks = std::collections::HashMap::from([
+            ("h:c1".to_string(), leaf_chunk("h:c1", b"abc")),
+            ("h:c2".to_string(), leaf_chunk("h:c2", b"def")),
+        ]);
+        let (base_db_url, server, shutdown) = spawn_fake_content_couch(
+            std::collections::HashMap::from([(file_id.to_string(), file_json)]),
+            chunks,
+        );
+        let db = couchdb_at_full(&base_db_url, "");
+
+        let result = db.get_file_content(file_id).await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake content couch server join");
+
+        let err = result
+            .expect_err("truncated bytes must error via the size mismatch, not be accepted")
+            .to_string();
+        assert!(
+            err.contains("size mismatch") && err.contains("10") && err.contains('6'),
+            "error must name expected/downloaded sizes: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_file_content_rejects_duplicate_chunk_ids() {
+        let file_id = "dup.md";
+        let file_json = format!(
+            r#"{{"_id":"{file_id}","_rev":"1-abc","children":["h:c1","h:c1"],"path":"{file_id}","type":"plain","size":3,"hash":""}}"#
+        );
+        let chunks =
+            std::collections::HashMap::from([("h:c1".to_string(), leaf_chunk("h:c1", b"abc"))]);
+        let (base_db_url, server, shutdown) = spawn_fake_content_couch(
+            std::collections::HashMap::from([(file_id.to_string(), file_json)]),
+            chunks,
+        );
+        let db = couchdb_at_full(&base_db_url, "");
+
+        let result = db.get_file_content(file_id).await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake content couch server join");
+
+        let err = result
+            .expect_err("a duplicate chunk id must be rejected, not double-counted")
+            .to_string();
+        assert!(
+            err.contains("Duplicate chunk") && err.contains("h:c1"),
+            "error must name the duplicate chunk: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_file_content_rejects_wrong_type_chunk_record() {
+        let file_id = "wrongtype.md";
+        let file_json = format!(
+            r#"{{"_id":"{file_id}","_rev":"1-abc","children":["h:c1"],"path":"{file_id}","type":"plain","size":3,"hash":""}}"#
+        );
+        // A chunk record whose doc_type is not Leaf violates the format contract.
+        let mut bad = leaf_chunk("h:c1", b"abc");
+        bad.doc_type = crate::models::DocType::Plain;
+        let chunks = std::collections::HashMap::from([("h:c1".to_string(), bad)]);
+        let (base_db_url, server, shutdown) = spawn_fake_content_couch(
+            std::collections::HashMap::from([(file_id.to_string(), file_json)]),
+            chunks,
+        );
+        let db = couchdb_at_full(&base_db_url, "");
+
+        let result = db.get_file_content(file_id).await;
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake content couch server join");
+
+        let err = result
+            .expect_err("a wrong-type chunk record must be rejected, not concatenated")
+            .to_string();
+        assert!(
+            err.contains("non-leaf"),
+            "error must name the wrong type: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_file_content_accepts_zero_length_file() {
+        let file_id = "empty.md";
+        let file_json = format!(
+            r#"{{"_id":"{file_id}","_rev":"1-abc","children":[],"path":"{file_id}","type":"plain","size":0,"hash":""}}"#
+        );
+        let (base_db_url, server, shutdown) = spawn_fake_content_couch(
+            std::collections::HashMap::from([(file_id.to_string(), file_json)]),
+            std::collections::HashMap::new(),
+        );
+        let db = couchdb_at_full(&base_db_url, "");
+
+        let content = db
+            .get_file_content(file_id)
+            .await
+            .expect("a genuine zero-length file must download as empty");
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake content couch server join");
+
+        assert!(
+            content.is_empty(),
+            "zero-length file must yield empty content"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_file_content_for_doc_uses_supplied_snapshot_not_store_metadata() {
+        let file_id = "notes/snap.md";
+        // The store's own file doc points at only c1 (size 3)...
+        let store_file_json = format!(
+            r#"{{"_id":"{file_id}","_rev":"1-abc","children":["h:c1"],"path":"{file_id}","type":"plain","size":3,"hash":""}}"#
+        );
+        // ...but the caller selects a newer snapshot that also includes c2 (size 6).
+        let selected = FileDoc::new(file_id.to_string(), String::new(), 6);
+        let mut selected = selected;
+        selected.path = file_id.to_string();
+        selected.children = vec!["h:c1".to_string(), "h:c2".to_string()];
+        let chunks = std::collections::HashMap::from([
+            ("h:c1".to_string(), leaf_chunk("h:c1", b"abc")),
+            ("h:c2".to_string(), leaf_chunk("h:c2", b"def")),
+        ]);
+        let (base_db_url, server, shutdown) = spawn_fake_content_couch(
+            std::collections::HashMap::from([(file_id.to_string(), store_file_json)]),
+            chunks,
+        );
+        let db = couchdb_at_full(&base_db_url, "");
+
+        let content = db
+            .get_file_content_for_doc(&selected)
+            .await
+            .expect("content must be assembled from the supplied snapshot");
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake content couch server join");
+
+        assert_eq!(
+            content,
+            b"abcdef".to_vec(),
+            "the supplied snapshot's children (c1+c2) must be used, not the store's (c1 only)"
+        );
+    }
+
     /// Spawn an in-process fake `CouchDB` that stores uploaded chunks in
     /// memory and serves them back, so a byte buffer can round-trip through
     /// `upload_file_content` → `get_file_content`.
@@ -3462,21 +3814,24 @@ mod tests {
                 ));
             }
             (hyper::Method::GET, id) if !id.is_empty() => {
-                let (chunk, children) = {
+                let (chunk, children, size) = {
                     let store = store.lock();
                     (
                         store.get(id).cloned(),
                         store.keys().cloned().collect::<Vec<_>>(),
+                        store.values().map(|c| c.data.len() as u64).sum::<u64>(),
                     )
                 };
                 let body = chunk.map_or_else(
                     || {
                         // Any unknown GET is the file doc: point its children
-                        // at every stored chunk id so content is reassembled.
+                        // at every stored chunk id so content is reassembled,
+                        // and declare the exact combined size so the download's
+                        // length validation passes.
                         let children_json =
                             serde_json::to_string(&children).expect("children json");
                         format!(
-                            r#"{{"_id":"{id}","_rev":"1-abc","children":{children_json},"path":"{id}","type":"plain","size":0}}"#
+                            r#"{{"_id":"{id}","_rev":"1-abc","children":{children_json},"path":"{id}","type":"plain","size":{size}}}"#
                         )
                     },
                     |chunk| serde_json::to_string(&chunk).expect("serialize chunk"),
