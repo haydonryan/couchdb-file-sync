@@ -1,6 +1,8 @@
 use crate::models::Conflict;
+use crate::notify::{ConflictNotifier, HttpSender, ReqwestSender};
 use anyhow::Result;
-use reqwest::Client;
+use std::pin::Pin;
+use std::sync::Arc;
 use tracing::{debug, warn};
 
 /// Matrix bot notifier
@@ -9,11 +11,11 @@ pub struct MatrixNotifier {
     access_token: String,
     room_id: String,
     message_type: String,
-    client: Client,
+    sender: Arc<dyn HttpSender>,
 }
 
 impl MatrixNotifier {
-    /// Create a new Matrix notifier
+    /// Create a new Matrix notifier backed by a timed real HTTP transport.
     #[must_use]
     pub fn new(
         homeserver_url: String,
@@ -21,12 +23,31 @@ impl MatrixNotifier {
         room_id: String,
         message_type: String,
     ) -> Self {
+        Self::with_sender(
+            homeserver_url,
+            access_token,
+            room_id,
+            message_type,
+            Arc::new(ReqwestSender::new()),
+        )
+    }
+
+    /// Create a notifier backed by an explicit HTTP transport (tests inject a
+    /// fake sender).
+    #[must_use]
+    pub fn with_sender(
+        homeserver_url: String,
+        access_token: String,
+        room_id: String,
+        message_type: String,
+        sender: Arc<dyn HttpSender>,
+    ) -> Self {
         Self {
             homeserver_url,
             access_token,
             room_id,
             message_type,
-            client: Client::new(),
+            sender,
         }
     }
 
@@ -98,17 +119,13 @@ impl MatrixNotifier {
             "formatted_body": text,
         });
 
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.access_token))
-            .json(&body)
-            .send()
-            .await?;
+        let headers = [("Authorization", format!("Bearer {}", self.access_token))];
+        let header_refs: Vec<(&str, &str)> =
+            headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let response = self.sender.post_json(&url, &header_refs, &body).await?;
 
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            anyhow::bail!("Matrix API error: {error_text}");
+        if !(200..300).contains(&response.status) {
+            anyhow::bail!("Matrix API error: {}", response.body);
         }
 
         Ok(())
@@ -126,19 +143,26 @@ impl MatrixNotifier {
             self.room_id
         );
 
-        match self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.access_token))
-            .send()
-            .await
-        {
-            Ok(response) => Ok(response.status().is_success()),
+        let headers = [("Authorization", format!("Bearer {}", self.access_token))];
+        let header_refs: Vec<(&str, &str)> =
+            headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        match self.sender.get(&url, &header_refs).await {
+            Ok(response) => Ok((200..300).contains(&response.status)),
             Err(e) => {
                 warn!("Matrix connection test failed: {}", e);
                 Ok(false)
             }
         }
+    }
+}
+
+impl ConflictNotifier for MatrixNotifier {
+    fn notify_new_conflicts<'a>(
+        &'a self,
+        conflicts: &'a [&'a Conflict],
+        sync_dir: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move { Self::notify_new_conflicts(self, conflicts, sync_dir).await })
     }
 }
 
