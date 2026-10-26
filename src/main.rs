@@ -109,9 +109,9 @@ struct DaemonCommand {
     #[argy(positional)]
     path: Option<PathBuf>,
 
-    /// poll interval in seconds
-    #[argy(option, short = 'i', default = "60")]
-    interval: u64,
+    /// poll interval in seconds (defaults to `sync.poll_interval` in the config)
+    #[argy(option, short = 'i')]
+    interval: Option<u64>,
 
     /// use live sync (filesystem watcher + `CouchDB` changes feed)
     #[argy(switch)]
@@ -347,12 +347,38 @@ async fn run_rebuild_local(path: Option<PathBuf>, config: &AppConfig) -> Result<
 
 async fn run_daemon(
     path: Option<PathBuf>,
-    interval: u64,
+    interval: Option<u64>,
     live: bool,
     config: AppConfig,
 ) -> Result<()> {
+    // Resolve the effective polling interval once: an explicit CLI value wins,
+    // otherwise fall back to the configured sync.poll_interval.
+    let interval = resolve_daemon_interval(interval, &config);
+    // Reject a zero/invalid polling interval before any worker or timer starts
+    // in polling mode; `tokio::time::interval` panics on a zero duration, so
+    // fail closed here instead. Live mode does not use the polling interval.
+    if !live {
+        validate_daemon_interval(interval)?;
+    }
     let paths = resolve_paths_or_bail(path, &config)?;
     cli::daemon(paths, config, interval, live).await
+}
+
+/// Resolve the effective daemon polling interval. An explicit CLI value takes
+/// precedence; otherwise the configured `sync.poll_interval` is used.
+fn resolve_daemon_interval(cli_interval: Option<u64>, config: &AppConfig) -> u64 {
+    cli_interval.unwrap_or(config.sync.poll_interval)
+}
+
+/// Reject a non-positive polling interval before the daemon starts workers.
+fn validate_daemon_interval(interval: u64) -> Result<()> {
+    if interval == 0 {
+        anyhow::bail!(
+            "daemon poll interval must be greater than 0 (got {interval}); \
+             set sync.poll_interval in the config or pass --interval"
+        );
+    }
+    Ok(())
 }
 
 fn run_conflicts(path: Option<PathBuf>, json: bool, config: &AppConfig) -> Result<()> {
@@ -437,9 +463,15 @@ fn resolve_paths(cli_path: Option<PathBuf>, config: &AppConfig) -> Vec<SyncPath>
         None => {
             // No CLI path - use paths from config
             if config.paths.is_empty() {
-                // Fallback to current directory with config's remote_path
+                // Fall back to the configured sync.root_dir when present; when
+                // no root is configured, fall back to the current directory.
+                let local = config
+                    .sync
+                    .root_dir
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("."));
                 vec![SyncPath {
-                    local: PathBuf::from("."),
+                    local,
                     remote: config.couchdb.remote_path.clone(),
                 }]
             } else {
@@ -525,11 +557,11 @@ fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daem
 mod tests {
     use super::{Cli, Commands, init_logging};
     use super::{
-        apply_cli_overrides, default_user_config_file_if_exists, paths_match, resolve_paths,
-        resolved_config_path,
+        apply_cli_overrides, default_user_config_file_if_exists, paths_match,
+        resolve_daemon_interval, resolve_paths, resolved_config_path, validate_daemon_interval,
     };
     use argy::FromArgs;
-    use couchdb_file_sync::config::{AppConfig, SyncPath};
+    use couchdb_file_sync::config::{AppConfig, SyncConfig, SyncPath};
     use std::path::PathBuf;
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -613,6 +645,39 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].local, PathBuf::from("."));
         assert_eq!(resolved[0].remote, "");
+    }
+
+    #[test]
+    fn resolve_paths_empty_config_no_cli_path_uses_root_dir() {
+        let config = AppConfig {
+            sync: SyncConfig {
+                root_dir: Some(PathBuf::from("/srv/notes")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let resolved = resolve_paths(None, &config);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].local, PathBuf::from("/srv/notes"));
+        assert_eq!(resolved[0].remote, "");
+    }
+
+    #[test]
+    fn resolve_paths_configured_paths_beat_root_dir_when_no_cli_path() {
+        let config = AppConfig {
+            paths: vec![SyncPath {
+                local: PathBuf::from("/home/user/docs"),
+                remote: "docs/".to_string(),
+            }],
+            sync: SyncConfig {
+                root_dir: Some(PathBuf::from("/srv/notes")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let resolved = resolve_paths(None, &config);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].local, PathBuf::from("/home/user/docs"));
     }
 
     #[test]
@@ -928,13 +993,13 @@ mod tests {
     fn cli_parses_daemon_no_args() {
         let cli = Cli::from_args(&["couchdb-file-sync"], &["daemon"]).unwrap();
         assert!(matches!(cli.command, Commands::Daemon(ref cmd)
-            if cmd.path.is_none() && cmd.interval == 60 && !cmd.live));
+            if cmd.path.is_none() && cmd.interval.is_none() && !cmd.live));
     }
 
     #[test]
     fn cli_parses_daemon_with_interval() {
         let cli = Cli::from_args(&["couchdb-file-sync"], &["daemon", "--interval", "30"]).unwrap();
-        assert!(matches!(cli.command, Commands::Daemon(ref cmd) if cmd.interval == 30));
+        assert!(matches!(cli.command, Commands::Daemon(ref cmd) if cmd.interval == Some(30)));
     }
 
     #[test]
@@ -951,13 +1016,59 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(cli.command, Commands::Daemon(ref cmd)
-            if cmd.path == Some(PathBuf::from("/my/path")) && cmd.interval == 120 && cmd.live));
+            if cmd.path == Some(PathBuf::from("/my/path"))
+                && cmd.interval == Some(120)
+                && cmd.live));
     }
 
     #[test]
     fn cli_parses_daemon_with_short_interval() {
         let cli = Cli::from_args(&["couchdb-file-sync"], &["daemon", "-i", "15"]).unwrap();
-        assert!(matches!(cli.command, Commands::Daemon(ref cmd) if cmd.interval == 15));
+        assert!(matches!(cli.command, Commands::Daemon(ref cmd) if cmd.interval == Some(15)));
+    }
+
+    // --- Daemon interval resolution ---
+
+    #[test]
+    fn resolve_daemon_interval_uses_config_when_cli_absent() {
+        let config = AppConfig {
+            sync: SyncConfig {
+                poll_interval: 120,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(resolve_daemon_interval(None, &config), 120);
+    }
+
+    #[test]
+    fn resolve_daemon_interval_cli_wins() {
+        let config = AppConfig {
+            sync: SyncConfig {
+                poll_interval: 120,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(resolve_daemon_interval(Some(30), &config), 30);
+    }
+
+    #[test]
+    fn resolve_daemon_interval_defaults_when_neither_set() {
+        let config = AppConfig::default();
+        // `sync.poll_interval` defaults to 60 seconds.
+        assert_eq!(resolve_daemon_interval(None, &config), 60);
+    }
+
+    #[test]
+    fn validate_daemon_interval_rejects_zero() {
+        assert!(validate_daemon_interval(0).is_err());
+    }
+
+    #[test]
+    fn validate_daemon_interval_accepts_positive() {
+        assert!(validate_daemon_interval(1).is_ok());
+        assert!(validate_daemon_interval(60).is_ok());
     }
 
     // --- Conflicts subcommand ---

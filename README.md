@@ -176,6 +176,10 @@ paths:
     remote: "notes/"
 
 sync:
+  # Optional default sync root used when no CLI PATH and no `paths` entries
+  # are given. Omitted here, so a bare command falls back to the current
+  # directory.
+  # root_dir: "/absolute/or/relative/path"
   poll_interval: 60
   debounce_ms: 500
   # Live mode: how often (seconds) a bounded reconciliation rescan retries
@@ -288,6 +292,15 @@ Run continuous sync daemon.
 ```bash
 couchdb-file-sync daemon ~/documents --interval 60
 ```
+
+`--interval` (or `-i`) is optional. When omitted, the daemon polls at the
+configured `sync.poll_interval` (default `60` seconds); an explicit
+`--interval` always takes precedence. A zero interval is rejected before the
+daemon starts, as are invalid poll intervals.
+
+When `PATH` is omitted, the daemon (and the other commands) sync every
+configured `paths` entry. If no `paths` are configured and no `PATH` is given,
+the command syncs `sync.root_dir` when set, otherwise the current directory.
 
 For live mode (watcher + changes feed):
 
