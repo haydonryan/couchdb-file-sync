@@ -218,7 +218,11 @@ mod tests {
         let joined = root
             .join_contained("a/b/file.txt")
             .expect("legitimate nested path should be accepted");
-        assert_eq!(joined, dir.path().join("a/b/file.txt"));
+        // Compare against the canonicalized root (SyncDirPath canonicalizes on
+        // construction). On macOS the temp dir lives under /var which is a
+        // symlink to /private/var, so the raw dir.path() differs from the
+        // canonicalized root and would spuriously fail.
+        assert_eq!(joined, root.as_path().join("a/b/file.txt"));
         assert!(joined.starts_with(root.as_path()));
     }
 
