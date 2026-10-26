@@ -1866,6 +1866,26 @@ async fn handle_local_change(
     touched: &TouchTracker,
     change: &Change,
 ) -> Result<()> {
+    // A directory-scoped watcher event (a rename/move-in/move-out of a
+    // populated directory) carries only the top-level directory path, never
+    // its children. It cannot be applied as a single file — an upload would
+    // try to read the directory and fail, and a directory delete is not a
+    // tracked file. Route it into the bounded full reconciliation rescan,
+    // which expands the event into tracked subtree reconciliation (removing
+    // old remote child paths, uploading new ones) and safely orders filesystem
+    // type transitions.
+    if engine.is_directory_scoped(change).await? {
+        if let Some(r) = reconcile {
+            r.mark_full_rescan();
+        }
+        info!(
+            "Directory-scoped local change ({}); routing to subtree reconciliation: {}",
+            change.change_type(),
+            change.path()
+        );
+        return Ok(());
+    }
+
     // Only hash paths the tool may have just written; ordinary user edits of
     // arbitrary files skip the (potentially expensive) content check.
     let current_hash = if touched.contains(change.path()) {
