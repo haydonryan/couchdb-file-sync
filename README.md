@@ -166,8 +166,9 @@ export COUCHDB_FILE_SYNC__SYNC__POLL_INTERVAL="60"
 ```yaml
 couchdb:
   url: "http://localhost:5984"
-  username: "admin"
-  password: "${COUCHDB_PASSWORD}"
+  auth:
+    username: "admin"
+    password: "${COUCHDB_PASSWORD}"
   database: "couchdb_file_sync_files"
 
 paths:
@@ -182,10 +183,10 @@ sync:
   tombstone_retention_secs: 604800
 
 notifications:
-  enabled: true
   telegram:
-    bot_token: "${TELEGRAM_BOT_TOKEN}"
-    chat_id: "${TELEGRAM_CHAT_ID}"
+    credentials:
+      bot_token: "${TELEGRAM_BOT_TOKEN}"
+      chat_id: "${TELEGRAM_CHAT_ID}"
   notify_on_conflict: true
   notify_on_sync_error: true
 
@@ -193,7 +194,7 @@ logging:
   level: "info"      # error, warn, info, debug, trace
   format: "pretty"   # pretty, json, compact
   file: "~/.local/state/couchdb-file-sync/couchdb-file-sync.log"  # Optional file output (used by sync/daemon)
-  rotated_logs: "delete"  # delete, keep (daemon rotates every 24 hours)
+  rotation: daily-delete  # never, daily-keep, daily-delete
 ```
 
 ## CLI Commands

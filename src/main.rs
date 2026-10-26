@@ -180,7 +180,7 @@ async fn run() -> Result<()> {
         }
     }
 
-    let config = load_config(&cli);
+    let config = load_config(&cli)?;
 
     let enable_file_logging = matches!(
         &cli.command,
@@ -198,22 +198,18 @@ async fn run() -> Result<()> {
     dispatch_command(cli.command, config).await
 }
 
-fn load_config(cli: &Cli) -> AppConfig {
-    // Load configuration
-    let mut config = match AppConfig::load(cli.config.clone()) {
-        Ok(c) => c,
-        Err(e) => {
-            if cli.verbose > 0 {
-                info!("Could not load config file: {}", e);
-            }
-            AppConfig::default()
-        }
-    };
+/// Load configuration, failing closed when an explicit or found default config
+/// file is missing, unreadable, or malformed.
+fn load_config(cli: &Cli) -> Result<AppConfig> {
+    // Load configuration. `AppConfig::load` returns defaults (no error) when no
+    // explicit path is given and no default config file exists, so an absent
+    // optional default config still permits documented defaults.
+    let mut config = AppConfig::load(cli.config.clone())?;
 
     // Override config with CLI arguments
     apply_cli_overrides(&mut config, cli);
 
-    config
+    Ok(config)
 }
 
 fn apply_cli_overrides(config: &mut AppConfig, cli: &Cli) {
