@@ -77,6 +77,18 @@ pub struct ChunkCollectionResult {
 /// the response to complete and decode before the client gives up.
 const LONGPOLL_TRANSPORT_HEADROOM_MS: u64 = 1000;
 
+/// Maximum number of raw content bytes stored in a single chunk document.
+///
+/// `CouchDB` enforces a per-document transport limit (the default
+/// `max_document_size` is 8 MiB), rejecting any single document whose *encoded*
+/// JSON exceeds it with `413 document_too_large` — a 9 MiB upload fails even
+/// though the file-size limit is far larger. Chunk `data` is base64-encoded on
+/// the wire (4 bytes per 3 raw bytes, ~33% expansion), so a raw bound of 2 MiB
+/// encodes to roughly 2.8 MiB of JSON — comfortably inside the 8 MiB document
+/// limit with headroom for the surrounding `_id`/`type`/`created_at` fields.
+/// Files larger than this are split into multiple ordered chunks.
+const MAX_CHUNK_DATA_BYTES: usize = 2 * 1024 * 1024;
+
 /// Which `_changes` feed to request.
 ///
 /// `Normal` is nonblocking: `CouchDB` returns immediately with the current
@@ -106,6 +118,9 @@ pub struct CouchDb {
     /// Maximum total attempts (including the initial one) for a `CouchDB`
     /// operation before giving up on transient connectivity failures.
     retry_attempts: u32,
+    /// How to interpret legacy chunk `data` strings that carry no explicit
+    /// codec (see [`LegacyChunkData`]).
+    legacy_chunk_data: crate::models::LegacyChunkData,
     /// Test-only canned responses used to exercise the sync pipeline without a
     /// live `CouchDB` server. Only present in test builds.
     #[cfg(test)]
@@ -286,6 +301,7 @@ impl CouchDb {
             remote_path: RemotePath::new(remote_path.to_string()),
             timeout_seconds,
             retry_attempts,
+            legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             #[cfg(test)]
             test_state: None,
             #[cfg(test)]
@@ -293,6 +309,15 @@ impl CouchDb {
             #[cfg(test)]
             test_backoff: Duration::from_millis(1),
         })
+    }
+
+    /// Set how to interpret legacy chunk `data` strings that carry no explicit
+    /// codec (see [`LegacyChunkData`]). Defaults to the v0.5 `base64` migration
+    /// mode.
+    #[must_use]
+    pub const fn with_legacy_chunk_data(mut self, legacy: crate::models::LegacyChunkData) -> Self {
+        self.legacy_chunk_data = legacy;
+        self
     }
 
     async fn get_update_seq(&self) -> Result<String> {
@@ -362,6 +387,7 @@ impl CouchDb {
             remote_path: RemotePath::new(remote_path.to_string()),
             timeout_seconds: 30,
             retry_attempts: 3,
+            legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             #[cfg(test)]
             test_state: None,
             #[cfg(test)]
@@ -407,6 +433,7 @@ impl CouchDb {
             remote_path: RemotePath::new(remote_path.to_string()),
             timeout_seconds: 30,
             retry_attempts: 3,
+            legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             test_state: None,
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),
             test_backoff: Duration::from_millis(1),
@@ -1157,7 +1184,7 @@ impl CouchDb {
                     chunk.doc_type
                 );
             }
-            content.extend_from_slice(&chunk.data);
+            content.extend_from_slice(&chunk.content_bytes(self.legacy_chunk_data)?);
         }
 
         // The combined bytes must match the declared size exactly. A mismatch
@@ -1220,7 +1247,21 @@ impl CouchDb {
         Ok(())
     }
 
-    /// Upload file content as chunks and return the chunk IDs
+    /// Upload file content as ordered bounded chunks and return the chunk IDs.
+    ///
+    /// The content is split into chunks of at most [`MAX_CHUNK_DATA_BYTES`]
+    /// raw bytes each, saved in order, and the returned chunk IDs are ordered
+    /// so that `get_file_content` (which concatenates `children` in order)
+    /// reconstructs the original bytes byte-for-byte. An empty file yields no
+    /// chunks (an empty `children` list), which `get_file_content` maps to
+    /// empty content.
+    ///
+    /// If a chunk save fails partway through (an interrupted upload), the error
+    /// is propagated and no partial chunk set is returned: the caller only ever
+    /// records a file's `children` on success, so an interrupted upload never
+    /// leaves a file referencing missing chunks. Chunks written before the
+    /// failure carry no referencing metadata document and are reclaimed by
+    /// orphan chunk collection after the publication grace window.
     ///
     /// # Errors
     ///
@@ -1233,18 +1274,23 @@ impl CouchDb {
             return Ok(Vec::new());
         }
 
-        let chunk_id = Self::generate_chunk_id();
-        let chunk = ChunkDoc {
-            id: chunk_id.clone(),
-            rev: None,
-            data: content,
-            doc_type: crate::models::DocType::Leaf,
-            created_at: crate::models::TimestampMillis::now(),
-        };
+        // An empty file is represented by an empty `children` list rather than
+        // an empty chunk, keeping `get_file_content`'s empty-children mapping
+        // authoritative.
+        if content.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        self.save_chunk(&chunk).await?;
+        let mut chunk_ids = Vec::new();
+        for chunk_data in content.chunks(MAX_CHUNK_DATA_BYTES) {
+            let chunk_id = Self::generate_chunk_id();
+            let chunk = ChunkDoc::new_encoded(chunk_id.clone(), chunk_data.to_vec());
 
-        Ok(vec![chunk_id])
+            self.save_chunk(&chunk).await?;
+            chunk_ids.push(chunk_id);
+        }
+
+        Ok(chunk_ids)
     }
 
     /// Delete old chunks that are no longer referenced
@@ -1528,6 +1574,7 @@ mod tests {
             remote_path: RemotePath::new(remote_path.to_string()),
             timeout_seconds: 30,
             retry_attempts: 3,
+            legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             test_state: None,
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),
             test_backoff: Duration::from_millis(1),
@@ -1863,6 +1910,7 @@ mod tests {
             remote_path: RemotePath::new(String::new()),
             timeout_seconds: 30,
             retry_attempts: 3,
+            legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             test_state: None,
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),
             test_backoff: Duration::from_millis(1),
@@ -2038,6 +2086,7 @@ mod tests {
             remote_path: RemotePath::new(remote_path.to_string()),
             timeout_seconds: 30,
             retry_attempts: 3,
+            legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             test_state: None,
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),
             test_backoff: Duration::from_millis(1),
@@ -2063,6 +2112,7 @@ mod tests {
             remote_path: RemotePath::new(remote_path.to_string()),
             timeout_seconds,
             retry_attempts: 3,
+            legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             test_state: None,
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),
             test_backoff: Duration::from_millis(1),
@@ -3196,6 +3246,7 @@ mod tests {
             remote_path: RemotePath::new(String::new()),
             timeout_seconds: 30,
             retry_attempts: 3,
+            legacy_chunk_data: crate::models::LegacyChunkData::Base64,
             test_state: None,
             test_write_calls: std::sync::atomic::AtomicUsize::new(0),
             test_backoff: Duration::from_millis(1),
@@ -3550,13 +3601,9 @@ mod tests {
     }
 
     fn leaf_chunk(id: &str, data: &[u8]) -> ChunkDoc {
-        ChunkDoc {
-            id: id.to_string(),
-            rev: Some("1-abc".to_string()),
-            data: data.to_vec(),
-            doc_type: crate::models::DocType::Leaf,
-            created_at: TimestampMillis::new(1000),
-        }
+        let mut chunk = ChunkDoc::new_encoded(id.to_string(), data.to_vec());
+        chunk.rev = Some("1-abc".to_string());
+        chunk
     }
 
     #[tokio::test]
@@ -3731,6 +3778,16 @@ mod tests {
         );
     }
 
+    /// In-memory fake `CouchDB` chunk store that also remembers the insertion
+    /// order of chunk ids, so a synthesized file document's `children` list
+    /// reconstructs content in the exact order the chunks were uploaded — the
+    /// same ordering guarantee the sync engine records in a real file doc.
+    #[derive(Default)]
+    struct ChunkStore {
+        map: std::collections::HashMap<String, ChunkDoc>,
+        order: Vec<String>,
+    }
+
     /// Spawn an in-process fake `CouchDB` that stores uploaded chunks in
     /// memory and serves them back, so a byte buffer can round-trip through
     /// `upload_file_content` → `get_file_content`.
@@ -3744,8 +3801,8 @@ mod tests {
         let base_db_url = format!("http://{addr}/test_db");
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shutdown_thread = shutdown.clone();
-        let store: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, ChunkDoc>>> =
-            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let store: std::sync::Arc<parking_lot::Mutex<ChunkStore>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(ChunkStore::default()));
         let handle = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -3786,12 +3843,12 @@ mod tests {
 
     /// Serve `PUT` chunk storage and `GET` chunk/file-doc retrieval from the
     /// in-memory store. Any unknown `GET` is treated as a file document whose
-    /// `children` point at every stored chunk id, so downloaded content is
-    /// reassembled from the uploaded chunks.
+    /// `children` point at the stored chunk ids in insertion (upload) order, so
+    /// downloaded content is reassembled from the uploaded chunks.
     #[allow(clippy::unused_async)]
     async fn handle_fake_chunk_store_req(
         req: hyper::Request<hyper::body::Incoming>,
-        store: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, ChunkDoc>>>,
+        store: std::sync::Arc<parking_lot::Mutex<ChunkStore>>,
     ) -> Result<hyper::Response<http_body_util::Full<hyper::body::Bytes>>, hyper::Error> {
         let (parts, body) = req.into_parts();
         let mut response =
@@ -3808,7 +3865,11 @@ mod tests {
                 use http_body_util::BodyExt;
                 let bytes = body.collect().await.expect("collect chunk body").to_bytes();
                 let chunk: ChunkDoc = serde_json::from_slice(&bytes).expect("parse stored chunk");
-                store.lock().insert(id.to_string(), chunk);
+                {
+                    let mut store = store.lock();
+                    store.map.insert(id.to_string(), chunk);
+                    store.order.push(id.to_string());
+                }
                 *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(
                     r#"{"ok":true,"rev":"1-abc"}"#,
                 ));
@@ -3816,18 +3877,23 @@ mod tests {
             (hyper::Method::GET, id) if !id.is_empty() => {
                 let (chunk, children, size) = {
                     let store = store.lock();
-                    (
-                        store.get(id).cloned(),
-                        store.keys().cloned().collect::<Vec<_>>(),
-                        store.values().map(|c| c.data.len() as u64).sum::<u64>(),
-                    )
+                    let size = store
+                        .map
+                        .values()
+                        .map(|c| {
+                            c.content_bytes(crate::models::LegacyChunkData::Base64)
+                                .map_or(0, |bytes| bytes.len() as u64)
+                        })
+                        .sum::<u64>();
+                    (store.map.get(id).cloned(), store.order.clone(), size)
                 };
                 let body = chunk.map_or_else(
                     || {
                         // Any unknown GET is the file doc: point its children
-                        // at every stored chunk id so content is reassembled,
-                        // and declare the exact combined size so the download's
-                        // length validation passes.
+                        // at every stored chunk id in upload order so content
+                        // is reassembled in order, and declare the exact
+                        // combined size so the download's length validation
+                        // passes.
                         let children_json =
                             serde_json::to_string(&children).expect("children json");
                         format!(
@@ -3879,6 +3945,277 @@ mod tests {
             round_tripped, original,
             "non-UTF-8 bytes must round-trip byte-identical through upload+download"
         );
+    }
+
+    /// A file larger than a single chunk is split into ordered chunks and
+    /// reconstructs byte-for-byte with a matching hash (story 6357: a 9 MiB
+    /// upload previously failed `413 document_too_large` as one oversized
+    /// chunk).
+    #[tokio::test]
+    async fn multi_chunk_content_round_trips_byte_identical() {
+        let (base_db_url, server, shutdown) = spawn_fake_chunk_store_couch();
+        let db = couchdb_at_full(&base_db_url, "");
+
+        // Deliberately above the single-chunk bound so it must split, and
+        // non-UTF-8 so the split/reassembly must stay binary-safe.
+        let original: Vec<u8> = (0..(MAX_CHUNK_DATA_BYTES + 1000))
+            .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
+            .collect();
+        assert!(
+            original.len() > MAX_CHUNK_DATA_BYTES,
+            "test content must exceed one chunk"
+        );
+
+        let chunk_ids = db
+            .upload_file_content(original.clone())
+            .await
+            .expect("upload multi-chunk content");
+        assert!(
+            chunk_ids.len() >= 2,
+            "content above the bound must split into multiple chunks, got {}",
+            chunk_ids.len()
+        );
+        assert_eq!(
+            chunk_ids.len(),
+            original.len().div_ceil(MAX_CHUNK_DATA_BYTES),
+            "chunk count must match the bounded split"
+        );
+
+        let round_tripped = db
+            .get_file_content("notes/big.bin")
+            .await
+            .expect("download multi-chunk content");
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake couch server join");
+
+        assert_eq!(
+            round_tripped, original,
+            "multi-chunk file must reconstruct byte-for-byte"
+        );
+        assert_eq!(
+            crate::local::scanner::compute_bytes_hash(&round_tripped),
+            crate::local::scanner::compute_bytes_hash(&original),
+            "reconstructed bytes must hash identically"
+        );
+    }
+
+    /// Chunk splitting happens exactly at the configured bound: a file exactly
+    /// one chunk in size stays one chunk, one byte over becomes two, and a
+    /// file of exactly two chunks stays two (no empty tail chunk).
+    #[tokio::test]
+    async fn chunk_splitting_respects_exact_boundary() {
+        let expected = |len: usize| len.div_ceil(MAX_CHUNK_DATA_BYTES);
+
+        for (len, want) in [
+            (0usize, 0usize),
+            (1, 1),
+            (MAX_CHUNK_DATA_BYTES, 1),
+            (MAX_CHUNK_DATA_BYTES + 1, 2),
+            (2 * MAX_CHUNK_DATA_BYTES, 2),
+        ] {
+            let (base_db_url, server, shutdown) = spawn_fake_chunk_store_couch();
+            let db = couchdb_at_full(&base_db_url, "");
+            let chunk_ids = db
+                .upload_file_content(vec![0xAB; len])
+                .await
+                .expect("upload content");
+            shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+            server.join().expect("fake couch server join");
+
+            assert_eq!(
+                chunk_ids.len(),
+                want,
+                "len {len} should split into {want} chunk(s), expected {want} == {}",
+                expected(len)
+            );
+        }
+    }
+
+    /// An empty file uploads as no chunks at all, so `get_file_content` (which
+    /// maps an empty `children` list to empty content) returns the empty file.
+    #[tokio::test]
+    async fn empty_content_uploads_no_chunks_and_round_trips_empty() {
+        let (base_db_url, server, shutdown) = spawn_fake_chunk_store_couch();
+        let db = couchdb_at_full(&base_db_url, "");
+
+        let chunk_ids = db
+            .upload_file_content(Vec::new())
+            .await
+            .expect("upload empty content");
+        assert!(
+            chunk_ids.is_empty(),
+            "empty content must not create any chunk"
+        );
+
+        let round_tripped = db
+            .get_file_content("notes/empty.txt")
+            .await
+            .expect("download empty content");
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake couch server join");
+
+        assert!(
+            round_tripped.is_empty(),
+            "empty file must round-trip as empty"
+        );
+    }
+
+    /// An interrupted multi-chunk upload (a chunk save failing partway through)
+    /// must propagate the error and never return a partial chunk set as if the
+    /// upload succeeded. The already-saved leading chunks are left in place for
+    /// orphan chunk collection, not referenced by any metadata document.
+    #[tokio::test]
+    async fn interrupted_multi_chunk_upload_propagates_error() {
+        let (base_db_url, store, server, shutdown) = spawn_fake_failing_chunk_store_couch(1);
+        let db = couchdb_at_full(&base_db_url, "");
+
+        // Two chunks worth of content; the second chunk PUT fails.
+        let content = vec![0xCDu8; 2 * MAX_CHUNK_DATA_BYTES];
+        let result = db.upload_file_content(content).await;
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("fake couch server join");
+
+        assert!(
+            result.is_err(),
+            "interrupted upload must return an error, not a partial chunk set"
+        );
+        let err = format!("{}", result.expect_err("upload must fail"));
+        assert!(
+            err.contains("Failed to save chunk"),
+            "error must surface the failing chunk save, got: {err}"
+        );
+        // Exactly the first chunk made it before the failure.
+        assert_eq!(
+            store.lock().map.len(),
+            1,
+            "only the leading chunk is written before the interrupted upload"
+        );
+    }
+
+    /// Spawn an in-process fake `CouchDB` like [`spawn_fake_chunk_store_couch`],
+    /// but fail the chunk PUT once more than `fail_after_puts` chunk documents
+    /// have been accepted. Returns the base URL, the chunk store, the server
+    /// thread handle, and a shutdown flag.
+    fn spawn_fake_failing_chunk_store_couch(
+        fail_after_puts: usize,
+    ) -> (
+        String,
+        std::sync::Arc<parking_lot::Mutex<ChunkStore>>,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind failing store couch");
+        let addr = listener.local_addr().expect("failing store couch addr");
+        let base_db_url = format!("http://{addr}/test_db");
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_thread = shutdown.clone();
+        let store: std::sync::Arc<parking_lot::Mutex<ChunkStore>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(ChunkStore::default()));
+        let store_for_thread = store.clone();
+        let remaining_puts =
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(fail_after_puts));
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failing store couch runtime");
+            runtime.block_on(async move {
+                listener
+                    .set_nonblocking(true)
+                    .expect("set failing store couch nonblocking");
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .expect("failing store couch listener");
+                loop {
+                    if shutdown_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    match tokio::time::timeout(Duration::from_millis(10), listener.accept()).await {
+                        Ok(Ok((stream, _))) => {
+                            let store = store_for_thread.clone();
+                            let remaining = remaining_puts.clone();
+                            let service = hyper::service::service_fn(move |req| {
+                                let store = store.clone();
+                                let remaining = remaining.clone();
+                                async move {
+                                    handle_fake_failing_chunk_store_req(req, store, remaining).await
+                                }
+                            });
+                            tokio::spawn(async move {
+                                let io = hyper_util::rt::TokioIo::new(stream);
+                                let _ = hyper::server::conn::http1::Builder::new()
+                                    .serve_connection(io, service)
+                                    .await;
+                            });
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_elapsed) => {}
+                    }
+                }
+            });
+        });
+        (base_db_url, store, handle, shutdown)
+    }
+
+    /// Serve `PUT` chunk storage from [`spawn_fake_failing_chunk_store_couch`]:
+    /// accept (store) up to the configured number of chunk PUTs, then fail
+    /// subsequent ones with `500`. GETs return stored chunks so leading chunks
+    /// written before the failure remain observable.
+    #[allow(clippy::unused_async)]
+    async fn handle_fake_failing_chunk_store_req(
+        req: hyper::Request<hyper::body::Incoming>,
+        store: std::sync::Arc<parking_lot::Mutex<ChunkStore>>,
+        remaining_puts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Result<hyper::Response<http_body_util::Full<hyper::body::Bytes>>, hyper::Error> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (parts, body) = req.into_parts();
+        let mut response =
+            hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::new()));
+        let last_segment = parts
+            .uri
+            .path()
+            .split('/')
+            .next_back()
+            .unwrap_or("")
+            .to_string();
+        match (parts.method.clone(), last_segment.as_str()) {
+            (hyper::Method::PUT, id) if !id.is_empty() => {
+                use http_body_util::BodyExt;
+                // Always drain the request body first so the connection stays in
+                // a reusable HTTP/1.1 state regardless of the response path.
+                let bytes = body.collect().await.expect("collect chunk body").to_bytes();
+                if remaining_puts
+                    .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                    .is_err()
+                {
+                    *response.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
+                    *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(
+                        r#"{"error":"internal_server_error","reason":"injected chunk save failure"}"#,
+                    ));
+                    return Ok(response);
+                }
+                let chunk: ChunkDoc = serde_json::from_slice(&bytes).expect("parse stored chunk");
+                store.lock().map.insert(id.to_string(), chunk);
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(
+                    r#"{"ok":true,"rev":"1-abc"}"#,
+                ));
+            }
+            (hyper::Method::GET, id) if !id.is_empty() => {
+                let chunk = store.lock().map.get(id).cloned();
+                let body = chunk.map_or_else(
+                    || r#"{"_id":"none","_rev":"1-abc","children":[],"path":"none","type":"plain","size":0}"#.to_string(),
+                    |chunk| serde_json::to_string(&chunk).expect("serialize chunk"),
+                );
+                *response.body_mut() = http_body_util::Full::new(hyper::body::Bytes::from(body));
+            }
+            _ => {
+                *response.status_mut() = hyper::StatusCode::NOT_FOUND;
+            }
+        }
+        Ok(response)
     }
 
     // -----------------------------------------------------------------------
