@@ -59,6 +59,12 @@ pub enum Change {
     RemoteDeleted {
         path: String,
         mtime: Option<DateTime<Utc>>,
+        /// The `CouchDB` revision of the deletion (soft-delete tombstone or the
+        /// hard-delete row's winning rev), when available. Carrying the
+        /// monotonic server-assigned revision lets delete ordering be judged
+        /// independently of cross-host wall-clock skew, and is absent only for
+        /// legacy/external tombstones or hard deletes without a parseable rev.
+        rev: Option<String>,
     },
 }
 
@@ -133,10 +139,10 @@ impl Change {
     pub fn rev(&self) -> Option<&str> {
         match self {
             Self::RemoteCreated { rev, .. } | Self::RemoteModified { rev, .. } => Some(rev),
-            Self::LocalCreated { .. }
-            | Self::LocalModified { .. }
-            | Self::LocalDeleted { .. }
-            | Self::RemoteDeleted { .. } => None,
+            Self::RemoteDeleted { rev, .. } => rev.as_deref(),
+            Self::LocalCreated { .. } | Self::LocalModified { .. } | Self::LocalDeleted { .. } => {
+                None
+            }
         }
     }
 
@@ -190,8 +196,12 @@ impl Change {
     }
 
     #[must_use]
-    pub const fn remote_deleted(path: String, mtime: Option<DateTime<Utc>>) -> Self {
-        Self::RemoteDeleted { path, mtime }
+    pub const fn remote_deleted(
+        path: String,
+        mtime: Option<DateTime<Utc>>,
+        rev: Option<String>,
+    ) -> Self {
+        Self::RemoteDeleted { path, mtime, rev }
     }
 }
 
@@ -337,7 +347,7 @@ mod tests {
 
     #[test]
     fn test_change_remote_deleted() {
-        let c = Change::remote_deleted("/remote/path.txt".into(), None);
+        let c = Change::remote_deleted("/remote/path.txt".into(), None, None);
         assert_eq!(c.path(), "/remote/path.txt");
         assert_eq!(c.change_type(), ChangeType::Deleted);
         assert_eq!(c.source(), ChangeSource::Remote);
@@ -358,7 +368,7 @@ mod tests {
     fn test_change_batch_push_and_len() {
         let mut batch = ChangeBatch::new();
         batch.push(Change::local_created("a.txt".into(), "h1".into(), 100));
-        batch.push(Change::remote_deleted("b.txt".into(), None));
+        batch.push(Change::remote_deleted("b.txt".into(), None, None));
         assert!(!batch.is_empty());
         assert_eq!(batch.len(), 2);
     }
@@ -367,7 +377,7 @@ mod tests {
     fn test_change_batch_local_changes_filter() {
         let mut batch = ChangeBatch::new();
         batch.push(Change::local_created("a.txt".into(), "h1".into(), 100));
-        batch.push(Change::remote_deleted("b.txt".into(), None));
+        batch.push(Change::remote_deleted("b.txt".into(), None, None));
         batch.push(Change::local_deleted("c.txt".into()));
         let locals = batch.local_changes();
         assert_eq!(locals.len(), 2);
@@ -378,7 +388,7 @@ mod tests {
     fn test_change_batch_remote_changes_filter() {
         let mut batch = ChangeBatch::new();
         batch.push(Change::local_created("a.txt".into(), "h1".into(), 100));
-        batch.push(Change::remote_deleted("b.txt".into(), None));
+        batch.push(Change::remote_deleted("b.txt".into(), None, None));
         batch.push(Change::remote_created(
             "c.txt".into(),
             "h2".into(),

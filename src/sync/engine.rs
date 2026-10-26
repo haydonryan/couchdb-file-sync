@@ -969,14 +969,20 @@ impl SyncEngine {
         let mut conflicts: Vec<Conflict> = Vec::new();
 
         // ── Handle needs_comparison pairs (requires I/O) ──────────────────
-        self.resolve_needs_comparison(&triage_result.needs_comparison, dry_run, &mut conflicts)
-            .await?;
+        self.resolve_needs_comparison(
+            &triage_result.needs_comparison,
+            &stored_states,
+            dry_run,
+            &mut conflicts,
+        )
+        .await?;
 
         // ── Handle remote deletes ─────────────────────────────────────────
         self.handle_remote_deletes(
             &triage_result.remote_deletes,
             &stored_states,
             &mut remote_to_apply,
+            &mut conflicts,
         )?;
 
         // ── Debug skipped items ───────────────────────────────────────────
@@ -1126,108 +1132,143 @@ impl SyncEngine {
     async fn resolve_needs_comparison(
         &self,
         decisions: &[triage::TriageDecision],
+        stored_states: &HashMap<String, FileState>,
         dry_run: bool,
         conflicts: &mut Vec<Conflict>,
     ) -> Result<()> {
         for decision in decisions {
-            let Some(lc) = &decision.local_change else {
+            // An edit/delete race (local-delete vs remote-edit, or
+            // remote-delete vs local-edit/untracked) is inherently a conflict:
+            // there is no shared content to compare. Record it directly.
+            let local_is_delete = matches!(
+                decision.local_change.as_ref().map(Change::change_type),
+                Some(ChangeType::Deleted)
+            );
+            if matches!(
+                decision.remote_change.as_ref().map(Change::change_type),
+                Some(ChangeType::Deleted)
+            ) || local_is_delete
+            {
+                self.record_edit_delete_conflict(
+                    decision,
+                    local_is_delete,
+                    stored_states,
+                    conflicts,
+                )
+                .await?;
                 continue;
-            };
-            let Some(_rc) = &decision.remote_change else {
-                continue;
-            };
+            }
 
-            let remote_path = self.couchdb.get_remote_path(lc.path());
-            debug!("  => Remote is newer, fetching content to compare...");
+            self.resolve_content_comparison(decision, dry_run, conflicts)
+                .await?;
+        }
 
-            // Fetch remote metadata
-            let Some(remote_doc) = self.couchdb.fetch_metadata(&remote_path).await? else {
-                debug!("  Remote document not found!");
-                continue;
-            };
+        Ok(())
+    }
 
-            // Get local state for comparison
-            let local_state = self.get_local_state(lc.path()).await?;
-            debug!("  LOCAL STATE (from disk):");
-            debug!(
-                "    hash: {}...",
+    /// Compare the actual content of a both-edited change pair to decide
+    /// between a silent state update (identical content) and a conflict.
+    async fn resolve_content_comparison(
+        &self,
+        decision: &triage::TriageDecision,
+        dry_run: bool,
+        conflicts: &mut Vec<Conflict>,
+    ) -> Result<()> {
+        let Some(lc) = &decision.local_change else {
+            return Ok(());
+        };
+        let Some(_rc) = &decision.remote_change else {
+            return Ok(());
+        };
+
+        let remote_path = self.couchdb.get_remote_path(lc.path());
+        debug!("  => Remote is newer, fetching content to compare...");
+
+        // Fetch remote metadata
+        let Some(remote_doc) = self.couchdb.fetch_metadata(&remote_path).await? else {
+            debug!("  Remote document not found!");
+            return Ok(());
+        };
+
+        // Get local state for comparison
+        let local_state = self.get_local_state(lc.path()).await?;
+        debug!("  LOCAL STATE (from disk):");
+        debug!(
+            "    hash: {}...",
+            &local_state.hash[..8.min(local_state.hash.len())]
+        );
+        debug!("    size: {} bytes", local_state.size);
+        debug!("    modified_at: {:?}", local_state.modified_at);
+
+        // Download remote content and compute hash for comparison
+        let remote_content = self.couchdb.get_file_content(&remote_path).await?;
+        let remote_hash = compute_bytes_hash(&remote_content);
+
+        debug!("  COMPARING CONTENT:");
+        debug!(
+            "    local hash:  {}",
+            &local_state.hash[..8.min(local_state.hash.len())]
+        );
+        debug!(
+            "    remote hash: {}",
+            &remote_hash[..8.min(remote_hash.len())]
+        );
+        debug!("    local size:  {} bytes", local_state.size);
+        debug!("    remote size: {} bytes", remote_content.len());
+
+        // Compare hashes to determine if content actually differs
+        if local_state.hash == remote_hash {
+            info!(
+                "  [OK] {} - content identical (hash: {}), updating sync state",
+                lc.path(),
                 &local_state.hash[..8.min(local_state.hash.len())]
             );
-            debug!("    size: {} bytes", local_state.size);
-            debug!("    modified_at: {:?}", local_state.modified_at);
-
-            // Download remote content and compute hash for comparison
-            let remote_content = self.couchdb.get_file_content(&remote_path).await?;
-            let remote_hash = compute_bytes_hash(&remote_content);
-
-            debug!("  COMPARING CONTENT:");
-            debug!(
-                "    local hash:  {}",
-                &local_state.hash[..8.min(local_state.hash.len())]
-            );
-            debug!(
-                "    remote hash: {}",
+            // Update local state to reflect remote rev (skipped in dry-run)
+            if !dry_run {
+                let updated_state = FileState {
+                    path: lc.path().to_string(),
+                    hash: local_state.hash,
+                    size: local_state.size,
+                    modified_at: local_state.modified_at,
+                    couch_rev: remote_doc.rev.as_deref().and_then(CouchRev::new),
+                    last_sync_at: Utc::now(),
+                };
+                self.local_db.save_file_state(&updated_state).await?;
+            }
+        } else {
+            info!(
+                "  [CONFLICT] {} - content differs (local: {}, remote: {})",
+                lc.path(),
+                &local_state.hash[..8.min(local_state.hash.len())],
                 &remote_hash[..8.min(remote_hash.len())]
             );
-            debug!("    local size:  {} bytes", local_state.size);
-            debug!("    remote size: {} bytes", remote_content.len());
 
-            // Compare hashes to determine if content actually differs
-            if local_state.hash == remote_hash {
-                info!(
-                    "  [OK] {} - content identical (hash: {}), updating sync state",
-                    lc.path(),
-                    &local_state.hash[..8.min(local_state.hash.len())]
-                );
-                // Update local state to reflect remote rev (skipped in dry-run)
-                if !dry_run {
-                    let updated_state = FileState {
-                        path: lc.path().to_string(),
-                        hash: local_state.hash,
-                        size: local_state.size,
-                        modified_at: local_state.modified_at,
-                        couch_rev: remote_doc.rev.as_deref().and_then(CouchRev::new),
-                        last_sync_at: Utc::now(),
-                    };
-                    self.local_db.save_file_state(&updated_state).await?;
-                }
-            } else {
-                info!(
-                    "  [CONFLICT] {} - content differs (local: {}, remote: {})",
-                    lc.path(),
-                    &local_state.hash[..8.min(local_state.hash.len())],
-                    &remote_hash[..8.min(remote_hash.len())]
-                );
+            // Convert mtime (milliseconds since epoch) to DateTime
+            let remote_modified_at = Utc
+                .timestamp_millis_opt(i64::try_from(remote_doc.mtime.as_u64()).unwrap_or(i64::MAX))
+                .single()
+                .unwrap_or_else(Utc::now);
 
-                // Convert mtime (milliseconds since epoch) to DateTime
-                let remote_modified_at = Utc
-                    .timestamp_millis_opt(
-                        i64::try_from(remote_doc.mtime.as_u64()).unwrap_or(i64::MAX),
-                    )
-                    .single()
-                    .unwrap_or_else(Utc::now);
+            let remote_state = RemoteState {
+                hash: remote_hash,
+                size: remote_content.len() as u64,
+                modified_at: remote_modified_at,
+                couch_rev: CouchRev::new(
+                    remote_doc.rev.as_deref().unwrap_or(CouchRev::DEFAULT_REV),
+                )
+                .unwrap_or_default(),
+                deleted: remote_doc.deleted,
+            };
+            debug!("  REMOTE STATE:");
+            debug!("    size: {} bytes", remote_state.size);
+            debug!("    modified_at: {:?}", remote_state.modified_at);
+            debug!("    couch_rev: {:?}", remote_state.couch_rev);
 
-                let remote_state = RemoteState {
-                    hash: remote_hash,
-                    size: remote_content.len() as u64,
-                    modified_at: remote_modified_at,
-                    couch_rev: CouchRev::new(
-                        remote_doc.rev.as_deref().unwrap_or(CouchRev::DEFAULT_REV),
-                    )
-                    .unwrap_or_default(),
-                    deleted: remote_doc.deleted,
-                };
-                debug!("  REMOTE STATE:");
-                debug!("    size: {} bytes", remote_state.size);
-                debug!("    modified_at: {:?}", remote_state.modified_at);
-                debug!("    couch_rev: {:?}", remote_state.couch_rev);
-
-                conflicts.push(Conflict::new(
-                    lc.path().to_string(),
-                    local_state,
-                    remote_state,
-                ));
-            }
+            conflicts.push(Conflict::new(
+                lc.path().to_string(),
+                local_state,
+                remote_state,
+            ));
         }
 
         Ok(())
@@ -1238,6 +1279,7 @@ impl SyncEngine {
         remote_deletes: &[Change],
         stored_states: &HashMap<String, FileState>,
         remote_to_apply: &mut Vec<Change>,
+        conflicts: &mut Vec<Conflict>,
     ) -> Result<()> {
         for rc in remote_deletes {
             let local_path = self.couchdb.get_local_path(rc.path());
@@ -1248,16 +1290,139 @@ impl SyncEngine {
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .map(Into::into);
-            if triage::should_apply_remote_delete(stored_state, rc.mtime().copied(), local_mtime) {
-                debug!("  Remote delete is newer than last sync, scheduling local delete");
-                remote_to_apply.push(rc.clone());
-            } else if file_path.exists() || stored_state.is_some() {
-                debug!("  Remote delete is stale or file is untracked locally, skipping");
-            } else {
-                debug!("  Remote deleted, no local file/state, skipping");
+            // Protect same-mtime/preserved-mtime content edits: when the on-disk
+            // mtime matches the stored sync-time mtime, still compare content so
+            // an edit that kept the mtime is not mistaken for "unchanged".
+            let local_content_matches = match (stored_state, file_path.exists()) {
+                (Some(state), true) => compute_file_hash(&file_path)? == state.hash,
+                _ => true,
+            };
+            match triage::arbitrate_remote_delete(
+                stored_state,
+                rc.rev(),
+                rc.mtime().copied(),
+                local_mtime,
+                local_content_matches,
+            ) {
+                triage::RemoteDeleteVerdict::Apply => {
+                    debug!("  Remote delete is newer than last sync, scheduling local delete");
+                    remote_to_apply.push(rc.clone());
+                }
+                triage::RemoteDeleteVerdict::Conflict => {
+                    // A remote delete racing a local edit (including a
+                    // same-mtime content edit the pure triage pass could not
+                    // see): record a conflict so the local edit is preserved.
+                    debug!("  Remote delete races a local edit, recording conflict");
+                    let current_hash = if file_path.exists() {
+                        compute_file_hash(&file_path)?
+                    } else {
+                        String::new()
+                    };
+                    let local_state = FileState {
+                        path: local_path.clone(),
+                        hash: current_hash,
+                        size: file_path.metadata().map_or(0, |m| m.len()),
+                        modified_at: local_mtime.unwrap_or_else(Utc::now),
+                        couch_rev: stored_state.and_then(|s| s.couch_rev.clone()),
+                        last_sync_at: stored_state.map_or_else(Utc::now, |s| s.last_sync_at),
+                    };
+                    let remote_state = RemoteState {
+                        hash: String::new(),
+                        size: 0,
+                        modified_at: rc.mtime().copied().unwrap_or_else(Utc::now),
+                        couch_rev: rc.rev().and_then(CouchRev::new).unwrap_or_default(),
+                        deleted: true,
+                    };
+                    conflicts.push(Conflict::new(local_path.clone(), local_state, remote_state));
+                }
+                triage::RemoteDeleteVerdict::Skip => {
+                    if file_path.exists() || stored_state.is_some() {
+                        debug!("  Remote delete is stale or file is untracked locally, skipping");
+                    } else {
+                        debug!("  Remote deleted, no local file/state, skipping");
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    /// Record a conflict for an edit/delete race (local-delete vs remote-edit,
+    /// or remote-delete vs local-edit/untracked). There is no shared content to
+    /// compare, so the conflict is recorded directly.
+    async fn record_edit_delete_conflict(
+        &self,
+        decision: &triage::TriageDecision,
+        local_is_delete: bool,
+        stored_states: &HashMap<String, FileState>,
+        conflicts: &mut Vec<Conflict>,
+    ) -> Result<()> {
+        let remote_path = self.couchdb.get_remote_path(&decision.path);
+        let remote_state = if let Some(doc) = self.couchdb.fetch_metadata(&remote_path).await? {
+            // Remote state from the tombstone/edit document.
+            let remote_hash = if doc.hash.is_empty() {
+                let content = self.couchdb.get_file_content(&remote_path).await?;
+                compute_bytes_hash(&content)
+            } else {
+                doc.hash.clone()
+            };
+            RemoteState {
+                hash: remote_hash,
+                size: doc.size,
+                modified_at: doc.modified_at(),
+                couch_rev: doc
+                    .rev
+                    .as_deref()
+                    .and_then(CouchRev::new)
+                    .unwrap_or_default(),
+                deleted: doc.deleted,
+            }
+        } else {
+            // Remote doc gone (e.g. a hard delete with no tombstone body):
+            // fall back to the incoming change's metadata.
+            let rc = decision.remote_change.as_ref().unwrap();
+            RemoteState {
+                hash: String::new(),
+                size: 0,
+                modified_at: rc.mtime().copied().unwrap_or_else(Utc::now),
+                couch_rev: rc.rev().and_then(CouchRev::new).unwrap_or_default(),
+                deleted: true,
+            }
+        };
+        if let Some(local_state) = self
+            .local_state_for_decision(&decision.path, local_is_delete, stored_states)
+            .await?
+        {
+            conflicts.push(Conflict::new(
+                decision.path.clone(),
+                local_state,
+                remote_state,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Build the local `FileState` recorded in an edit/delete conflict.
+    ///
+    /// * Local-delete side: the local file is gone, so use the last stored
+    ///   state (the pre-delete baseline). Returns `None` when there is no
+    ///   tracked base to arbitrate against (the delete is then propagated).
+    /// * Remote-delete side: the local file is edited or untracked and still on
+    ///   disk, so prefer the current on-disk state, falling back to the stored
+    ///   state if the on-disk read fails.
+    async fn local_state_for_decision(
+        &self,
+        path: &str,
+        local_is_delete: bool,
+        stored_states: &HashMap<String, FileState>,
+    ) -> Result<Option<FileState>> {
+        if local_is_delete {
+            return Ok(stored_states.get(path).cloned());
+        }
+        if let Ok(state) = self.get_local_state(path).await {
+            return Ok(Some(state));
+        }
+        Ok(stored_states.get(path).cloned())
     }
 
     /// Get local file state    /// Get local file state
@@ -1327,6 +1492,70 @@ impl SyncEngine {
     /// Returns an error if the local database cannot be read.
     pub async fn get_conflicts(&self) -> Result<Vec<Conflict>> {
         self.local_db.get_conflicts().await
+    }
+
+    /// Record a conflict in the local database (used by live sync, where an
+    /// incoming change is arbitrated immediately rather than via a batch).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the conflict cannot be persisted.
+    pub async fn record_conflict(&self, conflict: &Conflict) -> Result<()> {
+        self.local_db.store_conflict(conflict).await
+    }
+
+    /// Arbitrate a live local delete against the remote.
+    ///
+    /// Returns `true` when the remote has been edited since our last sync and a
+    /// delete/edit conflict was recorded (the local delete must NOT propagate,
+    /// or it would destroy the remote edit). Returns `false` when the delete may
+    /// propagate (remote absent, also deleted, or unchanged since our last
+    /// sync).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the remote metadata or content cannot be fetched or
+    /// the conflict cannot be persisted.
+    pub async fn arbitrate_local_delete(&self, local_path: &str) -> Result<bool> {
+        let Some(state) = self.get_file_state(local_path).await? else {
+            return Ok(false);
+        };
+        let remote_path = self.couchdb.get_remote_path(local_path);
+        let Some(remote_doc) = self.couchdb.fetch_metadata(&remote_path).await? else {
+            return Ok(false);
+        };
+        if remote_doc.deleted {
+            // Both sides deleted → the local delete is an idempotent no-op.
+            return Ok(false);
+        }
+        let remote_rev_changed = remote_doc
+            .rev
+            .as_deref()
+            .is_some_and(|r| triage::remote_revision_changed(Some(r), state.couch_rev.as_deref()));
+        if !remote_rev_changed {
+            // Remote unchanged since our last sync → propagate the delete.
+            return Ok(false);
+        }
+        // Remote edited since our last sync → record a delete/edit conflict.
+        let remote_hash = if remote_doc.hash.is_empty() {
+            compute_bytes_hash(&self.couchdb.get_file_content(&remote_path).await?)
+        } else {
+            remote_doc.hash.clone()
+        };
+        let remote_state = RemoteState {
+            hash: remote_hash,
+            size: remote_doc.size,
+            modified_at: remote_doc.modified_at(),
+            couch_rev: remote_doc
+                .rev
+                .as_deref()
+                .and_then(CouchRev::new)
+                .unwrap_or_default(),
+            deleted: false,
+        };
+        self.record_conflict(&Conflict::new(local_path.to_string(), state, remote_state))
+            .await?;
+        Ok(true)
     }
 
     /// Apply a local change immediately (live sync)
@@ -1428,31 +1657,76 @@ impl SyncEngine {
 
         // Convert local path to remote path for CouchDB operations
         let remote_path = self.couchdb.get_remote_path(local_path);
+        let file_path = self.root_dir.join_contained(local_path)?;
+        let local_exists = file_path.exists();
+        // Determine whether the remote side is currently a deletion (tombstone)
+        // so "keep remote" / "keep both" delete or skip rather than resurrecting
+        // the tombstone's stale content. The stored conflict does not persist
+        // this, so it is re-read from the live remote at resolution time.
+        let remote_is_tombstone = self
+            .couchdb
+            .fetch_metadata(&remote_path)
+            .await?
+            .is_some_and(|doc| doc.deleted);
 
         match strategy {
             ResolutionStrategy::KeepLocal => {
-                // Force upload local version to remote
-                self.upload_local_file(local_path, &remote_path).await?;
-                info!(
-                    "Resolved conflict (keep-local): {} - uploaded to remote",
-                    local_path
-                );
+                if local_exists {
+                    // Keep the local edit: upload it (re-creating the remote
+                    // file with the edited content).
+                    self.upload_local_file(local_path, &remote_path).await?;
+                    info!(
+                        "Resolved conflict (keep-local): {} - uploaded to remote",
+                        local_path
+                    );
+                } else {
+                    // The local side was deleted: choosing it propagates the
+                    // deletion rather than resurrecting anything.
+                    self.couchdb.delete_file(&remote_path).await?;
+                    info!(
+                        "Resolved conflict (keep-local delete): {} - deleted on remote",
+                        local_path
+                    );
+                }
             }
             ResolutionStrategy::KeepRemote => {
-                // Force download remote version
-                self.download_remote_file(&remote_path, local_path, true)
-                    .await?;
-                info!("Resolved conflict (keep-remote): {}", local_path);
+                if remote_is_tombstone {
+                    // The remote side is a tombstone: "keep remote" means
+                    // deleting the local file to match — NOT resurrecting the
+                    // tombstone's stale content.
+                    if local_exists {
+                        tokio::fs::remove_file(&file_path).await?;
+                    }
+                    self.local_db.delete_file_state(local_path).await?;
+                    info!(
+                        "Resolved conflict (keep-remote delete): {} - deleted locally",
+                        local_path
+                    );
+                } else {
+                    // Force download remote version
+                    self.download_remote_file(&remote_path, local_path, true)
+                        .await?;
+                    info!("Resolved conflict (keep-remote): {}", local_path);
+                }
             }
             ResolutionStrategy::KeepBoth => {
-                // Save remote as .remote file
-                let local_remote_path = format!("{local_path}.remote");
-                self.download_remote_file(&remote_path, &local_remote_path, true)
-                    .await?;
-                info!("Saved remote version as: {}", local_remote_path);
+                if remote_is_tombstone {
+                    // Nothing on the remote to merge: the tombstone has no
+                    // content, so keep the local file as-is.
+                    info!(
+                        "Resolved conflict (keep-both, remote deleted): {} - keeping local",
+                        local_path
+                    );
+                } else {
+                    // Save remote as .remote file
+                    let local_remote_path = format!("{local_path}.remote");
+                    self.download_remote_file(&remote_path, &local_remote_path, true)
+                        .await?;
+                    info!("Saved remote version as: {}", local_remote_path);
 
-                // Local file stays as-is
-                // User can manually merge/compare
+                    // Local file stays as-is
+                    // User can manually merge/compare
+                }
             }
             ResolutionStrategy::Skip => {
                 // Do nothing, leave conflict for later
@@ -2864,6 +3138,7 @@ mod tests {
         let remote_delete = Change::remote_deleted(
             "prefix/a.txt".to_string(),
             Some(last_sync + Duration::microseconds(1)),
+            None,
         );
         let canned = CannedCouch {
             changes: vec![remote_delete],
@@ -3205,24 +3480,304 @@ mod tests {
         let fresh_delete = Change::remote_deleted(
             "test-prefix/fresh.txt".to_string(),
             Some(Utc::now() + Duration::hours(1)),
+            None,
         );
         let mut to_apply = Vec::new();
+        let mut conflicts = Vec::new();
         engine
-            .handle_remote_deletes(&[fresh_delete], &stored_states, &mut to_apply)
+            .handle_remote_deletes(
+                &[fresh_delete],
+                &stored_states,
+                &mut to_apply,
+                &mut conflicts,
+            )
             .unwrap();
 
         assert_eq!(to_apply.len(), 1, "newer remote delete is scheduled");
         assert_eq!(to_apply[0].path(), "test-prefix/fresh.txt");
+        assert!(
+            conflicts.is_empty(),
+            "unchanged local file must not conflict"
+        );
 
         let stale_delete = Change::remote_deleted(
             "test-prefix/fresh.txt".to_string(),
             Some(Utc::now() - Duration::days(2)),
+            None,
         );
         let mut to_apply = Vec::new();
+        let mut conflicts = Vec::new();
         engine
-            .handle_remote_deletes(&[stale_delete], &stored_states, &mut to_apply)
+            .handle_remote_deletes(
+                &[stale_delete],
+                &stored_states,
+                &mut to_apply,
+                &mut conflicts,
+            )
             .unwrap();
 
         assert!(to_apply.is_empty(), "stale remote delete is skipped");
+        assert!(conflicts.is_empty(), "stale delete must not conflict");
+    }
+
+    #[tokio::test]
+    async fn detect_conflicts_records_local_delete_remote_edit_conflict() {
+        // Local-delete / remote-edit: the local delete must not blindly upload
+        // (destroying the remote edit); it is recorded as a conflict.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let local = test_local_db();
+        seed_file_state(&local, "b.txt", "stalehash", 13);
+        let mut stored = local.get_file_state("b.txt").unwrap().unwrap();
+        stored.couch_rev = Some(CouchRev::new("1-abc").unwrap());
+        stored.last_sync_at = Utc::now() - Duration::days(1);
+        local.save_file_state(&stored).unwrap();
+
+        let remote_path = "prefix/b.txt";
+        let mut remote_doc = FileDoc::new(remote_path.to_string(), String::new(), 14);
+        remote_doc.rev = Some("2-def".to_string());
+        remote_doc.mtime = TimestampMillis::now();
+        remote_doc.path = remote_path.to_string();
+        let canned = CannedCouch {
+            metadata: std::collections::HashMap::from([(
+                remote_path.to_string(),
+                remote_doc.clone(),
+            )]),
+            contents: std::collections::HashMap::from([(
+                remote_path.to_string(),
+                b"remote".to_vec(),
+            )]),
+            ..CannedCouch::default()
+        };
+        let engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let local_changes = vec![Change::local_deleted("b.txt".to_string())];
+        let remote_changes = vec![Change::remote_modified(
+            remote_path.to_string(),
+            "remotehash".to_string(),
+            14,
+            Utc::now(),
+            "2-def".to_string(),
+        )];
+
+        let (uploads, _downloads, conflicts) = engine
+            .detect_conflicts(&local_changes, &remote_changes, true)
+            .await
+            .expect("detect_conflicts should succeed");
+
+        assert!(
+            uploads.is_empty(),
+            "local delete racing a remote edit must not upload"
+        );
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, "b.txt");
+        assert!(!conflicts[0].remote_state.deleted);
+    }
+
+    #[tokio::test]
+    async fn handle_remote_deletes_records_conflict_for_same_mtime_edit() {
+        // A remote delete racing a same-mtime content edit (mtime preserved but
+        // content changed) must record a conflict, not delete the local edit.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let file_path = root.as_path().join("f.txt");
+        std::fs::write(&file_path, b"edited content").unwrap();
+        let mtime: chrono::DateTime<Utc> = std::fs::metadata(&file_path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .into();
+
+        let local = test_local_db();
+        let mut state = FileState::new("f.txt".to_string(), "storedhash".to_string(), 1, mtime);
+        state.couch_rev = Some(CouchRev::new("3-abc").unwrap());
+        state.last_sync_at = Utc::now() - Duration::days(1);
+        local.save_file_state(&state).unwrap();
+        let stored_states = local
+            .get_file_state("f.txt")
+            .unwrap()
+            .map(|s| (s.path.clone(), s))
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let engine = SyncEngine::new(test_couchdb(), local, root);
+
+        let fresh_delete = Change::remote_deleted(
+            "test-prefix/f.txt".to_string(),
+            Some(Utc::now() + Duration::hours(1)),
+            Some("4-def".to_string()),
+        );
+        let mut to_apply = Vec::new();
+        let mut conflicts = Vec::new();
+        engine
+            .handle_remote_deletes(
+                &[fresh_delete],
+                &stored_states,
+                &mut to_apply,
+                &mut conflicts,
+            )
+            .unwrap();
+
+        assert!(to_apply.is_empty(), "same-mtime edit must not be deleted");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, "f.txt");
+        assert!(conflicts[0].remote_state.deleted);
+    }
+
+    #[tokio::test]
+    async fn resolve_conflict_keep_remote_tombstone_deletes_local_not_resurrect() {
+        // Choosing the remote deletion during resolution must delete the local
+        // file, NOT resurrect the tombstone's stale content.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let local_path = "conflict.txt";
+        std::fs::write(root.as_path().join(local_path), b"local edit").unwrap();
+
+        let local = test_local_db();
+        let local_state = FileState::new(
+            local_path.to_string(),
+            "localhash".to_string(),
+            10,
+            Utc::now() - Duration::days(1),
+        );
+        let remote_state = RemoteState {
+            hash: String::new(),
+            size: 0,
+            modified_at: Utc::now(),
+            couch_rev: CouchRev::new("4-def").unwrap(),
+            deleted: true, // tombstone
+        };
+        local
+            .store_conflict(&Conflict::new(
+                local_path.to_string(),
+                local_state,
+                remote_state,
+            ))
+            .unwrap();
+
+        // The remote side is a live tombstone: resolve_conflict must detect it
+        // via fetch_metadata (the stored conflict does not persist `deleted`).
+        let mut tombstone = FileDoc::new(format!("test-prefix/{local_path}"), String::new(), 0);
+        tombstone.deleted = true;
+        tombstone.rev = Some("4-def".to_string());
+        let canned = CannedCouch {
+            metadata: std::collections::HashMap::from([(
+                format!("test-prefix/{local_path}"),
+                tombstone,
+            )]),
+            ..CannedCouch::default()
+        };
+
+        let mut engine = SyncEngine::new(
+            test_canned_couch("test-prefix/", canned),
+            local,
+            root.clone(),
+        );
+        engine
+            .resolve_conflict(local_path, ResolutionStrategy::KeepRemote)
+            .await
+            .unwrap();
+
+        assert!(
+            !root.as_path().join(local_path).exists(),
+            "keep-remote on a tombstone must delete the local file, not resurrect it"
+        );
+        assert!(
+            engine.get_conflicts().await.unwrap().is_empty(),
+            "conflict must be removed after resolution"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_conflict_keep_local_on_deleted_local_deletes_remote() {
+        // Choosing the local deletion during resolution (local file already
+        // gone) must propagate the deletion to the remote instead of trying to
+        // upload a missing file.
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let local_path = "conflict.txt";
+        // Local file is absent (local side deleted).
+
+        let local = test_local_db();
+        let local_state = FileState::new(
+            local_path.to_string(),
+            "localhash".to_string(),
+            10,
+            Utc::now() - Duration::days(1),
+        );
+        let remote_state = RemoteState {
+            hash: "remotehash".to_string(),
+            size: 11,
+            modified_at: Utc::now(),
+            couch_rev: CouchRev::new("2-def").unwrap(),
+            deleted: false, // remote edit
+        };
+        local
+            .store_conflict(&Conflict::new(
+                local_path.to_string(),
+                local_state,
+                remote_state,
+            ))
+            .unwrap();
+
+        let mut engine = SyncEngine::new(
+            test_canned_couch("test-prefix/", CannedCouch::default()),
+            local,
+            root.clone(),
+        );
+        engine
+            .resolve_conflict(local_path, ResolutionStrategy::KeepLocal)
+            .await
+            .unwrap();
+
+        assert!(
+            engine.get_conflicts().await.unwrap().is_empty(),
+            "conflict must be removed after resolution"
+        );
+    }
+
+    #[tokio::test]
+    async fn arbitrate_local_delete_records_conflict_when_remote_edited() {
+        // A live local delete racing a remote edit must record a conflict
+        // rather than propagate the delete (which would destroy the remote
+        // edit).
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let local = test_local_db();
+        seed_file_state(&local, "f.txt", "stalehash", 10);
+        let mut stored = local.get_file_state("f.txt").unwrap().unwrap();
+        stored.couch_rev = Some(CouchRev::new("1-abc").unwrap());
+        stored.last_sync_at = Utc::now() - Duration::days(1);
+        local.save_file_state(&stored).unwrap();
+
+        let remote_path = "test-prefix/f.txt";
+        let mut remote_doc = FileDoc::new(remote_path.to_string(), String::new(), 11);
+        remote_doc.rev = Some("2-def".to_string());
+        remote_doc.mtime = TimestampMillis::now();
+        remote_doc.path = remote_path.to_string();
+        let canned = CannedCouch {
+            metadata: std::collections::HashMap::from([(
+                remote_path.to_string(),
+                remote_doc.clone(),
+            )]),
+            contents: std::collections::HashMap::from([(
+                remote_path.to_string(),
+                b"remote edit".to_vec(),
+            )]),
+            ..CannedCouch::default()
+        };
+        let engine = SyncEngine::new(test_canned_couch("test-prefix/", canned), local, root);
+
+        let conflict = engine.arbitrate_local_delete("f.txt").await.unwrap();
+        assert!(conflict, "remote edit must be surfaced as a conflict");
+
+        let conflicts = engine.get_conflicts().await.unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, "f.txt");
+        assert!(!conflicts[0].remote_state.deleted);
     }
 }
