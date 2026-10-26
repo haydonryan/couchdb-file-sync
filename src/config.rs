@@ -280,6 +280,10 @@ pub struct SyncConfig {
     pub rescan_interval_secs: u64,
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Maximum size (bytes) of a single file that sync will upload or
+    /// download. Files larger than this are skipped and reported before full
+    /// allocation or transfer, and are never recorded as synced state. `0`
+    /// means unlimited.
     #[serde(default = "default_max_file_size")]
     pub max_file_size: u64,
     #[serde(default = "default_parallel")]

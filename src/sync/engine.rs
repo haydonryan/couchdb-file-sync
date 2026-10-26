@@ -39,6 +39,11 @@ pub struct SyncEngine {
     /// chunks beyond this limit are deferred to a later cycle so collection
     /// stays bounded and resumable.
     orphan_chunk_batch: u64,
+    /// Maximum size (bytes) of a file that sync will upload or download.
+    /// `None` means unlimited. Files over the limit are rejected before full
+    /// allocation/transfer, reported in the sync report, and never recorded as
+    /// synced state (so a skipped file never becomes a deletion candidate).
+    max_file_size: Option<u64>,
 }
 
 /// Report from a sync operation
@@ -190,9 +195,42 @@ struct ApplyWorker {
     /// boundaries so ignored or internal paths are never written or removed
     /// locally even if they slipped past triage.
     ignore_matcher: IgnoreMatcher,
+    /// Maximum size (bytes) of a file this worker will upload or download.
+    /// `None` means unlimited. Enforced at the transfer boundary so growth
+    /// during a transfer cannot bypass the limit and a malicious oversized
+    /// remote size is rejected before any allocation.
+    max_file_size: Option<u64>,
 }
 
 impl ApplyWorker {
+    /// Enforce the configured upload size limit, rejecting before any content
+    /// is read/allocated and again after a read so growth during transfer can
+    /// never bypass the bound.
+    fn bound_upload_size(&self, local_path: &str, size: u64) -> Result<()> {
+        if let Some(limit) = self.max_file_size
+            && size > limit
+        {
+            anyhow::bail!(
+                "refusing to upload {local_path}: {size} bytes exceeds configured max_file_size {limit}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Enforce the configured download size limit against remote metadata
+    /// before any content is fetched/allocated, and again against the actually
+    /// transferred length so growth during transfer can never bypass the bound.
+    fn bound_download_size(&self, remote_path: &str, size: u64) -> Result<()> {
+        if let Some(limit) = self.max_file_size
+            && size > limit
+        {
+            anyhow::bail!(
+                "refusing to download {remote_path}: {size} bytes exceeds configured max_file_size {limit}"
+            );
+        }
+        Ok(())
+    }
+
     async fn upload_local_file(
         &self,
         local_path: &str,
@@ -214,9 +252,17 @@ impl ApplyWorker {
         debug!("[UPLOAD] Size: {} bytes", metadata.len());
         debug!("[UPLOAD] mtime: {} ms", mtime);
 
+        // Reject an oversized local file before allocating/reading the whole
+        // content buffer (reported by the caller).
+        self.bound_upload_size(local_path, metadata.len())?;
+
         let content = tokio::fs::read(&file_path).await?;
         let content_len = content.len();
         debug!("[UPLOAD] Read {} bytes from disk", content_len);
+
+        // Re-check after the read so a file that grew past the limit during
+        // the transfer is aborted rather than uploaded.
+        self.bound_upload_size(local_path, u64::try_from(content_len).unwrap_or(u64::MAX))?;
 
         // Hash the in-memory content buffer before moving it into the chunk,
         // so the persisted hash still matches the transferred bytes. Since
@@ -337,6 +383,8 @@ impl ApplyWorker {
             return Ok(None);
         };
 
+        self.bound_download_size(remote_path, doc.size)?;
+
         let file_path = self.root_dir.join_contained(local_path)?;
         // Filesystem type transition: an incoming remote file arriving where a
         // directory currently exists (a remote directory replaced by a file, or
@@ -381,6 +429,10 @@ impl ApplyWorker {
                 anyhow::bail!("failed to fetch content for {remote_path}: {e}");
             }
         };
+
+        // Bound the actually-transferred length too (growth during transfer).
+        let len = u64::try_from(content.len()).unwrap_or(u64::MAX);
+        self.bound_download_size(remote_path, len)?;
 
         // Hash the in-memory content buffer we just fetched instead of
         // re-reading the file back from disk. This avoids a redundant disk
@@ -767,6 +819,7 @@ impl SyncEngine {
             tombstone_retention: None,
             orphan_chunk_grace: None,
             orphan_chunk_batch: 0,
+            max_file_size: None,
         }
     }
 
@@ -787,6 +840,7 @@ impl SyncEngine {
             tombstone_retention: None,
             orphan_chunk_grace: None,
             orphan_chunk_batch: 0,
+            max_file_size: None,
         }
     }
 
@@ -816,6 +870,15 @@ impl SyncEngine {
     ) -> Self {
         self.orphan_chunk_grace = grace;
         self.orphan_chunk_batch = batch;
+        self
+    }
+
+    /// Bound the size (bytes) of files sync will upload or download. Pass
+    /// `Some(limit)` to reject any file over `limit` before full allocation or
+    /// transfer; pass `None` (or omit) for unlimited.
+    #[must_use]
+    pub const fn with_max_file_size(mut self, max_file_size: Option<u64>) -> Self {
+        self.max_file_size = max_file_size;
         self
     }
 
@@ -851,6 +914,7 @@ impl SyncEngine {
             local_db: self.local_db.clone(),
             root_dir: self.root_dir.clone(),
             ignore_matcher: self.ignore_matcher.clone(),
+            max_file_size: self.max_file_size,
         }
     }
 
@@ -936,6 +1000,17 @@ impl SyncEngine {
             .await?;
 
         report.conflicts = conflicts.len();
+
+        // Enforce the configured size limit at the planning boundary: an
+        // oversized local/remote change is excluded from the apply queues,
+        // reported as an error, and (for local) has its stored state dropped so
+        // it never becomes a deletion candidate or recorded as synced state.
+        // The per-transfer checks in the apply worker remain as defense-in-depth
+        // for growth-during-transfer and paths that bypass triage (live sync,
+        // rebuilds).
+        let (local_to_upload, remote_to_apply) = self
+            .filter_oversized(local_to_upload, remote_to_apply, dry_run, &mut report)
+            .await?;
 
         info!("After analysis:");
         info!("  - Files to upload: {}", local_to_upload.len());
@@ -1306,6 +1381,57 @@ impl SyncEngine {
         }
 
         Ok(changes)
+    }
+
+    /// Exclude oversized changes from the apply queues, reporting each one as
+    /// an error and dropping the local stored state of an oversized local file
+    /// so it never becomes a deletion candidate or is recorded as synced
+    /// state. A `None` limit (unlimited) is a no-op.
+    async fn filter_oversized(
+        &self,
+        local_to_upload: Vec<Change>,
+        remote_to_apply: Vec<Change>,
+        dry_run: bool,
+        report: &mut SyncReport,
+    ) -> Result<(Vec<Change>, Vec<Change>)> {
+        let Some(limit) = self.max_file_size else {
+            return Ok((local_to_upload, remote_to_apply));
+        };
+
+        let mut uploads = Vec::with_capacity(local_to_upload.len());
+        for change in local_to_upload {
+            match change.size() {
+                Some(size) if size > limit => {
+                    report.errors.push(format!(
+                        "Oversized local file skipped: {} ({} bytes exceeds max_file_size {limit})",
+                        change.path(),
+                        size
+                    ));
+                    if !dry_run {
+                        // Drop any stored sync state so the skipped file never
+                        // becomes a deletion candidate nor is treated as synced.
+                        self.local_db.delete_file_state(change.path()).await?;
+                    }
+                }
+                _ => uploads.push(change),
+            }
+        }
+
+        let mut downloads = Vec::with_capacity(remote_to_apply.len());
+        for change in remote_to_apply {
+            match change.size() {
+                Some(size) if size > limit => {
+                    report.errors.push(format!(
+                        "Oversized remote file skipped: {} ({} bytes exceeds max_file_size {limit})",
+                        change.path(),
+                        size
+                    ));
+                }
+                _ => downloads.push(change),
+            }
+        }
+
+        Ok((uploads, downloads))
     }
 
     /// Fetch remote changes from `CouchDB`
@@ -4196,6 +4322,250 @@ mod tests {
             stored.hash, stored_hash,
             "FileState hash must equal the verified remote hash"
         );
+    }
+
+    // ── Configured file-size limits (#6358) ────────────────────────────────
+
+    /// Upload of a local file over the configured limit must be rejected before
+    /// any content is read or uploaded, must not save sync state, and the
+    /// skipped file must never become a deletion candidate on a later sync.
+    #[tokio::test]
+    async fn sync_skips_oversized_local_upload_and_never_becomes_deletion_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        // 6 bytes > limit 5.
+        std::fs::write(root.as_path().join("big.txt"), b"123456").unwrap();
+
+        let local = test_local_db();
+        local.save_checkpoint("100-before").unwrap();
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", CannedCouch::default()),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        )
+        .with_max_file_size(Some(5));
+
+        let report = engine.sync().await.expect("sync with oversized local file");
+        assert_eq!(report.uploaded.0, 0, "oversized file must not be uploaded");
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("Oversized local file skipped: big.txt")),
+            "oversized file must be reported: {:#?}",
+            report.errors
+        );
+        assert!(
+            engine.get_file_state("big.txt").await.unwrap().is_none(),
+            "oversized skipped file must never be recorded as synced state"
+        );
+
+        // Now the local file is deleted; because it was never synced, its
+        // deletion must not propagate to remote (it never became a deletion
+        // candidate).
+        std::fs::remove_file(root.as_path().join("big.txt")).unwrap();
+        let report2 = engine.sync().await.expect("second sync after local delete");
+        assert_eq!(
+            report2.deleted_remote, 0,
+            "skipped oversized file must not become a deletion candidate"
+        );
+        assert_eq!(report2.uploaded.0, 0);
+    }
+
+    /// A sync with an oversized remote change must reject the download before
+    /// any allocation/transfer, write nothing locally, and save no state.
+    #[tokio::test]
+    async fn sync_skips_oversized_remote_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+
+        let remote_path = "prefix/big.txt";
+        let mut remote_doc = FileDoc::new(remote_path.to_string(), String::new(), 200);
+        remote_doc.rev = Some("1-big".to_string());
+        remote_doc.path = remote_path.to_string();
+
+        let canned = CannedCouch {
+            changes: vec![Change::remote_modified(
+                remote_path.to_string(),
+                "hash".to_string(),
+                200,
+                Utc::now(),
+                "1-big".to_string(),
+            )],
+            last_seq: "200-after".to_string(),
+            metadata: std::collections::HashMap::from([(remote_path.to_string(), remote_doc)]),
+            contents: std::collections::HashMap::new(),
+            ..CannedCouch::default()
+        };
+        let local = test_local_db();
+        local.save_checkpoint("100-before").unwrap();
+        let mut engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        )
+        .with_max_file_size(Some(100));
+
+        let report = engine
+            .sync()
+            .await
+            .expect("sync with oversized remote file");
+        assert_eq!(
+            report.downloaded.0, 0,
+            "oversized remote file must not be downloaded"
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("Oversized remote file skipped: prefix/big.txt")),
+            "oversized remote file must be reported: {:#?}",
+            report.errors
+        );
+        assert!(
+            !root.as_path().join("big.txt").exists(),
+            "oversized remote file must not be written locally"
+        );
+        assert!(
+            engine.get_file_state("big.txt").await.unwrap().is_none(),
+            "oversized remote file must not save sync state"
+        );
+    }
+
+    /// A local file that grows past the limit by the time it is transferred
+    /// (length changed between scan and apply) must be rejected before content
+    /// is uploaded, with zero `CouchDB` writes.
+    #[tokio::test]
+    async fn upload_rejects_oversized_file_before_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(root.as_path().join("grew.txt"), b"123456").unwrap();
+
+        let local = test_local_db();
+        let engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", CannedCouch::default()),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        )
+        .with_max_file_size(Some(5));
+
+        let err = engine
+            .upload_local_file("grew.txt", "prefix/grew.txt", &ExpectedRemote::Force)
+            .await
+            .expect_err("oversized upload must be rejected before allocation");
+        assert!(
+            format!("{err:#}").contains("max_file_size"),
+            "error must cite the size limit: {err:#}"
+        );
+        assert_eq!(
+            engine.couchdb.test_write_calls(),
+            0,
+            "oversized upload must not read content nor write to CouchDB"
+        );
+        assert!(
+            engine.get_file_state("grew.txt").await.unwrap().is_none(),
+            "rejected upload must not save sync state"
+        );
+    }
+
+    /// A maliciously oversized remote `doc.size` must be rejected from the
+    /// metadata alone, before any content is fetched/allocated.
+    #[tokio::test]
+    async fn download_rejects_malicious_oversized_remote_metadata_before_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+
+        let remote_path = "prefix/huge.txt";
+        let mut remote_doc = FileDoc::new(remote_path.to_string(), String::new(), 1_000_000_000);
+        remote_doc.rev = Some("1-huge".to_string());
+        remote_doc.path = remote_path.to_string();
+
+        let canned = CannedCouch {
+            changes: Vec::new(),
+            last_seq: "1".to_string(),
+            metadata: std::collections::HashMap::from([(remote_path.to_string(), remote_doc)]),
+            // No content entry: if the size check is skipped, the empty-content
+            // path would succeed — the rejection must come from metadata.
+            contents: std::collections::HashMap::new(),
+            ..CannedCouch::default()
+        };
+        let engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        )
+        .with_max_file_size(Some(100));
+
+        let err = engine
+            .download_remote_file(remote_path, "huge.txt", true, true)
+            .await
+            .expect_err("oversized remote metadata must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("max_file_size") && msg.contains("1000000000"),
+            "rejection must cite the remote size and limit: {msg}"
+        );
+        assert!(
+            !root.as_path().join("huge.txt").exists(),
+            "malicious oversized metadata must not allocate/write any content"
+        );
+    }
+
+    /// A file exactly at the configured limit uploads successfully (boundary
+    /// inclusive).
+    #[tokio::test]
+    async fn upload_at_limit_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        std::fs::write(root.as_path().join("at.txt"), b"12345").unwrap();
+
+        let local = test_local_db();
+        let engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", CannedCouch::default()),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        )
+        .with_max_file_size(Some(5));
+
+        let (bytes, _rev) = engine
+            .upload_local_file("at.txt", "prefix/at.txt", &ExpectedRemote::Force)
+            .await
+            .expect("a file exactly at the limit must upload");
+        assert_eq!(bytes, 5);
+    }
+
+    /// No configured limit (unlimited, i.e. config `0`) transfers files that
+    /// would exceed a bounded default.
+    #[tokio::test]
+    async fn unlimited_engine_transfers_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        // 20 bytes — would exceed any small bounded default but is fine when
+        // the engine carries no limit (max_file_size = None / config 0).
+        std::fs::write(root.as_path().join("unlimited.txt"), b"x".repeat(20)).unwrap();
+
+        let local = test_local_db();
+        let engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", CannedCouch::default()),
+            local,
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let (bytes, _rev) = engine
+            .upload_local_file(
+                "unlimited.txt",
+                "prefix/unlimited.txt",
+                &ExpectedRemote::Force,
+            )
+            .await
+            .expect("an unlimited engine must transfer the file");
+        assert_eq!(bytes, 20);
     }
 
     /// A local create/modify change for a path that is a directory on disk is
