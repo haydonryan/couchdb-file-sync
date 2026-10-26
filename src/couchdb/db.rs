@@ -148,6 +148,10 @@ pub struct CannedCouch {
     pub last_seq: String,
     /// Metadata returned by `fetch_metadata`, keyed by remote path.
     pub metadata: std::collections::HashMap<String, crate::models::FileDoc>,
+    /// All in-scope remote files returned by `get_all_files` (used by the
+    /// authoritative rebuild paths). Filtered by the remote-path scope the same
+    /// way the live `get_all_files` filters its listing.
+    pub all_files: Vec<crate::models::FileDoc>,
     /// File content returned by `get_file_content`, keyed by remote path.
     pub contents: std::collections::HashMap<String, Vec<u8>>,
     /// Paths for which `get_file_content` should return a fetch error instead
@@ -883,6 +887,15 @@ impl CouchDb {
     ///
     /// Returns an error if the `CouchDB` request fails.
     pub async fn get_all_files(&self) -> Result<Vec<FileDoc>> {
+        #[cfg(test)]
+        if let Some(state) = &self.test_state {
+            return Ok(state
+                .all_files
+                .iter()
+                .filter(|&d| d.is_file() && self.is_path_allowed(&d.id))
+                .cloned()
+                .collect());
+        }
         let collection = self
             .retry_transient(|| self.db.get_all::<FileDoc>())
             .await?;
@@ -4188,7 +4201,7 @@ mod tests {
                 // a reusable HTTP/1.1 state regardless of the response path.
                 let bytes = body.collect().await.expect("collect chunk body").to_bytes();
                 if remaining_puts
-                    .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                    .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
                     .is_err()
                 {
                     *response.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;

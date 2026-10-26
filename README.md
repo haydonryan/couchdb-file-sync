@@ -346,7 +346,7 @@ couchdb-file-sync rebuild-remote ~/documents
 
 ### `couchdb-file-sync rebuild-local [PATH]`
 
-Replace the local filesystem with the current remote scope for that path. Existing non-ignored local files are removed first, then live remote files are downloaded.
+Replace the local filesystem with the current remote scope for that path. Every live remote file is fetched and content-verified into a staging area first; only after all of it is verified are obsolete local files removed, the staged content installed, and the sync baseline reset — so a failed rebuild leaves the prior local tree and baseline intact. An interrupted rebuild resumes from its journal on the next run.
 
 ```bash
 couchdb-file-sync rebuild-local ~/documents
