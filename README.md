@@ -182,6 +182,16 @@ sync:
   # local changes that failed to upload or were dropped when the file watcher
   # overflowed. 0 disables the periodic rescan. Default: 30
   rescan_interval_secs: 30
+  # Maximum number of queued changes applied per scheduling wave during a sync.
+  # Uploads/downloads are processed batch_size at a time, bounding the queue of
+  # work held in memory. Must be >= 1. Default: 100
+  batch_size: 100
+  # Whether per-file uploads/downloads may run in parallel during a sync.
+  # When false, files are applied strictly one at a time (serially). Default: true
+  parallel: true
+  # Maximum number of per-file uploads/downloads in flight at once when
+  # parallel is enabled. Must be >= 1 when parallel is true. Default: 4
+  max_parallel: 4
   # Soft-delete tombstones older than this many seconds are pruned so
   # get_all_files/get_changes do not grow unbounded. 0 disables pruning.
   tombstone_retention_secs: 604800

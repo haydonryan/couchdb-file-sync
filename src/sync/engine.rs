@@ -13,11 +13,6 @@ use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, warn};
 
-/// Maximum number of per-file upload/download operations applied in parallel
-/// during the sync phase. Bounds in-flight HTTP + hash + DB work so a large
-/// change batch is processed concurrently without unbounded resource use.
-const APPLY_CONCURRENCY_LIMIT: usize = 8;
-
 /// The main sync engine
 pub struct SyncEngine {
     /// Shared `CouchDB` client; all operations are `&self` so the same client is
@@ -44,6 +39,18 @@ pub struct SyncEngine {
     /// allocation/transfer, reported in the sync report, and never recorded as
     /// synced state (so a skipped file never becomes a deletion candidate).
     max_file_size: Option<u64>,
+    /// Whether per-file upload/download applies may run in parallel. When
+    /// `false`, applies run strictly serially (one file at a time), regardless
+    /// of `apply_max_parallel`.
+    apply_parallel: bool,
+    /// Maximum number of per-file upload/download applies in flight at once
+    /// when `apply_parallel` is enabled. Only consulted when parallel is on;
+    /// it must be `>= 1` (validated before any apply work).
+    apply_max_parallel: usize,
+    /// Number of queued changes applied per scheduling wave. The apply loops
+    /// process this many changes before moving on, bounding the queue of work
+    /// held in memory. Must be `>= 1` (validated before any apply work).
+    apply_batch_size: usize,
 }
 
 /// Report from a sync operation
@@ -722,35 +729,45 @@ async fn apply_one_upload(
 
 /// Apply a batch of uploads with bounded concurrency, collecting every
 /// per-file error into `report` (none dropped).
+///
+/// Changes are processed in scheduling waves of `batch_size` (an observable
+/// bound on the queue of work held at once). Within each wave, up to
+/// `concurrency` per-file applies run in flight; `concurrency == 1` runs
+/// strictly serially. Callers must pass a validated `concurrency >= 1` and
+/// `batch_size >= 1` (see [`SyncEngine::validate_apply_settings`]).
 async fn apply_upload_batch(
     worker: ApplyWorker,
     changes: Vec<Change>,
     dry_run: bool,
+    concurrency: usize,
+    batch_size: usize,
     report: &mut SyncReport,
 ) -> Result<()> {
-    let mut in_flight = tokio::task::JoinSet::new();
-    let mut pending = changes.into_iter();
+    for wave in changes.chunks(batch_size) {
+        let mut in_flight = tokio::task::JoinSet::new();
+        let mut pending = wave.iter().cloned();
 
-    // Seed the first `APPLY_CONCURRENCY_LIMIT` tasks so the number of
-    // in-flight file operations never exceeds the bound.
-    for _ in 0..APPLY_CONCURRENCY_LIMIT {
-        if let Some(change) = pending.next() {
-            let worker = worker.clone();
-            in_flight.spawn(async move { apply_one_upload(worker, change, dry_run).await });
+        // Seed the first `concurrency` tasks so the number of in-flight file
+        // operations never exceeds the bound.
+        for _ in 0..concurrency {
+            if let Some(change) = pending.next() {
+                let worker = worker.clone();
+                in_flight.spawn(async move { apply_one_upload(worker, change, dry_run).await });
+            }
         }
-    }
 
-    while let Some(joined) = in_flight.join_next().await {
-        let outcome = joined.map_err(|e| anyhow::anyhow!("upload task panicked: {e}"))??;
-        report.uploaded.0 += outcome.uploaded;
-        report.deleted_remote += outcome.deleted_remote;
-        if let Some(error) = outcome.error {
-            report.errors.push(error);
-        }
-        // Fill the freed slot with the next pending upload.
-        if let Some(change) = pending.next() {
-            let worker = worker.clone();
-            in_flight.spawn(async move { apply_one_upload(worker, change, dry_run).await });
+        while let Some(joined) = in_flight.join_next().await {
+            let outcome = joined.map_err(|e| anyhow::anyhow!("upload task panicked: {e}"))??;
+            report.uploaded.0 += outcome.uploaded;
+            report.deleted_remote += outcome.deleted_remote;
+            if let Some(error) = outcome.error {
+                report.errors.push(error);
+            }
+            // Fill the freed slot with the next pending upload.
+            if let Some(change) = pending.next() {
+                let worker = worker.clone();
+                in_flight.spawn(async move { apply_one_upload(worker, change, dry_run).await });
+            }
         }
     }
 
@@ -786,32 +803,42 @@ async fn apply_one_download(
 
 /// Apply a batch of downloads with bounded concurrency, collecting every
 /// per-file error into `report` (none dropped).
+///
+/// Changes are processed in scheduling waves of `batch_size` (an observable
+/// bound on the queue of work held at once). Within each wave, up to
+/// `concurrency` per-file applies run in flight; `concurrency == 1` runs
+/// strictly serially. Callers must pass a validated `concurrency >= 1` and
+/// `batch_size >= 1` (see [`SyncEngine::validate_apply_settings`]).
 async fn apply_download_batch(
     worker: ApplyWorker,
     changes: Vec<Change>,
     dry_run: bool,
+    concurrency: usize,
+    batch_size: usize,
     report: &mut SyncReport,
 ) -> Result<()> {
-    let mut in_flight = tokio::task::JoinSet::new();
-    let mut pending = changes.into_iter();
+    for wave in changes.chunks(batch_size) {
+        let mut in_flight = tokio::task::JoinSet::new();
+        let mut pending = wave.iter().cloned();
 
-    for _ in 0..APPLY_CONCURRENCY_LIMIT {
-        if let Some(change) = pending.next() {
-            let worker = worker.clone();
-            in_flight.spawn(async move { apply_one_download(worker, change, dry_run).await });
+        for _ in 0..concurrency {
+            if let Some(change) = pending.next() {
+                let worker = worker.clone();
+                in_flight.spawn(async move { apply_one_download(worker, change, dry_run).await });
+            }
         }
-    }
 
-    while let Some(joined) = in_flight.join_next().await {
-        let outcome = joined.map_err(|e| anyhow::anyhow!("download task panicked: {e}"))??;
-        report.downloaded.0 += outcome.downloaded;
-        report.deleted_local += outcome.deleted_local;
-        if let Some(error) = outcome.error {
-            report.errors.push(error);
-        }
-        if let Some(change) = pending.next() {
-            let worker = worker.clone();
-            in_flight.spawn(async move { apply_one_download(worker, change, dry_run).await });
+        while let Some(joined) = in_flight.join_next().await {
+            let outcome = joined.map_err(|e| anyhow::anyhow!("download task panicked: {e}"))??;
+            report.downloaded.0 += outcome.downloaded;
+            report.deleted_local += outcome.deleted_local;
+            if let Some(error) = outcome.error {
+                report.errors.push(error);
+            }
+            if let Some(change) = pending.next() {
+                let worker = worker.clone();
+                in_flight.spawn(async move { apply_one_download(worker, change, dry_run).await });
+            }
         }
     }
 
@@ -833,6 +860,9 @@ impl SyncEngine {
             orphan_chunk_grace: None,
             orphan_chunk_batch: 0,
             max_file_size: None,
+            apply_parallel: true,
+            apply_max_parallel: 4,
+            apply_batch_size: 100,
         }
     }
 
@@ -854,6 +884,9 @@ impl SyncEngine {
             orphan_chunk_grace: None,
             orphan_chunk_batch: 0,
             max_file_size: None,
+            apply_parallel: true,
+            apply_max_parallel: 4,
+            apply_batch_size: 100,
         }
     }
 
@@ -902,6 +935,60 @@ impl SyncEngine {
     pub const fn with_max_file_size(mut self, max_file_size: Option<u64>) -> Self {
         self.max_file_size = max_file_size;
         self
+    }
+
+    /// Configure the effective per-file apply parallelism and batching.
+    ///
+    /// * `parallel` — when `false`, uploads and downloads are applied strictly
+    ///   serially (one file at a time) regardless of `max_parallel`.
+    /// * `max_parallel` — maximum number of per-file applies in flight at once
+    ///   when `parallel` is enabled. Must be `>= 1` (validated before apply).
+    /// * `batch_size` — number of queued changes applied per scheduling wave.
+    ///   Must be `>= 1` (validated before apply).
+    ///
+    /// Invalid bounds (`max_parallel == 0` with parallel enabled, or
+    /// `batch_size == 0`) are rejected by [`SyncEngine::run_cycle`] before any
+    /// apply work runs.
+    #[must_use]
+    pub const fn with_apply_settings(
+        mut self,
+        parallel: bool,
+        max_parallel: usize,
+        batch_size: usize,
+    ) -> Self {
+        self.apply_parallel = parallel;
+        self.apply_max_parallel = max_parallel;
+        self.apply_batch_size = batch_size;
+        self
+    }
+
+    /// Effective number of per-file applies allowed in flight. `1` when
+    /// parallelism is disabled, otherwise the configured `max_parallel` bound.
+    /// Callers must ensure [`SyncEngine::validate_apply_settings`] succeeded so
+    /// the returned value is `>= 1`.
+    const fn effective_apply_concurrency(&self) -> usize {
+        if self.apply_parallel {
+            self.apply_max_parallel
+        } else {
+            1
+        }
+    }
+
+    /// Validate the configured apply/batch bounds. Returns an error before any
+    /// apply work runs when the configuration is unusable: `batch_size == 0`,
+    /// or `max_parallel == 0` while parallelism is enabled. A `max_parallel`
+    /// of `0` with parallelism disabled is harmless (applies are serial) and
+    /// accepted.
+    fn validate_apply_settings(&self) -> Result<()> {
+        if self.apply_batch_size == 0 {
+            anyhow::bail!("sync.batch_size must be >= 1 (got 0); refusing to apply changes");
+        }
+        if self.apply_parallel && self.apply_max_parallel == 0 {
+            anyhow::bail!(
+                "sync.max_parallel must be >= 1 when sync.parallel is enabled (got 0); refusing to apply changes"
+            );
+        }
+        Ok(())
     }
 
     /// Best-effort orphan chunk collection. Runs after uploads/downloads (so
@@ -969,7 +1056,11 @@ impl SyncEngine {
     /// When `dry_run` is true every write operation (`CouchDB` writes, local
     /// filesystem writes, and state-DB saves) is skipped while the read-only
     /// triage, conflict detection, and report generation still run.
+    #[allow(clippy::too_many_lines)] // full sync pipeline spans many sequential steps
     async fn run_cycle(&self, dry_run: bool) -> Result<SyncReport> {
+        // Fail fast on invalid apply/batch bounds before any work runs.
+        self.validate_apply_settings()?;
+
         if dry_run {
             info!("========== DRY-RUN SYNC CYCLE STARTING ==========");
         } else {
@@ -1054,7 +1145,15 @@ impl SyncEngine {
             "========== UPLOADING {} FILES ==========",
             local_to_upload.len()
         );
-        apply_upload_batch(self.apply_worker(), local_to_upload, dry_run, &mut report).await?;
+        apply_upload_batch(
+            self.apply_worker(),
+            local_to_upload,
+            dry_run,
+            self.effective_apply_concurrency(),
+            self.apply_batch_size,
+            &mut report,
+        )
+        .await?;
 
         // 6. Apply clean remote changes to local (skipped in dry-run).
         //    Runs with bounded concurrency so a large batch of downloads does
@@ -1063,7 +1162,15 @@ impl SyncEngine {
             "========== DOWNLOADING {} FILES ==========",
             remote_to_apply.len()
         );
-        apply_download_batch(self.apply_worker(), remote_to_apply, dry_run, &mut report).await?;
+        apply_download_batch(
+            self.apply_worker(),
+            remote_to_apply,
+            dry_run,
+            self.effective_apply_concurrency(),
+            self.apply_batch_size,
+            &mut report,
+        )
+        .await?;
 
         // 7. Update checkpoint (skipped in dry-run).
         //    Advance the remote change-feed checkpoint only when every queued
@@ -5765,7 +5872,7 @@ mod tests {
 
     #[tokio::test]
     async fn upload_batch_applies_with_bounded_concurrency_and_collects_every_error() {
-        // Larger than APPLY_CONCURRENCY_LIMIT so the loop is forced to run in
+        // Larger than the parallel bound so the loop is forced to run in
         // waves; a couple of uploads fail at the canned `save_file` step so we
         // can verify every per-file error is still collected (none dropped).
         const N: usize = 16;
@@ -5797,7 +5904,7 @@ mod tests {
         );
 
         let mut report = SyncReport::default();
-        apply_upload_batch(engine.apply_worker(), changes, false, &mut report)
+        apply_upload_batch(engine.apply_worker(), changes, false, 4, 100, &mut report)
             .await
             .expect("batch upload must not abort the sync");
 
@@ -5819,11 +5926,11 @@ mod tests {
         }
 
         // Real concurrency happened (more than one file in flight) but never
-        // above the configured bound.
+        // above the configured bound (max_parallel = 4).
         let max = probe.max_concurrent();
         assert!(
-            (2..=APPLY_CONCURRENCY_LIMIT).contains(&max),
-            "upload batch max concurrency {max}, expected 2..={APPLY_CONCURRENCY_LIMIT}"
+            (2..=4).contains(&max),
+            "upload batch max concurrency {max}, expected 2..=4"
         );
     }
 
@@ -5872,7 +5979,7 @@ mod tests {
         );
 
         let mut report = SyncReport::default();
-        apply_download_batch(engine.apply_worker(), changes, false, &mut report)
+        apply_download_batch(engine.apply_worker(), changes, false, 4, 100, &mut report)
             .await
             .expect("batch download must not abort the sync");
 
@@ -5898,9 +6005,186 @@ mod tests {
 
         let max = probe.max_concurrent();
         assert!(
-            (2..=APPLY_CONCURRENCY_LIMIT).contains(&max),
-            "download batch max concurrency {max}, expected 2..={APPLY_CONCURRENCY_LIMIT}"
+            (2..=4).contains(&max),
+            "download batch max concurrency {max}, expected 2..=4"
         );
+    }
+
+    #[tokio::test]
+    async fn upload_batch_runs_serially_when_parallel_is_disabled() {
+        const N: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let mut changes = Vec::with_capacity(N);
+        let mut save_errors = std::collections::HashSet::new();
+        for i in 0..N {
+            let path = format!("ser{i}.txt");
+            std::fs::write(root.as_path().join(&path), format!("content-{i}")).unwrap();
+            changes.push(Change::local_created(path.clone(), format!("hash-{i}"), 8));
+            if i == 2 || i == 5 {
+                save_errors.insert(format!("prefix/{path}"));
+            }
+        }
+
+        let probe = std::sync::Arc::new(ConcurrencyProbe::default());
+        let canned = CannedCouch {
+            save_errors,
+            probe: Some(probe.clone()),
+            batch_delay: Some(std::time::Duration::from_millis(20)),
+            ..CannedCouch::default()
+        };
+        let engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let mut report = SyncReport::default();
+        // Concurrency 1 (what the engine derives when parallel=false) means
+        // applies never overlap: max in-flight is exactly one.
+        apply_upload_batch(engine.apply_worker(), changes, false, 1, 100, &mut report)
+            .await
+            .expect("batch upload must not abort the sync");
+
+        assert_eq!(report.uploaded.0, N, "all uploads accounted for");
+        assert_eq!(
+            report.errors.len(),
+            2,
+            "both serial-mode failures collected"
+        );
+        assert_eq!(
+            probe.max_concurrent(),
+            1,
+            "serial mode must never run more than one apply at once"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_batch_bounded_concurrency_across_multiple_batches_collects_every_error() {
+        // batch_size < N forces multiple scheduling waves; a couple of uploads
+        // fail inside each wave so we verify the concurrency bound holds across
+        // waves and every per-file error is still collected (none dropped).
+        const N: usize = 12;
+        const BATCH: usize = 5;
+        const CONCURRENCY: usize = 3;
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let mut changes = Vec::with_capacity(N);
+        let mut save_errors = std::collections::HashSet::new();
+        for i in 0..N {
+            let path = format!("mb{i}.txt");
+            std::fs::write(root.as_path().join(&path), format!("content-{i}")).unwrap();
+            changes.push(Change::local_created(path.clone(), format!("hash-{i}"), 8));
+            // Fail one file in each of the three waves.
+            if i == 1 || i == 7 || i == 11 {
+                save_errors.insert(format!("prefix/{path}"));
+            }
+        }
+
+        let probe = std::sync::Arc::new(ConcurrencyProbe::default());
+        let canned = CannedCouch {
+            save_errors,
+            probe: Some(probe.clone()),
+            batch_delay: Some(std::time::Duration::from_millis(20)),
+            ..CannedCouch::default()
+        };
+        let engine = SyncEngine::with_ignore(
+            test_canned_couch("prefix/", canned),
+            test_local_db(),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+
+        let mut report = SyncReport::default();
+        apply_upload_batch(
+            engine.apply_worker(),
+            changes,
+            false,
+            CONCURRENCY,
+            BATCH,
+            &mut report,
+        )
+        .await
+        .expect("batch upload must not abort the sync");
+
+        assert_eq!(
+            report.uploaded.0, N,
+            "all uploads accounted for across waves"
+        );
+        assert_eq!(
+            report.errors.len(),
+            3,
+            "one failure per wave collected across multiple batches"
+        );
+        for i in [1, 7, 11] {
+            let expected = format!("Upload mb{i}.txt: simulated save failure for prefix/mb{i}.txt");
+            assert!(
+                report.errors.iter().any(|e| e == &expected),
+                "multi-batch upload dropped the error for mb{i}.txt; got {:?}",
+                report.errors
+            );
+        }
+
+        // Bounded in every wave: in-flight never exceeds CONCURRENCY.
+        let max = probe.max_concurrent();
+        assert!(
+            (2..=CONCURRENCY).contains(&max),
+            "multi-batch upload max concurrency {max}, expected 2..={CONCURRENCY}"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_batch_size_fails_before_any_apply_work() {
+        let mut engine = SyncEngine::new(
+            test_couchdb(),
+            test_local_db(),
+            test_root("/tmp/apply-zbatch"),
+        )
+        .with_apply_settings(true, 4, 0);
+        let err = engine
+            .sync()
+            .await
+            .expect_err("zero batch_size must fail sync");
+        assert!(
+            err.to_string().contains("batch_size"),
+            "zero batch_size error should mention batch_size; got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_with_zero_max_parallel_fails_before_any_apply_work() {
+        let mut engine = SyncEngine::new(
+            test_couchdb(),
+            test_local_db(),
+            test_root("/tmp/apply-zmax"),
+        )
+        .with_apply_settings(true, 0, 100);
+        let err = engine
+            .sync()
+            .await
+            .expect_err("parallel with zero max_parallel must fail sync");
+        assert!(
+            err.to_string().contains("max_parallel"),
+            "zero max_parallel error should mention max_parallel; got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_parallel_with_zero_max_parallel_is_accepted() {
+        // max_parallel is meaningless when parallelism is off, so it is not a
+        // validation failure: applies run serially regardless.
+        let mut engine = SyncEngine::new(
+            test_canned_couch("prefix/", CannedCouch::default()),
+            test_local_db(),
+            test_root("/tmp/apply-serial-zmax"),
+        )
+        .with_apply_settings(false, 0, 100);
+        let report = engine
+            .sync()
+            .await
+            .expect("serial sync with max_parallel 0 must not fail");
+        assert_eq!(report.uploaded.0, 0);
     }
 
     #[test]
