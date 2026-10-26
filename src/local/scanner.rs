@@ -1348,7 +1348,7 @@ mod tests {
             !outcome.complete,
             "a missing sync root must produce an incomplete scan"
         );
-        assert!(outcome.states.is_empty());
+        assert_eq!(outcome.states, [] as [FileState; 0]);
     }
 
     /// A non-root permission failure inside a subtree must mark the whole scan
