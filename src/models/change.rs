@@ -26,6 +26,23 @@ pub enum ChangeSource {
     Remote,
 }
 
+/// Remote revision a local publication is authorized against.
+///
+/// Carried from the planning/triage decision into metadata publication so a
+/// stale baseline is rejected instead of overwriting a concurrent writer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExpectedRemote {
+    /// The remote doc should not exist yet (create). Presence of a doc is a
+    /// concurrent-creation race and must not be overwritten.
+    Absent,
+    /// The remote doc should be at exactly this revision (conditional
+    /// overwrite). Any other revision means a concurrent write happened.
+    At(String),
+    /// No expectation: overwrite whatever is on the remote. Only set by
+    /// explicit force paths (conflict resolution, remote rebuild).
+    Force,
+}
+
 /// A change record for sync operations - per-variant sum type preventing invalid combinations
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Change {
@@ -33,11 +50,13 @@ pub enum Change {
         path: String,
         hash: String,
         size: u64,
+        expected_rev: ExpectedRemote,
     },
     LocalModified {
         path: String,
         hash: String,
         size: u64,
+        expected_rev: ExpectedRemote,
     },
     LocalDeleted {
         path: String,
@@ -148,12 +167,22 @@ impl Change {
 
     #[must_use]
     pub const fn local_created(path: String, hash: String, size: u64) -> Self {
-        Self::LocalCreated { path, hash, size }
+        Self::LocalCreated {
+            path,
+            hash,
+            size,
+            expected_rev: ExpectedRemote::Force,
+        }
     }
 
     #[must_use]
     pub const fn local_modified(path: String, hash: String, size: u64) -> Self {
-        Self::LocalModified { path, hash, size }
+        Self::LocalModified {
+            path,
+            hash,
+            size,
+            expected_rev: ExpectedRemote::Force,
+        }
     }
 
     #[must_use]
@@ -202,6 +231,36 @@ impl Change {
         rev: Option<String>,
     ) -> Self {
         Self::RemoteDeleted { path, mtime, rev }
+    }
+
+    /// The expected remote revision carried by a local upload decision. Only
+    /// local create/modify changes carry a real expectation; every other
+    /// change (deletes, remote-origin changes) has no publication baseline and
+    /// defaults to [`ExpectedRemote::Force`].
+    #[must_use]
+    pub fn expected_rev(&self) -> ExpectedRemote {
+        match self {
+            Self::LocalCreated { expected_rev, .. } | Self::LocalModified { expected_rev, .. } => {
+                expected_rev.clone()
+            }
+            _ => ExpectedRemote::Force,
+        }
+    }
+
+    /// Override the expected remote revision for this local upload decision.
+    /// No-op for changes that are not local create/modify.
+    #[must_use]
+    pub fn with_expected_rev(mut self, expected_rev: ExpectedRemote) -> Self {
+        match &mut self {
+            Self::LocalCreated {
+                expected_rev: slot, ..
+            }
+            | Self::LocalModified {
+                expected_rev: slot, ..
+            } => *slot = expected_rev,
+            _ => {}
+        }
+        self
     }
 }
 

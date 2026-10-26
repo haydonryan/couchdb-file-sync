@@ -1,4 +1,4 @@
-use crate::models::{Change, ChangeType, FileState};
+use crate::models::{Change, ChangeType, ExpectedRemote, FileState};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
@@ -401,12 +401,25 @@ pub fn triage_changes<S: std::hash::BuildHasher>(
                         remote_change: Some((*rc).clone()),
                     });
                 } else {
-                    // Remote unchanged → upload local change
-                    result.uploads.push(lc.clone());
+                    // Remote unchanged → upload local change. Carry the
+                    // observed remote revision as the publication baseline so a
+                    // concurrent writer that lands between this decision and
+                    // the metadata save is rejected instead of overwritten. If
+                    // the remote change carries no revision (older/external
+                    // client), we cannot condition on one and fall back to an
+                    // unconditional overwrite.
+                    let expected = rc
+                        .rev()
+                        .map_or(ExpectedRemote::Force, |r| ExpectedRemote::At(r.to_string()));
+                    result.uploads.push(lc.clone().with_expected_rev(expected));
                 }
             }
-            // Remote absent → upload local change
-            None => result.uploads.push(lc.clone()),
+            // Remote absent → upload local change (create). The remote is
+            // expected to stay absent; a doc appearing between this decision
+            // and the metadata save is a concurrent-creation race.
+            None => result
+                .uploads
+                .push(lc.clone().with_expected_rev(ExpectedRemote::Absent)),
         }
     }
 
@@ -1041,6 +1054,9 @@ mod tests {
 
         assert_eq!(result.uploads.len(), 1);
         assert_eq!(result.uploads[0].path(), "f.txt");
+        // Create is planned against an absent remote; a doc appearing before
+        // publication is a concurrent-creation race, not a license to overwrite.
+        assert_eq!(result.uploads[0].expected_rev(), ExpectedRemote::Absent);
     }
 
     #[test]
@@ -1059,6 +1075,12 @@ mod tests {
         let result = triage_changes(&local, &remote, &states, "", std::path::Path::new(""));
 
         assert_eq!(result.uploads.len(), 1);
+        // Overwrite is planned against the observed remote revision; a remote
+        // edit landing between planning and publication must be rejected.
+        assert_eq!(
+            result.uploads[0].expected_rev(),
+            ExpectedRemote::At("1-abc".to_string())
+        );
     }
 
     // ── triage_changes: needs comparison when both changed ──────────
