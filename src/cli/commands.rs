@@ -3,7 +3,8 @@ use crate::couchdb::{ChangeFeedEntry, CouchDb};
 use crate::local::{AsyncFileWatcher, LocalDb};
 use crate::matrix::MatrixNotifier;
 use crate::models::{
-    Change, ChangeType, DatabaseName, IgnoreMatcher, RemotePath, ResolutionStrategy, SyncDirPath,
+    Change, ChangeType, DatabaseName, ExpectedRemote, IgnoreMatcher, RemotePath,
+    ResolutionStrategy, SyncDirPath,
 };
 use crate::sync::{SyncEngine, SyncReport, triage};
 use crate::telegram::TelegramNotifier;
@@ -1353,7 +1354,14 @@ async fn handle_remote_change(
                 touched.mark(&local_rel, SystemTime::now());
                 engine.apply_remote_change(&change).await?;
             } else {
-                let local_change = Change::local_modified(local_rel.clone(), String::new(), 0);
+                // Upload the local version to arbitrate. Carry the observed
+                // remote revision as the publication baseline so a further
+                // concurrent remote write landing during the upload is rejected
+                // (surfaced as an error) instead of silently overwritten.
+                let local_change = Change::local_modified(local_rel.clone(), String::new(), 0)
+                    .with_expected_rev(change.rev().map_or(ExpectedRemote::Force, |rev| {
+                        ExpectedRemote::At(rev.to_string())
+                    }));
                 engine.apply_local_change(&local_change).await?;
             }
         }
