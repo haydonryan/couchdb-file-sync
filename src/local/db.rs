@@ -3,7 +3,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tracing::info;
 
@@ -84,6 +84,19 @@ impl LocalDb {
                 remote_deleted BOOLEAN NOT NULL DEFAULT FALSE,
                 local_couch_rev TEXT,
                 local_last_sync_at TEXT
+            );
+
+            -- Per-channel conflict delivery state. Keyed by (channel, path,
+            -- generation) so each opted-in channel tracks its own deliveries,
+            -- a recurrent conflict at the same path (new generation) is
+            -- delivered again, and one channel's success never suppresses
+            -- another channel. The DB is per-root, so this is per-root too.
+            CREATE TABLE IF NOT EXISTS conflict_delivery (
+                channel TEXT NOT NULL,
+                path TEXT NOT NULL,
+                generation TEXT NOT NULL,
+                delivered_at TEXT NOT NULL,
+                PRIMARY KEY (channel, path, generation)
             );
 
             -- Sync checkpoint
@@ -407,6 +420,49 @@ impl LocalDb {
             params![path],
         )?;
         Ok(())
+    }
+
+    /// Record that a conflict was delivered on `channel` for a specific
+    /// `generation`. Delivery state is keyed by (channel, path, generation) so
+    /// each channel tracks its own deliveries, a recurrent conflict (new
+    /// generation) is delivered again, and one channel's success never
+    /// suppresses another channel. The DB is per-root, so this is per-root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the insert cannot be executed.
+    pub fn mark_conflict_delivered(
+        &self,
+        channel: &str,
+        path: &str,
+        generation: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO conflict_delivery (channel, path, generation, delivered_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![channel, path, generation, Utc::now()],
+        )?;
+        Ok(())
+    }
+
+    /// Return the set of `(path, generation)` pairs already delivered on
+    /// `channel`, so a caller can decide which conflicts are brand-new.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query against the local database fails.
+    pub fn delivered_conflicts(&self, channel: &str) -> Result<HashSet<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, generation FROM conflict_delivery WHERE channel = ?1")?;
+        let rows = stmt.query_map(params![channel], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut set = HashSet::new();
+        for row in rows {
+            set.insert(row?);
+        }
+        Ok(set)
     }
 
     /// Delete conflict
@@ -1217,6 +1273,47 @@ mod tests {
         let db = test_db();
         let result = db.mark_conflict_notified("/nonexistent");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_conflict_delivery_state_is_per_channel_and_generation() {
+        let db = test_db();
+
+        // Nothing delivered yet.
+        assert!(db.delivered_conflicts("telegram").unwrap().is_empty());
+        assert!(db.delivered_conflicts("matrix").unwrap().is_empty());
+
+        // Deliver on one channel; the other channel must remain independent.
+        db.mark_conflict_delivered("telegram", "/a.txt", "2")
+            .expect("mark telegram delivered");
+        assert_eq!(
+            db.delivered_conflicts("telegram").unwrap(),
+            HashSet::from([("/a.txt".to_string(), "2".to_string())])
+        );
+        assert!(
+            db.delivered_conflicts("matrix").unwrap().is_empty(),
+            "one channel's delivery must not suppress another"
+        );
+
+        // A new generation at the same path is a distinct delivery.
+        db.mark_conflict_delivered("telegram", "/a.txt", "3")
+            .expect("mark new generation");
+        assert_eq!(
+            db.delivered_conflicts("telegram").unwrap(),
+            HashSet::from([
+                ("/a.txt".to_string(), "2".to_string()),
+                ("/a.txt".to_string(), "3".to_string()),
+            ])
+        );
+
+        // Re-delivering the same (channel, path, generation) is idempotent.
+        db.mark_conflict_delivered("telegram", "/a.txt", "2")
+            .expect("re-deliver same generation");
+        assert_eq!(
+            db.delivered_conflicts("telegram").unwrap().len(),
+            2,
+            "re-delivery must not create a duplicate row"
+        );
     }
 
     // ── sync identity ────────────────────────────────────────────────────

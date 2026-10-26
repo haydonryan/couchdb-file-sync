@@ -5,6 +5,7 @@ pub mod local;
 pub mod logging;
 pub mod matrix;
 pub mod models;
+pub mod notify;
 pub mod sync;
 pub mod telegram;
 
