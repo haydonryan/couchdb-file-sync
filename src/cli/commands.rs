@@ -566,7 +566,8 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
         .with_orphan_chunk_collection(
             orphan_grace,
             u64::try_from(config.sync.batch_size).unwrap_or(1000),
-        );
+        )
+        .with_max_file_size(size_limit(&config));
     let report = if dry_run {
         engine.sync_dry_run().await?
     } else {
@@ -628,7 +629,8 @@ pub async fn rebuild_remote(path: PathBuf, config: AppConfig) -> Result<SyncRepo
     .await?;
     bind_sync_mapping(&local_db, &identity)?;
 
-    let mut engine = SyncEngine::with_ignore(couchdb, local_db, root, ignore_matcher);
+    let mut engine = SyncEngine::with_ignore(couchdb, local_db, root, ignore_matcher)
+        .with_max_file_size(size_limit(&config));
     let report = engine.rebuild_remote_from_local().await?;
     print_sync_report(&report, false);
 
@@ -670,7 +672,8 @@ pub async fn rebuild_local(path: PathBuf, config: AppConfig) -> Result<SyncRepor
     .await?;
     bind_sync_mapping(&local_db, &identity)?;
 
-    let mut engine = SyncEngine::with_ignore(couchdb, local_db, root, ignore_matcher);
+    let mut engine = SyncEngine::with_ignore(couchdb, local_db, root, ignore_matcher)
+        .with_max_file_size(size_limit(&config));
     let report = engine.rebuild_local_from_remote().await?;
     print_sync_report(&report, false);
 
@@ -1167,7 +1170,8 @@ async fn daemon_sync(
         .with_orphan_chunk_collection(
             orphan_grace,
             u64::try_from(config.sync.batch_size).unwrap_or(1000),
-        );
+        )
+        .with_max_file_size(size_limit(config));
     let report = engine.sync().await?;
 
     print_sync_report(&report, false);
@@ -1784,6 +1788,12 @@ async fn run_live_loop(
     }
 }
 
+/// Effective per-file size limit from config: `0` (or unset default) means
+/// unlimited, any positive value bounds the largest file sync will transfer.
+fn size_limit(config: &AppConfig) -> Option<u64> {
+    (config.sync.max_file_size > 0).then_some(config.sync.max_file_size)
+}
+
 async fn build_live_sync_engine(
     path: &Path,
     config: &AppConfig,
@@ -1824,7 +1834,8 @@ async fn build_live_sync_engine(
             (config.sync.orphan_chunk_grace_secs > 0)
                 .then(|| std::time::Duration::from_secs(config.sync.orphan_chunk_grace_secs)),
             u64::try_from(config.sync.batch_size).unwrap_or(1000),
-        );
+        )
+        .with_max_file_size(size_limit(config));
 
     Ok((ignore_matcher, engine))
 }
@@ -3678,5 +3689,19 @@ mod tests {
                 .is_some(),
             "edit landed during bootstrap must be reconciled after bootstrap"
         );
+    }
+
+    // ── Configured file-size limit (zero = unlimited) ─────────────────────
+    #[test]
+    fn size_limit_zero_means_unlimited() {
+        // Zero (documented as unlimited) must yield no bound.
+        let mut unlimited = AppConfig::default();
+        unlimited.sync.max_file_size = 0;
+        assert_eq!(size_limit(&unlimited), None);
+
+        // Any positive value becomes an enforced bound.
+        let mut bounded = AppConfig::default();
+        bounded.sync.max_file_size = 4096;
+        assert_eq!(size_limit(&bounded), Some(4096));
     }
 }
