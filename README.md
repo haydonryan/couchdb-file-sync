@@ -201,6 +201,24 @@ logging:
   rotation: daily-delete  # never, daily-keep, daily-delete
 ```
 
+#### Remote path prefix
+
+The `remote` value on each path (or the `couchdb.remote_path` for a single-path
+setup) is the remote document prefix that scope syncs. An **empty value or `"/"`
+both mean the whole database** (no prefix); any other value is normalized to a
+trailing-slash, leading-slash-free form (`"notes"` and `"/notes/"` both become
+`"notes/"`).
+
+Local sync state (file states, conflicts, and the change-feed checkpoint) is
+**bound to the validated sync mapping**: the canonical local root, the remote
+database name, the remote database UUID, and the normalized prefix. If any of
+those change (for example, you point the same directory at a different prefix,
+a different database, or a recreated database), the old state is **not** reused.
+The affected command errors and asks you to run `couchdb-file-sync
+rebuild-remote` or `rebuild-local` — the sanctioned explicit reset for the new
+mapping. The daemon also refuses to start if two configured paths resolve to
+the same canonical root.
+
 ## CLI Commands
 
 ### `couchdb-file-sync init [PATH]`

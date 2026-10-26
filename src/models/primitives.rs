@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 use std::str::FromStr;
 
@@ -89,11 +90,28 @@ impl FromStr for DatabaseName {
 pub struct RemotePath(String);
 
 impl RemotePath {
+    /// Build a remote path prefix from raw configuration input.
+    ///
+    /// # Documented contract
+    ///
+    /// The empty string and `"/"` both mean the whole database (no remote
+    /// prefix). Any other value is normalized to a single, leading-slash-free,
+    /// trailing-slash form (`"notes"` → `"notes/"`, `"/notes/"` → `"notes/"`),
+    /// so equivalent spellings always compare equal and never silently select
+    /// a different sync scope.
     pub fn new(path: impl Into<String>) -> Self {
-        let mut p = path.into();
-        // Normalize: ensure it ends with / if not empty
-        if !p.is_empty() && !p.ends_with('/') {
-            p.push('/');
+        let mut p = path.into().trim().to_string();
+        // Whole-database: empty and "/" are the same documented contract.
+        if p.is_empty() || p == "/" || p == "\\" {
+            p.clear();
+        } else {
+            // Strip any leading slashes so the prefix is relative to the DB root.
+            while p.starts_with('/') {
+                p.remove(0);
+            }
+            if !p.ends_with('/') {
+                p.push('/');
+            }
         }
         Self(p)
     }
@@ -101,6 +119,44 @@ impl RemotePath {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// The validated sync mapping that a local state database is bound to.
+///
+/// Stored state (file states, conflicts, and the change-feed checkpoint) is
+/// only ever reused when the mapping that produced it matches the mapping the
+/// engine is about to sync. The identity is the canonical local root, the
+/// remote database name, the remote database UUID (which changes when the
+/// database is recreated), and the normalized remote prefix. Changing any of
+/// these means the stored state belongs to a different sync scope and must not
+/// be reused without an explicit reset/rebuild.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncIdentity {
+    /// Canonical (symlink-resolved) local sync root.
+    pub root: String,
+    /// Remote `CouchDB` database name.
+    pub database: String,
+    /// Remote `CouchDB` database UUID; changes when the database is recreated.
+    pub db_uuid: String,
+    /// Normalized remote path prefix (empty = whole database).
+    pub prefix: String,
+}
+
+impl SyncIdentity {
+    #[must_use]
+    pub fn new(
+        root: impl Into<String>,
+        database: impl Into<String>,
+        db_uuid: impl Into<String>,
+        prefix: impl Into<String>,
+    ) -> Self {
+        Self {
+            root: root.into(),
+            database: database.into(),
+            db_uuid: db_uuid.into(),
+            prefix: prefix.into(),
+        }
     }
 }
 
@@ -233,5 +289,47 @@ mod compile_tests {
         // UploadCount/DownloadCount wrap usize
         // DatabaseName/RemotePath wrap String
         // So accidental assignment across these will fail to compile.
+    }
+
+    #[test]
+    fn remote_path_documented_contract() {
+        // Whole-database: empty and "/" are the same documented contract.
+        assert_eq!(RemotePath::new("").as_str(), "");
+        assert_eq!(RemotePath::new("/").as_str(), "");
+        assert_eq!(RemotePath::new("  ").as_str(), "");
+        assert_eq!(RemotePath::new(" / ").as_str(), "");
+
+        // Non-root prefixes normalize to a leading-slash-free, trailing-slash
+        // form so equivalent spellings always compare equal.
+        assert_eq!(RemotePath::new("notes").as_str(), "notes/");
+        assert_eq!(RemotePath::new("notes/").as_str(), "notes/");
+        assert_eq!(RemotePath::new("/notes").as_str(), "notes/");
+        assert_eq!(RemotePath::new("/notes/").as_str(), "notes/");
+        assert_eq!(RemotePath::new("obsidian/sub").as_str(), "obsidian/sub/");
+    }
+
+    #[test]
+    fn sync_identity_roundtrips_through_serde() {
+        let id = SyncIdentity::new("/srv/sync-root", "files_db", "a1b2c3-uuid", "notes/");
+        let raw = serde_json::to_string(&id).unwrap();
+        let back: SyncIdentity = serde_json::from_str(&raw).unwrap();
+        assert_eq!(id, back);
+        assert_eq!(back.root, "/srv/sync-root");
+        assert_eq!(back.database, "files_db");
+        assert_eq!(back.db_uuid, "a1b2c3-uuid");
+        assert_eq!(back.prefix, "notes/");
+    }
+
+    #[test]
+    fn sync_identity_equality_catches_every_scope_change() {
+        let base = SyncIdentity::new("/root", "db", "uuid-1", "old/");
+        let new_root = SyncIdentity::new("/other", "db", "uuid-1", "old/");
+        let new_db = SyncIdentity::new("/root", "other_db", "uuid-1", "old/");
+        let new_uuid = SyncIdentity::new("/root", "db", "uuid-2", "old/");
+        let new_prefix = SyncIdentity::new("/root", "db", "uuid-1", "new/");
+        assert_ne!(base, new_root);
+        assert_ne!(base, new_db);
+        assert_ne!(base, new_uuid);
+        assert_ne!(base, new_prefix);
     }
 }
