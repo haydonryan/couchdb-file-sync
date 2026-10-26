@@ -78,7 +78,12 @@ impl LocalDb {
                 remote_modified_at TEXT NOT NULL,
                 remote_couch_rev TEXT NOT NULL,
                 detected_at TEXT NOT NULL,
-                notified BOOLEAN DEFAULT FALSE
+                notified BOOLEAN DEFAULT FALSE,
+                -- Faithful conflict baseline. Added by schema migration for
+                -- pre-existing databases; new databases create them directly.
+                remote_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+                local_couch_rev TEXT,
+                local_last_sync_at TEXT
             );
 
             -- Sync checkpoint
@@ -92,7 +97,40 @@ impl LocalDb {
             CREATE INDEX IF NOT EXISTS idx_conflicts_notified ON conflicts(notified);
             ",
         )?;
+        self.migrate_schema()?;
         Ok(())
+    }
+
+    /// Add columns to pre-existing databases created before the faithful
+    /// conflict-baseline columns existed. Backwards-compatible: existing
+    /// conflicts and checkpoints are left intact, and only the missing
+    /// baseline columns are added. Fresh databases already contain them, so
+    /// this is a no-op.
+    fn migrate_schema(&self) -> Result<()> {
+        let cols = self.column_names("conflicts")?;
+        if !cols.iter().any(|c| c == "remote_deleted") {
+            self.conn.execute_batch(
+                "ALTER TABLE conflicts ADD COLUMN remote_deleted BOOLEAN NOT NULL DEFAULT FALSE",
+            )?;
+        }
+        if !cols.iter().any(|c| c == "local_couch_rev") {
+            self.conn
+                .execute_batch("ALTER TABLE conflicts ADD COLUMN local_couch_rev TEXT")?;
+        }
+        if !cols.iter().any(|c| c == "local_last_sync_at") {
+            self.conn
+                .execute_batch("ALTER TABLE conflicts ADD COLUMN local_last_sync_at TEXT")?;
+        }
+        Ok(())
+    }
+
+    /// Column names of a table, from `PRAGMA table_info`.
+    fn column_names(&self, table: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(names)
     }
 
     // === File State Operations ===
@@ -285,8 +323,9 @@ impl LocalDb {
             "INSERT OR REPLACE INTO conflicts 
              (path, local_hash, local_size, local_modified_at,
               remote_hash, remote_size, remote_modified_at, remote_couch_rev,
-              detected_at, notified)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              detected_at, notified, remote_deleted, local_couch_rev,
+              local_last_sync_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 &conflict.path,
                 &conflict.local_state.hash,
@@ -298,6 +337,9 @@ impl LocalDb {
                 &conflict.remote_state.couch_rev,
                 &conflict.detected_at,
                 conflict.is_notified(),
+                conflict.remote_state.deleted,
+                conflict.local_state.couch_rev.as_deref(),
+                &conflict.local_state.last_sync_at,
             ],
         )?;
         Ok(())
@@ -313,41 +355,13 @@ impl LocalDb {
         let mut stmt = self.conn.prepare(
             "SELECT path, local_hash, local_size, local_modified_at,
                     remote_hash, remote_size, remote_modified_at, remote_couch_rev,
-                    detected_at, notified
+                    detected_at, notified, remote_deleted, local_couch_rev,
+                    local_last_sync_at
              FROM conflicts ORDER BY detected_at DESC",
         )?;
 
         let conflicts = stmt
-            .query_map([], |row| {
-                use crate::models::RemoteState;
-
-                let path: String = row.get(0)?;
-                let local_state = FileState {
-                    path: path.clone(),
-                    hash: row.get(1)?,
-                    size: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
-                    modified_at: row.get(3)?,
-                    couch_rev: None,
-                    last_sync_at: Utc::now(),
-                };
-
-                let remote_state = RemoteState {
-                    hash: row.get(4)?,
-                    size: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
-                    modified_at: row.get(6)?,
-                    couch_rev: CouchRev::new(row.get::<_, String>(7)?.as_str()).unwrap_or_default(),
-                    deleted: false,
-                };
-
-                let mut conflict = Conflict::new(path, local_state, remote_state);
-                conflict.detected_at = row.get(8)?;
-                let notified: bool = row.get(9)?;
-                if notified {
-                    conflict.notification_mode = crate::models::NotificationMode::Notified;
-                }
-
-                Ok(conflict)
-            })?
+            .query_map([], row_to_conflict)?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(conflicts)
@@ -363,42 +377,12 @@ impl LocalDb {
         let mut stmt = self.conn.prepare(
             "SELECT path, local_hash, local_size, local_modified_at,
                     remote_hash, remote_size, remote_modified_at, remote_couch_rev,
-                    detected_at, notified
+                    detected_at, notified, remote_deleted, local_couch_rev,
+                    local_last_sync_at
              FROM conflicts WHERE path = ?",
         )?;
 
-        let conflict = stmt
-            .query_row(params![path], |row| {
-                use crate::models::RemoteState;
-
-                let path: String = row.get(0)?;
-                let local_state = FileState {
-                    path: path.clone(),
-                    hash: row.get(1)?,
-                    size: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
-                    modified_at: row.get(3)?,
-                    couch_rev: None,
-                    last_sync_at: Utc::now(),
-                };
-
-                let remote_state = RemoteState {
-                    hash: row.get(4)?,
-                    size: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
-                    modified_at: row.get(6)?,
-                    couch_rev: CouchRev::new(row.get::<_, String>(7)?.as_str()).unwrap_or_default(),
-                    deleted: false,
-                };
-
-                let mut conflict = Conflict::new(path, local_state, remote_state);
-                conflict.detected_at = row.get(8)?;
-                let notified: bool = row.get(9)?;
-                if notified {
-                    conflict.notification_mode = crate::models::NotificationMode::Notified;
-                }
-
-                Ok(conflict)
-            })
-            .optional()?;
+        let conflict = stmt.query_row(params![path], row_to_conflict).optional()?;
 
         Ok(conflict)
     }
@@ -508,6 +492,49 @@ fn u64_to_i64(value: u64) -> Result<i64> {
     Ok(i64::try_from(value)?)
 }
 
+/// Map a `conflicts` row to a [`Conflict`], shared by both conflict lookup
+/// APIs so they always agree. Reads back the persisted baseline faithfully:
+/// the remote deletion flag, the local couch revision, and the local
+/// `last_sync_at`. Pre-migration rows (added before these columns existed)
+/// have NULL local baseline; their `last_sync_at` falls back to the stored
+/// `detected_at` rather than fabricating a current timestamp.
+fn row_to_conflict(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conflict> {
+    use crate::models::{NotificationMode, RemoteState};
+
+    let path: String = row.get(0)?;
+    let detected_at: DateTime<Utc> = row.get(8)?;
+    let local_state = FileState {
+        path: path.clone(),
+        hash: row.get(1)?,
+        size: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+        modified_at: row.get(3)?,
+        couch_rev: row
+            .get::<_, Option<String>>(11)?
+            .as_deref()
+            .and_then(CouchRev::new),
+        last_sync_at: row
+            .get::<_, Option<DateTime<Utc>>>(12)?
+            .unwrap_or(detected_at),
+    };
+
+    let remote_state = RemoteState {
+        hash: row.get(4)?,
+        size: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+        modified_at: row.get(6)?,
+        couch_rev: CouchRev::new(row.get::<_, String>(7)?.as_str()).unwrap_or_default(),
+        deleted: row.get(10)?,
+    };
+
+    let mut conflict = Conflict::new(path, local_state, remote_state);
+    conflict.detected_at = detected_at;
+    let notified: bool = row.get(9)?;
+    if notified {
+        conflict.notification_mode = NotificationMode::Notified;
+    }
+
+    Ok(conflict)
+}
+
 fn i64_to_u64(value: i64) -> rusqlite::Result<u64> {
     u64::try_from(value).map_err(|_| {
         let err = std::io::Error::new(std::io::ErrorKind::InvalidData, "negative size");
@@ -540,6 +567,25 @@ mod tests {
             modified_at: Utc::now(),
             couch_rev: crate::models::CouchRev::new("1-abc").unwrap(),
             deleted: false,
+        };
+        Conflict::new(path.to_string(), local, remote)
+    }
+
+    fn make_conflict_with_baseline(
+        path: &str,
+        local_couch_rev: Option<&str>,
+        local_last_sync_at: DateTime<Utc>,
+        remote_deleted: bool,
+    ) -> Conflict {
+        let mut local = make_file_state(path);
+        local.couch_rev = local_couch_rev.and_then(crate::models::CouchRev::new);
+        local.last_sync_at = local_last_sync_at;
+        let remote = crate::models::RemoteState {
+            hash: "remote_hash".to_string(),
+            size: 4096,
+            modified_at: Utc::now(),
+            couch_rev: crate::models::CouchRev::new("1-abc").unwrap(),
+            deleted: remote_deleted,
         };
         Conflict::new(path.to_string(), local, remote)
     }
@@ -777,6 +823,184 @@ mod tests {
 
         let loaded = db.get_conflict("/test/conflict.txt").expect("get_conflict");
         assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn test_conflict_baseline_round_trip_edit_edit() {
+        let db = test_db();
+        // A non-null local couch_rev and a non-now last_sync_at must survive
+        // write/read faithfully through both lookup APIs, so neither is
+        // synthesized on the way out.
+        let last_sync =
+            chrono::DateTime::from_timestamp(1_700_000_000, 123_456_789).expect("valid ts");
+        let conflict = make_conflict_with_baseline("/e/e.txt", Some("1-abc"), last_sync, false);
+        db.store_conflict(&conflict).expect("store_conflict");
+
+        let from_list = db.get_conflicts().expect("get_conflicts");
+        assert_eq!(from_list.len(), 1);
+        let from_by_path = db
+            .get_conflict("/e/e.txt")
+            .expect("get_conflict")
+            .expect("present");
+
+        for loaded in [&from_list[0], &from_by_path] {
+            assert!(!loaded.remote_state.deleted);
+            assert_eq!(loaded.local_state.couch_rev.as_deref(), Some("1-abc"));
+            assert_eq!(loaded.local_state.last_sync_at, last_sync);
+            assert_eq!(loaded.local_state.hash, "abc123");
+            assert_eq!(loaded.remote_state.hash, "remote_hash");
+            assert_eq!(loaded.remote_state.size, 4096);
+        }
+        assert_eq!(from_list[0].local_state, from_by_path.local_state);
+    }
+
+    #[test]
+    fn test_conflict_baseline_round_trip_edit_delete() {
+        let db = test_db();
+        // The remote deletion flag (edit/delete conflict) must round-trip as
+        // true instead of being hard-coded back to false on read.
+        let last_sync =
+            chrono::DateTime::from_timestamp(1_700_000_100, 987_654_321).expect("valid ts");
+        let conflict = make_conflict_with_baseline("/e/d.txt", Some("2-def"), last_sync, true);
+        db.store_conflict(&conflict).expect("store_conflict");
+
+        let from_list = db.get_conflicts().expect("get_conflicts");
+        assert_eq!(from_list.len(), 1);
+        let from_by_path = db
+            .get_conflict("/e/d.txt")
+            .expect("get_conflict")
+            .expect("present");
+
+        for loaded in [&from_list[0], &from_by_path] {
+            assert!(loaded.remote_state.deleted);
+            assert_eq!(loaded.local_state.couch_rev.as_deref(), Some("2-def"));
+            assert_eq!(loaded.local_state.last_sync_at, last_sync);
+        }
+        assert_eq!(from_list[0].local_state, from_by_path.local_state);
+    }
+
+    #[test]
+    fn test_conflict_baseline_survives_reopen() {
+        // The baseline must survive a full close/reopen of the database file.
+        let db_path =
+            std::env::temp_dir().join(format!("conflict_reopen_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db_path);
+
+        {
+            let db = LocalDb::open(&db_path).expect("open");
+            let last_sync =
+                chrono::DateTime::from_timestamp(1_700_000_000, 123_456_789).expect("valid ts");
+            db.store_conflict(&make_conflict_with_baseline(
+                "/reopen.txt",
+                Some("3-ghi"),
+                last_sync,
+                true,
+            ))
+            .expect("store_conflict");
+        }
+
+        let db = LocalDb::open(&db_path).expect("reopen");
+        let loaded = db
+            .get_conflict("/reopen.txt")
+            .expect("get_conflict")
+            .expect("present");
+        assert!(loaded.remote_state.deleted);
+        assert_eq!(loaded.local_state.couch_rev.as_deref(), Some("3-ghi"));
+        assert_eq!(
+            loaded.local_state.last_sync_at,
+            chrono::DateTime::from_timestamp(1_700_000_000, 123_456_789).expect("valid ts")
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_old_schema_migration_preserves_conflicts_and_checkpoint() {
+        // A database created before the baseline columns existed must migrate
+        // in place: conflicts and checkpoints survive, and only the missing
+        // baseline columns are added.
+        let db_path =
+            std::env::temp_dir().join(format!("conflict_migration_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db_path);
+
+        // Build a pre-migration database by hand (old conflicts schema).
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open raw conn");
+            conn.execute_batch(
+                r"
+                CREATE TABLE file_states (
+                    path TEXT PRIMARY KEY, hash TEXT NOT NULL, size INTEGER NOT NULL,
+                    modified_at TEXT NOT NULL, couch_rev TEXT, last_sync_at TEXT NOT NULL
+                );
+                CREATE TABLE conflicts (
+                    path TEXT PRIMARY KEY,
+                    local_hash TEXT NOT NULL,
+                    local_size INTEGER NOT NULL,
+                    local_modified_at TEXT NOT NULL,
+                    remote_hash TEXT NOT NULL,
+                    remote_size INTEGER NOT NULL,
+                    remote_modified_at TEXT NOT NULL,
+                    remote_couch_rev TEXT NOT NULL,
+                    detected_at TEXT NOT NULL,
+                    notified BOOLEAN DEFAULT FALSE
+                );
+                CREATE TABLE sync_checkpoint (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    last_seq TEXT,
+                    last_sync_at TEXT NOT NULL
+                );
+                ",
+            )
+            .expect("create old schema");
+            conn.execute(
+                "INSERT INTO conflicts
+                 (path, local_hash, local_size, local_modified_at,
+                  remote_hash, remote_size, remote_modified_at, remote_couch_rev,
+                  detected_at, notified)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    "/old.txt",
+                    "oldlocal",
+                    10_i64,
+                    "2024-01-01T00:00:00Z",
+                    "oldremote",
+                    20_i64,
+                    "2024-01-02T00:00:00Z",
+                    "1-abc",
+                    "2024-01-03T00:00:00Z",
+                    false,
+                ],
+            )
+            .expect("insert old conflict");
+            conn.execute(
+                "INSERT INTO sync_checkpoint (id, last_seq, last_sync_at)
+                 VALUES (1, 'seq-1', '2024-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert checkpoint");
+        }
+
+        let db = LocalDb::open(&db_path).expect("open migrated db");
+
+        let conflicts = db.get_conflicts().expect("get_conflicts");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, "/old.txt");
+        assert_eq!(conflicts[0].local_state.hash, "oldlocal");
+        assert_eq!(conflicts[0].remote_state.hash, "oldremote");
+        assert_eq!(conflicts[0].remote_state.couch_rev.as_str(), "1-abc");
+        // Pre-migration rows carry no stored deletion flag (not deleted) and
+        // their last_sync_at falls back to the stored detected_at — never a
+        // fabricated current timestamp.
+        assert!(!conflicts[0].remote_state.deleted);
+        assert_eq!(
+            conflicts[0].local_state.last_sync_at,
+            conflicts[0].detected_at
+        );
+
+        let cp = db.get_checkpoint().expect("get_checkpoint");
+        assert_eq!(cp.expect("checkpoint present").last_seq, "seq-1");
+
+        let _ = std::fs::remove_file(&db_path);
     }
 
     #[test]
