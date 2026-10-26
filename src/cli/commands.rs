@@ -3783,7 +3783,7 @@ mod tests {
         );
 
         let report = engine.sync().await.expect("reconciliation sync");
-        assert!(report.errors.is_empty());
+        assert_eq!(report.errors, [] as [String; 0]);
         assert!(
             report.uploaded.0 >= 1,
             "overflow-dropped create must converge"
