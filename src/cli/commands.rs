@@ -1,3 +1,4 @@
+use crate::cli::root_lock::{LOCK_WAIT_TIMEOUT, RootLock};
 use crate::config::{
     AppConfig, ConflictStrategy, IgnoreConfig, SyncPath, default_user_config_file,
 };
@@ -189,14 +190,52 @@ fn install_binary(current_exe: &Path, target_binary: &Path) -> Result<()> {
         return Ok(());
     }
 
-    fs::copy(current_exe, target_binary).with_context(|| {
-        format!(
-            "Failed to copy {} to {}",
-            current_exe.display(),
-            target_binary.display()
-        )
-    })?;
-    set_mode(target_binary, 0o755)?;
+    let parent = target_binary
+        .parent()
+        .context("Target binary has no parent directory")?;
+    let file_name = target_binary
+        .file_name()
+        .context("Target binary has no file name")?;
+
+    // Stage into the same directory as the target so the final rename is an
+    // atomic same-filesystem operation. A running Linux executable is never
+    // overwritten in place (that yields ETXTBSY): the rename simply points the
+    // path at the new inode while the running process keeps the old one.
+    let mut staging_name = std::ffi::OsString::from(".");
+    staging_name.push(file_name);
+    staging_name.push(format!(".new-{}", std::process::id()));
+    let staging = parent.join(staging_name);
+
+    let staged = (|| -> Result<()> {
+        fs::copy(current_exe, &staging).with_context(|| {
+            format!(
+                "Failed to stage {} to {}",
+                current_exe.display(),
+                staging.display()
+            )
+        })?;
+        set_mode(&staging, 0o755)?;
+        Ok(())
+    })();
+
+    if let Err(err) = staged {
+        let _ = fs::remove_file(&staging);
+        return Err(err);
+    }
+
+    // Atomic replace. On failure the original target is left untouched (the
+    // rename either fully lands or leaves the old file in place), and the
+    // staged copy is cleaned up.
+    if let Err(err) = fs::rename(&staging, target_binary) {
+        let _ = fs::remove_file(&staging);
+        return Err(err).with_context(|| {
+            format!(
+                "Failed to atomically replace {} with staged {}",
+                target_binary.display(),
+                staging.display()
+            )
+        });
+    }
     Ok(())
 }
 
@@ -241,7 +280,10 @@ fn write_service_file(paths: &InstallPaths) -> Result<()> {
 
 fn reload_and_enable_service() -> Result<()> {
     run_systemctl_user(&["daemon-reload"])?;
+    // `enable --now` does not restart an already-active service, so an upgrade
+    // must explicitly restart after all install artifacts have validated.
     run_systemctl_user(&["enable", "--now", SYSTEMD_UNIT_NAME])?;
+    run_systemctl_user(&["restart", SYSTEMD_UNIT_NAME])?;
     Ok(())
 }
 
@@ -251,7 +293,7 @@ fn stop_and_disable_service() -> Result<()> {
 }
 
 fn run_systemctl_user(args: &[&str]) -> Result<()> {
-    let status = Command::new("systemctl")
+    let status = Command::new(systemctl_path())
         .args(["--user"])
         .args(args)
         .status()
@@ -269,7 +311,7 @@ fn run_systemctl_user(args: &[&str]) -> Result<()> {
 }
 
 fn run_systemctl_user_ignore_missing(args: &[&str]) -> Result<()> {
-    let status = Command::new("systemctl")
+    let status = Command::new(systemctl_path())
         .args(["--user"])
         .args(args)
         .status()
@@ -279,7 +321,7 @@ fn run_systemctl_user_ignore_missing(args: &[&str]) -> Result<()> {
         return Ok(());
     }
 
-    let missing_status = Command::new("systemctl")
+    let missing_status = Command::new(systemctl_path())
         .args(["--user", "status", SYSTEMD_UNIT_NAME])
         .status()
         .with_context(|| format!("Failed to run systemctl --user status {SYSTEMD_UNIT_NAME}"))?;
@@ -292,6 +334,16 @@ fn run_systemctl_user_ignore_missing(args: &[&str]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Resolve the `systemctl` binary to invoke, defaulting to `systemctl` on
+/// `PATH`. Overridable via `COUCHDB_FILE_SYNC_SYSTEMCTL` (e.g. for tests, or
+/// container/embedded environments with a custom systemd shim).
+fn systemctl_path() -> PathBuf {
+    std::env::var_os("COUCHDB_FILE_SYNC_SYSTEMCTL")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| PathBuf::from("systemctl"))
 }
 
 fn render_systemd_service(paths: &InstallPaths) -> String {
@@ -311,9 +363,9 @@ Environment=PATH={}
 [Install]
 WantedBy=default.target
 ",
-        shell_quote(&paths.binary_path),
-        shell_quote(&paths.config_file),
-        shell_quote_path_list(&[
+        systemd_quote(&paths.binary_path.to_string_lossy()),
+        systemd_quote(&paths.config_file.to_string_lossy()),
+        systemd_quote_path_list(&[
             paths.bin_dir.clone(),
             PathBuf::from("/usr/local/bin"),
             PathBuf::from("/usr/bin"),
@@ -322,22 +374,33 @@ WantedBy=default.target
     )
 }
 
-fn shell_quote(path: &Path) -> String {
-    let value = path.to_string_lossy();
-    if value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || b"/._-:@".contains(&byte))
-    {
-        value.into_owned()
-    } else {
-        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+/// Quote a value for use on a systemd unit's `ExecStart=` (or `Environment=`)
+/// line so that spaces, quotes, backslashes, percent specifiers and dollar
+/// variables are interpreted literally by systemd.
+///
+/// Unlike a plain shell quote, this must also neutralise systemd's own
+/// expansion: `%` begins a specifier (e.g. `%h`) and `$` begins an environment
+/// variable reference, so both are doubled (`%%`, `$$`) to render literally.
+fn systemd_quote(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '%' => escaped.push_str("%%"),
+            '$' => escaped.push_str("$$"),
+            other => escaped.push(other),
+        }
     }
+    escaped.push('"');
+    escaped
 }
 
-fn shell_quote_path_list(paths: &[PathBuf]) -> String {
+fn systemd_quote_path_list(paths: &[PathBuf]) -> String {
     let joined = std::env::join_paths(paths.iter().map(PathBuf::as_path))
         .unwrap_or_else(|_| OsString::from("/usr/local/bin:/usr/bin:/bin"));
-    shell_quote(Path::new(&joined))
+    systemd_quote(&joined.to_string_lossy())
 }
 
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
@@ -543,6 +606,16 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
     // any sync work begins.
     validate_conflict_policy(&config)?;
 
+    // A mutating sync takes the root lock so no other process (daemon, manual
+    // sync, rebuild, or resolve) races the same state DB and filesystem. A
+    // dry-run is read-only and intentionally does not lock, keeping it
+    // available while a mutator owns the root.
+    let _root_lock = if dry_run {
+        None
+    } else {
+        Some(acquire_root_lock(&path)?)
+    };
+
     // Load ignore patterns
     let ignore_matcher = load_ignore_patterns(&path, &config)?;
 
@@ -676,6 +749,7 @@ pub async fn rebuild_remote(path: PathBuf, config: AppConfig) -> Result<SyncRepo
     info!("Rebuilding remote from local in: {}", path.display());
 
     validate_conflict_policy(&config)?;
+    let _root_lock = acquire_root_lock(&path)?;
 
     let ignore_matcher = load_ignore_patterns(&path, &config)?;
     let db_path = state_db_path(&path);
@@ -721,6 +795,7 @@ pub async fn rebuild_local(path: PathBuf, config: AppConfig) -> Result<SyncRepor
     info!("Rebuilding local from remote in: {}", path.display());
 
     validate_conflict_policy(&config)?;
+    let _root_lock = acquire_root_lock(&path)?;
 
     let ignore_matcher = load_ignore_patterns(&path, &config)?;
     let db_path = state_db_path(&path);
@@ -1037,6 +1112,16 @@ pub async fn daemon(
 
     // Fail closed on an unsupported conflict policy before any worker starts.
     validate_conflict_policy(&config)?;
+
+    // Own every root's lock for the daemon's whole lifetime so a manual
+    // sync/rebuild/resolve cannot race the daemon's per-tick mutations. The
+    // guards live until the daemon exits (or is killed, at which point the OS
+    // releases the locks). `_root_locks` is never read; holding it alive is
+    // the entire point (RootLock's Drop releases each lock).
+    let _root_locks: Vec<RootLock> = paths
+        .iter()
+        .map(|sync_path| acquire_root_lock(&sync_path.local))
+        .collect::<Result<_>>()?;
 
     let path_list: Vec<_> = paths
         .iter()
@@ -2463,6 +2548,7 @@ pub fn conflicts(path: &Path, json: bool) -> Result<()> {
 /// cannot be resolved.
 #[allow(clippy::too_many_lines)] // large interactive resolution flow; per-conflict UI dominates
 pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
+    let _root_lock = acquire_root_lock(&path)?;
     let db_path = state_db_path(&path);
     let local_db = LocalDb::open(&db_path)?;
 
@@ -2826,6 +2912,26 @@ fn state_dir(root: &Path) -> PathBuf {
 
 fn state_db_path(root: &Path) -> PathBuf {
     state_dir(root).join("state.db")
+}
+
+/// Acquire the OS-backed root lock for a mutating command over `path`.
+///
+/// The lock file lives in the canonical root's state directory, so any two
+/// processes that canonicalize to the same root (regardless of path spelling
+/// or symlink aliases) contend on the same file. Read-only commands (`status`,
+/// `conflicts`, `sync --dry-run`) never call this and therefore stay available
+/// while a mutator owns the root.
+///
+/// # Errors
+///
+/// Returns an error if the state directory cannot be created or the lock is
+/// still held by another process after the bounded wait.
+fn acquire_root_lock(path: &Path) -> Result<RootLock> {
+    let root = resolve_sync_dir(path)?;
+    let dir = state_dir(root.as_path());
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("cannot create state directory {}", dir.display()))?;
+    RootLock::acquire(&dir.join("sync.lock"), root.as_path(), LOCK_WAIT_TIMEOUT)
 }
 
 /// Render the human-facing sync report as a string.
@@ -4450,6 +4556,284 @@ mod tests {
         assert!(
             db.delivered_conflicts("telegram").unwrap().is_empty(),
             "timed-out delivery must stay retryable"
+        );
+    }
+
+    // ── install/uninstall (systemd user service) ──────────────────────────
+
+    /// Global mutex serializing tests that mutate process environment
+    /// variables, mirroring the pattern in `main.rs` tests.
+    static INSTALL_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    fn restore_env_var(key: &str, previous: Option<std::ffi::OsString>) {
+        match previous {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    fn assert_no_staging_residue(dir: &Path) {
+        let leftovers: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".new-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "staging residue left behind: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn systemd_quote_escapes_reserved_characters() {
+        assert_eq!(systemd_quote("plain"), "\"plain\"");
+        assert_eq!(systemd_quote("a b"), "\"a b\"");
+        assert_eq!(systemd_quote("100%h"), "\"100%%h\"");
+        assert_eq!(systemd_quote("$HOME"), "\"$$HOME\"");
+        assert_eq!(systemd_quote("has \"quote\""), "\"has \\\"quote\\\"\"");
+        assert_eq!(systemd_quote("back\\slash"), "\"back\\\\slash\"");
+    }
+
+    #[test]
+    fn render_systemd_service_escapes_reserved_path_characters() {
+        let paths = InstallPaths {
+            bin_dir: PathBuf::from("/opt/my files/bin"),
+            binary_path: PathBuf::from("/opt/my files/bin/couchdb-file-sync%h"),
+            config_dir: PathBuf::from("/opt/my files/etc"),
+            config_file: PathBuf::from("/opt/my files/etc/$config file.yaml"),
+            systemd_user_dir: PathBuf::from("/opt/my files/systemd/user"),
+            service_file: PathBuf::from("/opt/my files/systemd/user/couchdb-file-sync.service"),
+        };
+        let rendered = render_systemd_service(&paths);
+
+        // %h specifier must be doubled so systemd reads it literally.
+        assert!(
+            rendered.contains("couchdb-file-sync%%h"),
+            "binary path % must be escaped for literal interpretation"
+        );
+        assert!(
+            !rendered.contains("couchdb-file-sync%h"),
+            "unescaped %h specifier must not be emitted"
+        );
+        // $var must be doubled so systemd does not expand it as an env var.
+        assert!(
+            rendered.contains("$$config file.yaml"),
+            "config $ must be escaped for literal interpretation"
+        );
+        // Space-containing paths must be double-quoted to stay one word.
+        assert!(rendered.contains("\"/opt/my files/bin/couchdb-file-sync%%h\""));
+        assert!(rendered.contains("--config \"/opt/my files/etc/$$config file.yaml\""));
+        assert!(rendered.contains("Environment=PATH=\""));
+    }
+
+    #[test]
+    fn install_binary_replaces_existing_target_atomically() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("new-bin");
+        let target = dir.path().join("couchdb-file-sync");
+        std::fs::write(&source, "new-content").unwrap();
+        std::fs::write(&target, "old-content").unwrap();
+
+        install_binary(&source, &target).expect("atomic replace should succeed");
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "new-content",
+            "target must hold the new executable"
+        );
+        assert_no_staging_residue(dir.path());
+    }
+
+    #[test]
+    fn install_binary_replaces_running_executable() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("new-bin");
+        let target = dir.path().join("couchdb-file-sync");
+        std::fs::write(&source, "#!/bin/sh\necho new\nexit 0\n").unwrap();
+        std::fs::write(&target, "#!/bin/sh\nsleep 30\n").unwrap();
+        set_mode(&source, 0o755).unwrap();
+        set_mode(&target, 0o755).unwrap();
+
+        // Hold the old inode "in use" by executing it as a background child;
+        // a direct in-place copy would fail with ETXTBSY, but the atomic
+        // rename must still swap in the new executable.
+        let mut child = std::process::Command::new(&target)
+            .spawn()
+            .expect("old binary should be executable");
+
+        install_binary(&source, &target)
+            .expect("atomic upgrade over a running executable succeeds");
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "#!/bin/sh\necho new\nexit 0\n",
+            "target path must now point at the new executable"
+        );
+        assert_no_staging_residue(dir.path());
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn install_binary_preserves_old_target_on_stage_failure() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("missing-source");
+        let target = dir.path().join("couchdb-file-sync");
+        std::fs::write(&target, "old-content").unwrap();
+
+        let err =
+            install_binary(&source, &target).expect_err("copying from a missing source must fail");
+
+        assert!(
+            format!("{err:#}").contains("Failed to stage"),
+            "expected a staging failure, got: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "old-content",
+            "a failed install must leave the previous executable untouched"
+        );
+        assert_no_staging_residue(dir.path());
+    }
+
+    #[test]
+    fn install_binary_repeated_install_leaves_no_residue() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("new-bin");
+        let target = dir.path().join("couchdb-file-sync");
+        std::fs::write(&source, "v1").unwrap();
+
+        install_binary(&source, &target).unwrap();
+        std::fs::write(&source, "v2").unwrap();
+        install_binary(&source, &target).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "v2");
+        assert_no_staging_residue(dir.path());
+    }
+
+    #[test]
+    fn run_systemctl_user_surfaces_manager_permission_errors() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // Fake systemctl that always fails (e.g. permission denied).
+        let fake = bin.join("systemctl");
+        std::fs::write(&fake, "#!/bin/sh\nexit 1\n").unwrap();
+        set_mode(&fake, 0o755).unwrap();
+
+        let _guard = INSTALL_ENV_LOCK.lock();
+        let old = std::env::var_os("COUCHDB_FILE_SYNC_SYSTEMCTL");
+        unsafe {
+            std::env::set_var("COUCHDB_FILE_SYNC_SYSTEMCTL", &fake);
+        }
+
+        let result = run_systemctl_user(&["daemon-reload"]);
+        restore_env_var("COUCHDB_FILE_SYNC_SYSTEMCTL", old);
+
+        let err = result.expect_err("a failing systemctl must surface an error");
+        assert!(
+            format!("{err:#}").contains("exited with status"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn run_systemctl_user_ignore_missing_ignores_missing_unit() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // Fake systemctl that fails for both the op and `status` -> missing unit.
+        let fake = bin.join("systemctl");
+        std::fs::write(&fake, "#!/bin/sh\nexit 1\n").unwrap();
+        set_mode(&fake, 0o755).unwrap();
+
+        let _guard = INSTALL_ENV_LOCK.lock();
+        let old = std::env::var_os("COUCHDB_FILE_SYNC_SYSTEMCTL");
+        unsafe {
+            std::env::set_var("COUCHDB_FILE_SYNC_SYSTEMCTL", &fake);
+        }
+
+        let result = run_systemctl_user_ignore_missing(&["disable", "--now", SYSTEMD_UNIT_NAME]);
+        restore_env_var("COUCHDB_FILE_SYNC_SYSTEMCTL", old);
+
+        result.expect("a missing unit must be ignored");
+    }
+
+    #[test]
+    fn run_systemctl_user_ignore_missing_propagates_unrelated_manager_failure() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // Fake systemctl: the requested op fails but `status` succeeds -> the
+        // unit exists, so the failure is a real manager error, not a missing unit.
+        let fake = bin.join("systemctl");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n[ \"$2\" = \"status\" ] && exit 0 || exit 1\n",
+        )
+        .unwrap();
+        set_mode(&fake, 0o755).unwrap();
+
+        let _guard = INSTALL_ENV_LOCK.lock();
+        let old = std::env::var_os("COUCHDB_FILE_SYNC_SYSTEMCTL");
+        unsafe {
+            std::env::set_var("COUCHDB_FILE_SYNC_SYSTEMCTL", &fake);
+        }
+
+        let result = run_systemctl_user_ignore_missing(&["disable", "--now", SYSTEMD_UNIT_NAME]);
+        restore_env_var("COUCHDB_FILE_SYNC_SYSTEMCTL", old);
+
+        let err = result.expect_err("uninstall must not ignore a real manager failure");
+        assert!(
+            format!("{err:#}").contains("exited with status"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn reload_and_enable_service_explicitly_restarts_after_enable() {
+        let dir = TempDir::new().unwrap();
+        let fake_bin = dir.path().join("fakebin");
+        std::fs::create_dir_all(&fake_bin).unwrap();
+
+        // Fake systemctl that records every invocation and succeeds. Only
+        // `COUCHDB_FILE_SYNC_SYSTEMCTL` is mutated here (never HOME/XDG), so
+        // this cannot leak a bogus config search path into concurrent lib
+        // tests such as `config::tests`.
+        let log = dir.path().join("systemctl.log");
+        let fake = fake_bin.join("systemctl");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 0\n", log.display()),
+        )
+        .unwrap();
+        set_mode(&fake, 0o755).unwrap();
+
+        let _guard = INSTALL_ENV_LOCK.lock();
+        let old_sys = std::env::var_os("COUCHDB_FILE_SYNC_SYSTEMCTL");
+        unsafe {
+            std::env::set_var("COUCHDB_FILE_SYNC_SYSTEMCTL", &fake);
+        }
+
+        let result = reload_and_enable_service();
+        restore_env_var("COUCHDB_FILE_SYNC_SYSTEMCTL", old_sys);
+
+        result.expect("reload_and_enable_service should succeed with a fake systemctl");
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("daemon-reload"),
+            "must reload systemd: {calls}"
+        );
+        assert!(
+            calls.contains("enable --now"),
+            "must enable the unit: {calls}"
+        );
+        assert!(
+            calls.contains(&format!("restart {SYSTEMD_UNIT_NAME}")),
+            "must explicitly restart the service after install: {calls}"
         );
     }
 }
