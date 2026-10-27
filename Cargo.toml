@@ -16,7 +16,9 @@ path = "src/main.rs"
 tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal"] }
 
 # CouchDB client
-couch_rs = "0.13"
+# Use rustls (no OpenSSL/system TLS) so the Nix source build stays hermetic —
+# the default native-tls feature pulls openssl-sys.
+couch_rs = { version = "0.13", default-features = false, features = ["derive", "rustls-tls"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

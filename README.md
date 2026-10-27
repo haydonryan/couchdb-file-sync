@@ -84,6 +84,12 @@ nix build .#app-src
 A focused `nix develop` shell (Rust toolchain only — every native dependency is
 bundled) is provided as well.
 
+The `app-src` build vendors its dependencies from the committed `Cargo.lock`.
+The `argy` crate is pinned to a Git revision; `nix/source.nix` carries its
+fixed-output hash under `cargoLock.outputHashes`. When the `argy` Git revision
+in `Cargo.lock` changes, recompute that hash and update it, or the derivation
+will fail to evaluate/build.
+
 ## Development
 
 Enable the repo's pre-commit hook to run formatting, clippy, and tests before each commit:
