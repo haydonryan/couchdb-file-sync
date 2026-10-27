@@ -359,6 +359,13 @@ also refuses to run at all when the local scan is incomplete (an unreadable
 subtree or missing/unmounted sync root), so it never tombstones remote files
 it could not see.
 
+Files whose names cannot be represented losslessly as UTF-8 (invalid byte
+sequences, on Unix) are **skipped**: the scanner reports them with a warning,
+marks the scan incomplete, and never syncs or uploads them, so they can never
+be aliased with a distinct file (for example one whose real name is the U+FFFD
+replacement character), never have the wrong bytes uploaded, and never become
+deletion candidates. The watcher drops events for such paths the same way.
+
 ### `couchdb-file-sync rebuild-local [PATH]`
 
 Replace the local filesystem with the current remote scope for that path. Every live remote file is fetched and content-verified into a staging area first; only after all of it is verified are obsolete local files removed, the staged content installed, and the sync baseline reset — so a failed rebuild leaves the prior local tree and baseline intact. An interrupted rebuild resumes from its journal on the next run.
