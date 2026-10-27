@@ -13,17 +13,30 @@ export RUST_BACKTRACE=1
 git config user.name "${GIT_COMMIT_NAME}"
 git config user.email "${GIT_COMMIT_EMAIL}"
 
-mkdir -p "${HOME}/.ssh"
-chmod 700 "${HOME}/.ssh"
-printf '%s\n' "${GIT_PRIVATE_KEY}" > "${HOME}/.ssh/id_ed25519"
-chmod 600 "${HOME}/.ssh/id_ed25519"
+# Isolate the updater's SSH identity/config in a temporary private directory so
+# this script never touches (or clobbers) a real ~/.ssh. Always cleaned up, on
+# both success and failure.
+ssh_dir="$(mktemp -d "${TMPDIR:-/tmp}/dep-updater-ssh.XXXXXX")"
+chmod 700 "${ssh_dir}"
+ssh_key="${ssh_dir}/id_ed25519"
+printf '%s\n' "${GIT_PRIVATE_KEY}" > "${ssh_key}"
+chmod 600 "${ssh_key}"
 
-cat > "${HOME}/.ssh/config" <<'EOF'
+cat > "${ssh_dir}/config" <<EOF
 Host github.com
-  IdentityFile ~/.ssh/id_ed25519
+  IdentityFile ${ssh_key}
+  IdentitiesOnly yes
   StrictHostKeyChecking accept-new
 EOF
-chmod 600 "${HOME}/.ssh/config"
+chmod 600 "${ssh_dir}/config"
+
+cleanup_ssh() {
+  rm -rf "${ssh_dir}"
+}
+trap cleanup_ssh EXIT
+
+# Ensure every git transport (clone/push) uses only the isolated identity.
+export GIT_SSH_COMMAND="ssh -F ${ssh_dir}/config"
 
 manifest_pathspec=('Cargo.lock' ':(glob)**/Cargo.toml')
 had_failed_upgrades=0
@@ -39,7 +52,7 @@ run_checks() {
   local check_name
   local log_file
 
-  for check_name in test clippy fmt; do
+  for check_name in test clippy fmt audit deny; do
     log_file="$(mktemp)"
 
     case "${check_name}" in
@@ -57,6 +70,18 @@ run_checks() {
         ;;
       fmt)
         if cargo fmt --all -- --check >"${log_file}" 2>&1; then
+          rm -f "${log_file}"
+          continue
+        fi
+        ;;
+      audit)
+        if cargo audit >"${log_file}" 2>&1; then
+          rm -f "${log_file}"
+          continue
+        fi
+        ;;
+      deny)
+        if cargo deny check all >"${log_file}" 2>&1; then
           rm -f "${log_file}"
           continue
         fi
@@ -450,6 +475,10 @@ else
       continue
     fi
 
+    # A change confined to Cargo.lock (manifest untouched) is a valid,
+    # committable upgrade: has_manifest_changes includes Cargo.lock, so it is
+    # deliberately validated by run_checks (incl. audit/deny) and committed
+    # below rather than being dropped as a no-op.
     if ! has_manifest_changes; then
       echo "No update available for ${package_name}"
       record_result no-update "${package_name}"

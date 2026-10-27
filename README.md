@@ -92,6 +92,24 @@ Enable the repo's pre-commit hook to run formatting, clippy, and tests before ea
 git config core.hooksPath .githooks
 ```
 
+### Dependency upgrades
+
+`just dep-bump` runs `scripts/update-dependencies.sh` to upgrade dependencies one at a time,
+validating each with `cargo test`, `cargo clippy`, `cargo fmt`, `cargo audit`, and
+`cargo deny check all` before committing and pushing. A security-gate failure reverts the
+change and skips the commit/push.
+
+The updater's SSH identity and config are written to a temporary private directory
+(`mktemp -d`) and exported via `GIT_SSH_COMMAND`, so a real `~/.ssh` is never touched. The
+temporary directory is removed on both success and failure.
+
+Regression coverage for the updater (SSH isolation/cleanup, lockfile-only upgrades, and the
+audit/deny gate) lives in `tests/update-dependencies.sh`:
+
+```bash
+bash tests/update-dependencies.sh
+```
+
 ## Quick Start
 
 ### 1. Configure CouchDB Connection and Paths
