@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use tracing::info;
 
 use couchdb_file_sync::cli;
-use couchdb_file_sync::config::{AppConfig, SyncPath, default_log_file, default_user_config_file};
+use couchdb_file_sync::config::{
+    AppConfig, LogFormat, SyncPath, default_log_file, default_user_config_file,
+};
 use couchdb_file_sync::logging::AppLogWriter;
 
 #[derive(FromArgs, Debug)]
@@ -187,9 +189,10 @@ async fn run() -> Result<()> {
     let dry_run = matches!(&cli.command, Commands::Sync(cmd) if cmd.dry_run);
     let enable_file_logging = should_enable_file_logging(&cli.command, dry_run);
 
-    // Initialize logging
-    let daemon_mode = matches!(&cli.command, Commands::Daemon(_));
-    init_logging(cli.verbose, &config, enable_file_logging, daemon_mode);
+    // Initialize logging. The returned guard owns the non-blocking file writer
+    // and flushes it when dropped at the end of `run`, so normal shutdown does
+    // not lose buffered diagnostics.
+    let _logging_guard = init_logging(cli.verbose, &config, enable_file_logging);
 
     // Execute command
     dispatch_command(cli.command, config).await
@@ -583,10 +586,18 @@ const fn should_enable_file_logging(command: &Commands, dry_run: bool) -> bool {
     !dry_run && command_enables_file_logging(command)
 }
 
-/// Initialize logging based on verbosity or `RUST_LOG` env var
-fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daemon_mode: bool) {
+/// Initialize logging based on verbosity or `RUST_LOG` env var.
+///
+/// The returned [`WorkerGuard`] keeps the non-blocking file writer alive; it
+/// must be held for the lifetime of the program and is flushed when dropped,
+/// so normal shutdown does not silently lose buffered diagnostics. It is
+/// `None` when file logging is disabled.
+fn init_logging(
+    verbose: u8,
+    config: &AppConfig,
+    enable_file_logging: bool,
+) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::EnvFilter;
-    use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
@@ -604,9 +615,7 @@ fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daem
         EnvFilter::new(format!("couchdb_file_sync={}", level.as_filter_str()))
     };
 
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_filter(filter);
+    let stderr_layer = fmt_layer(config.logging.format, std::io::stderr, true, filter);
 
     if enable_file_logging {
         let log_path = config
@@ -615,34 +624,71 @@ fn init_logging(verbose: u8, config: &AppConfig, enable_file_logging: bool, daem
             .clone()
             .or_else(default_log_file)
             .unwrap_or_else(|| std::path::PathBuf::from("couchdb-file-sync.log"));
-        let rotation = if daemon_mode {
-            couchdb_file_sync::config::RotationConfig::DailyKeep
-        } else {
-            couchdb_file_sync::config::RotationConfig::Never
-        };
-        let log_writer = AppLogWriter::new(log_path.clone(), rotation);
+        // Honor the configured rotation policy instead of forcing a daemon
+        // default: never/daily-keep/daily-delete behave as configured.
+        let log_writer = AppLogWriter::new(&log_path, config.logging.rotation);
         let (non_blocking, guard) = match log_writer {
             Ok(writer) => tracing_appender::non_blocking(writer),
             Err(err) => {
                 eprintln!("Failed to open log file {}: {}", log_path.display(), err);
                 tracing_subscriber::registry().with(stderr_layer).init();
-                return;
+                return None;
             }
         };
-        Box::leak(Box::new(guard));
 
         let file_filter = EnvFilter::new("couchdb_file_sync=trace");
-        let file_layer = tracing_subscriber::fmt::layer()
-            .with_ansi(false)
-            .with_writer(non_blocking)
-            .with_filter(file_filter);
+        let file_layer = fmt_layer(config.logging.format, non_blocking, false, file_filter);
 
         tracing_subscriber::registry()
             .with(stderr_layer)
             .with(file_layer)
             .init();
+        Some(guard)
     } else {
         tracing_subscriber::registry().with(stderr_layer).init();
+        None
+    }
+}
+
+/// Build a fmt layer honoring the configured [`LogFormat`] and filter.
+///
+/// [`Pretty`](LogFormat::Pretty) is the default full format; `json` and
+/// `compact` select the corresponding tracing-subscriber renderers. The
+/// concrete layer type differs per format (each renderer changes the layer's
+/// field/event type parameters), so the layer is boxed to a uniform
+/// [`Layer`] so a single value can be returned from the match.
+fn fmt_layer<S, W>(
+    format: LogFormat,
+    writer: W,
+    ansi: bool,
+    filter: tracing_subscriber::EnvFilter,
+) -> Box<dyn tracing_subscriber::Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    use tracing_subscriber::Layer;
+    match format {
+        LogFormat::Pretty => Box::new(
+            tracing_subscriber::fmt::Layer::new()
+                .with_writer(writer)
+                .with_ansi(ansi)
+                .with_filter(filter),
+        ),
+        LogFormat::Json => Box::new(
+            tracing_subscriber::fmt::Layer::new()
+                .with_writer(writer)
+                .with_ansi(ansi)
+                .json()
+                .with_filter(filter),
+        ),
+        LogFormat::Compact => Box::new(
+            tracing_subscriber::fmt::Layer::new()
+                .with_writer(writer)
+                .with_ansi(ansi)
+                .compact()
+                .with_filter(filter),
+        ),
     }
 }
 
@@ -977,7 +1023,7 @@ mod tests {
     #[test]
     fn init_logging_smoke_test_default_verbose() {
         let config = AppConfig::default();
-        init_logging(0, &config, false, false);
+        init_logging(0, &config, false);
     }
 
     // ============================================================
