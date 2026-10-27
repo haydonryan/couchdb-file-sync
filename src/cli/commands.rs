@@ -1,3 +1,4 @@
+use crate::cli::root_lock::{LOCK_WAIT_TIMEOUT, RootLock};
 use crate::config::{
     AppConfig, ConflictStrategy, IgnoreConfig, SyncPath, default_user_config_file,
 };
@@ -605,6 +606,16 @@ pub async fn sync(path: PathBuf, config: AppConfig, dry_run: bool) -> Result<Syn
     // any sync work begins.
     validate_conflict_policy(&config)?;
 
+    // A mutating sync takes the root lock so no other process (daemon, manual
+    // sync, rebuild, or resolve) races the same state DB and filesystem. A
+    // dry-run is read-only and intentionally does not lock, keeping it
+    // available while a mutator owns the root.
+    let _root_lock = if dry_run {
+        None
+    } else {
+        Some(acquire_root_lock(&path)?)
+    };
+
     // Load ignore patterns
     let ignore_matcher = load_ignore_patterns(&path, &config)?;
 
@@ -738,6 +749,7 @@ pub async fn rebuild_remote(path: PathBuf, config: AppConfig) -> Result<SyncRepo
     info!("Rebuilding remote from local in: {}", path.display());
 
     validate_conflict_policy(&config)?;
+    let _root_lock = acquire_root_lock(&path)?;
 
     let ignore_matcher = load_ignore_patterns(&path, &config)?;
     let db_path = state_db_path(&path);
@@ -783,6 +795,7 @@ pub async fn rebuild_local(path: PathBuf, config: AppConfig) -> Result<SyncRepor
     info!("Rebuilding local from remote in: {}", path.display());
 
     validate_conflict_policy(&config)?;
+    let _root_lock = acquire_root_lock(&path)?;
 
     let ignore_matcher = load_ignore_patterns(&path, &config)?;
     let db_path = state_db_path(&path);
@@ -1099,6 +1112,16 @@ pub async fn daemon(
 
     // Fail closed on an unsupported conflict policy before any worker starts.
     validate_conflict_policy(&config)?;
+
+    // Own every root's lock for the daemon's whole lifetime so a manual
+    // sync/rebuild/resolve cannot race the daemon's per-tick mutations. The
+    // guards live until the daemon exits (or is killed, at which point the OS
+    // releases the locks). `_root_locks` is never read; holding it alive is
+    // the entire point (RootLock's Drop releases each lock).
+    let _root_locks: Vec<RootLock> = paths
+        .iter()
+        .map(|sync_path| acquire_root_lock(&sync_path.local))
+        .collect::<Result<_>>()?;
 
     let path_list: Vec<_> = paths
         .iter()
@@ -2525,6 +2548,7 @@ pub fn conflicts(path: &Path, json: bool) -> Result<()> {
 /// cannot be resolved.
 #[allow(clippy::too_many_lines)] // large interactive resolution flow; per-conflict UI dominates
 pub async fn resolve(path: PathBuf, config: AppConfig) -> Result<()> {
+    let _root_lock = acquire_root_lock(&path)?;
     let db_path = state_db_path(&path);
     let local_db = LocalDb::open(&db_path)?;
 
@@ -2888,6 +2912,26 @@ fn state_dir(root: &Path) -> PathBuf {
 
 fn state_db_path(root: &Path) -> PathBuf {
     state_dir(root).join("state.db")
+}
+
+/// Acquire the OS-backed root lock for a mutating command over `path`.
+///
+/// The lock file lives in the canonical root's state directory, so any two
+/// processes that canonicalize to the same root (regardless of path spelling
+/// or symlink aliases) contend on the same file. Read-only commands (`status`,
+/// `conflicts`, `sync --dry-run`) never call this and therefore stay available
+/// while a mutator owns the root.
+///
+/// # Errors
+///
+/// Returns an error if the state directory cannot be created or the lock is
+/// still held by another process after the bounded wait.
+fn acquire_root_lock(path: &Path) -> Result<RootLock> {
+    let root = resolve_sync_dir(path)?;
+    let dir = state_dir(root.as_path());
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("cannot create state directory {}", dir.display()))?;
+    RootLock::acquire(&dir.join("sync.lock"), root.as_path(), LOCK_WAIT_TIMEOUT)
 }
 
 /// Render the human-facing sync report as a string.

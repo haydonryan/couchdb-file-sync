@@ -92,6 +92,24 @@ Enable the repo's pre-commit hook to run formatting, clippy, and tests before ea
 git config core.hooksPath .githooks
 ```
 
+### Dependency upgrades
+
+`just dep-bump` runs `scripts/update-dependencies.sh` to upgrade dependencies one at a time,
+validating each with `cargo test`, `cargo clippy`, `cargo fmt`, `cargo audit`, and
+`cargo deny check all` before committing and pushing. A security-gate failure reverts the
+change and skips the commit/push.
+
+The updater's SSH identity and config are written to a temporary private directory
+(`mktemp -d`) and exported via `GIT_SSH_COMMAND`, so a real `~/.ssh` is never touched. The
+temporary directory is removed on both success and failure.
+
+Regression coverage for the updater (SSH isolation/cleanup, lockfile-only upgrades, and the
+audit/deny gate) lives in `tests/update-dependencies.sh`:
+
+```bash
+bash tests/update-dependencies.sh
+```
+
 ## Quick Start
 
 ### 1. Configure CouchDB Connection and Paths
@@ -358,6 +376,13 @@ run `rebuild-remote` again to finish the authoritative mirror first. A rebuild
 also refuses to run at all when the local scan is incomplete (an unreadable
 subtree or missing/unmounted sync root), so it never tombstones remote files
 it could not see.
+
+Files whose names cannot be represented losslessly as UTF-8 (invalid byte
+sequences, on Unix) are **skipped**: the scanner reports them with a warning,
+marks the scan incomplete, and never syncs or uploads them, so they can never
+be aliased with a distinct file (for example one whose real name is the U+FFFD
+replacement character), never have the wrong bytes uploaded, and never become
+deletion candidates. The watcher drops events for such paths the same way.
 
 ### `couchdb-file-sync rebuild-local [PATH]`
 
