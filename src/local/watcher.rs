@@ -217,34 +217,20 @@ impl FileWatcher {
     pub fn event_to_change(&self, event: WatcherEvent) -> Option<Change> {
         match event {
             WatcherEvent::FileCreated(path) => {
-                let relative = self.relative_path(&path)?;
-                Some(Change::local_created(
-                    relative.to_string_lossy().to_string(),
-                    String::new(),
-                    0,
-                ))
+                let relative = self.relative_utf8(&path)?;
+                Some(Change::local_created(relative, String::new(), 0))
             }
             WatcherEvent::FileModified(path) => {
-                let relative = self.relative_path(&path)?;
-                Some(Change::local_modified(
-                    relative.to_string_lossy().to_string(),
-                    String::new(),
-                    0,
-                ))
+                let relative = self.relative_utf8(&path)?;
+                Some(Change::local_modified(relative, String::new(), 0))
             }
             WatcherEvent::FileDeleted(path) => {
-                let relative = self.relative_path(&path)?;
-                Some(Change::local_deleted(
-                    relative.to_string_lossy().to_string(),
-                ))
+                let relative = self.relative_utf8(&path)?;
+                Some(Change::local_deleted(relative))
             }
             WatcherEvent::FileRenamed(_from, to) => {
-                let to_relative = self.relative_path(&to)?;
-                Some(Change::local_created(
-                    to_relative.to_string_lossy().to_string(),
-                    String::new(),
-                    0,
-                ))
+                let to_relative = self.relative_utf8(&to)?;
+                Some(Change::local_created(to_relative, String::new(), 0))
             }
         }
     }
@@ -254,6 +240,26 @@ impl FileWatcher {
         path.strip_prefix(self.root_dir.as_path())
             .ok()
             .map(std::path::Path::to_path_buf)
+    }
+
+    /// Return the root-relative path as a UTF-8 string, or `None` when it
+    /// cannot be represented losslessly (invalid UTF-8). The event is dropped
+    /// rather than lossily converted: `to_string_lossy` would alias the file
+    /// with a distinct replacement-character name, and the scanner already
+    /// rejects such files, so there is no valid syncable representation to
+    /// emit.
+    fn relative_utf8(&self, path: &Path) -> Option<String> {
+        let relative = self.relative_path(path)?;
+        relative.to_str().map_or_else(
+            || {
+                warn!(
+                    "Ignoring watcher event for non-UTF-8 relative path {:?}: cannot represent it losslessly",
+                    relative
+                );
+                None
+            },
+            |s| Some(s.to_owned()),
+        )
     }
 }
 
@@ -613,6 +619,53 @@ mod tests {
 
         let event = WatcherEvent::FileCreated(PathBuf::from("/outside/file.txt"));
         assert!(w.event_to_change(event).is_none());
+    }
+
+    /// Watcher events for a non-UTF-8 relative path are dropped (rather than
+    /// lossily converted to a replacement-character path that would alias a
+    /// distinct file), while an ordinary Unicode path still round-trips.
+    #[cfg(unix)]
+    #[test]
+    fn test_event_to_change_drops_non_utf8_path() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = PathBuf::from("/root");
+        let w = test_watcher(&root);
+
+        // A root-relative path containing an invalid UTF-8 byte (0xFF).
+        let invalid_relative = OsString::from_vec(b"a\xFF.txt".to_vec());
+        let invalid_path = root.join(&invalid_relative);
+        assert!(
+            w.event_to_change(WatcherEvent::FileCreated(invalid_path))
+                .is_none(),
+            "created event for a non-UTF-8 path must be dropped"
+        );
+        assert!(
+            w.event_to_change(WatcherEvent::FileModified(root.join(&invalid_relative)))
+                .is_none(),
+            "modified event for a non-UTF-8 path must be dropped"
+        );
+        assert!(
+            w.event_to_change(WatcherEvent::FileDeleted(root.join(&invalid_relative)))
+                .is_none(),
+            "deleted event for a non-UTF-8 path must be dropped"
+        );
+        assert!(
+            w.event_to_change(WatcherEvent::FileRenamed(
+                PathBuf::from("/root/old.txt"),
+                root.join(&invalid_relative),
+            ))
+            .is_none(),
+            "renamed event to a non-UTF-8 path must be dropped"
+        );
+
+        // A real replacement-character name (valid UTF-8) still round-trips.
+        let ff_path = root.join("\u{FFFD}.txt");
+        let change = w
+            .event_to_change(WatcherEvent::FileCreated(ff_path))
+            .expect("a valid replacement-character path must produce a change");
+        assert_eq!(change.path(), "\u{FFFD}.txt");
     }
 
     // -----------------------------------------------------------------------

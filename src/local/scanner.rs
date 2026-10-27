@@ -148,6 +148,23 @@ impl Scanner {
                 continue;
             };
 
+            // Reject relative paths that cannot be represented losslessly as
+            // UTF-8 instead of converting them with `to_string_lossy`. A lossy
+            // conversion maps an invalid byte to U+FFFD, aliasing this file
+            // with a *distinct* file whose real name is the replacement
+            // character: the wrong stored hash could be reused (uploading the
+            // wrong bytes) or the file could look absent and become a deletion
+            // candidate. Skip such files and mark the scan incomplete so
+            // callers never infer a deletion from their absence.
+            let Some(path_str) = relative_path.to_str() else {
+                warn!(
+                    "Skipping file with non-UTF-8 relative path {:?}: cannot represent it losslessly; marking scan incomplete",
+                    relative_path
+                );
+                complete = false;
+                continue;
+            };
+
             if self.ignore_matcher.should_ignore(relative_path) {
                 trace!("Ignoring file: {}", relative_path.display());
                 continue;
@@ -155,9 +172,7 @@ impl Scanner {
 
             // Get file metadata and hash, reusing the stored hash when the
             // mtime+size match is safe.
-            let stored = stored_map
-                .get(relative_path.to_string_lossy().as_ref())
-                .copied();
+            let stored = stored_map.get(path_str).copied();
             match self.scan_file_with_stored(path, stored) {
                 Ok(state) => {
                     debug!("Scanned file: {} (hash: {})", state.path, &state.hash[..8]);
@@ -247,7 +262,21 @@ impl Scanner {
                 let relative_buf = relative.to_path_buf();
                 (Cow::Owned(resolved), Cow::Owned(relative_buf))
             };
-        let path_str = relative_path.to_string_lossy().to_string();
+        // Reject non-UTF-8 relative paths (rather than lossily converting
+        // them) so a direct single-file scan cannot alias this file with a
+        // distinct replacement-character name or upload the wrong bytes. The
+        // full-scan path in [`Self::scan_blocking`] already skips such files
+        // and marks the scan incomplete; this guard covers direct callers such
+        // as the watcher quick-scan.
+        let path_str = match relative_path.to_str() {
+            Some(s) => s.to_string(),
+            None => {
+                return Err(anyhow::anyhow!(
+                    "cannot represent relative path {} losslessly: not valid UTF-8",
+                    relative_path.display()
+                ));
+            }
+        };
 
         // Get modification time and size from the same metadata the hash
         // shortcut decision uses.
@@ -988,6 +1017,79 @@ mod tests {
         assert!(paths.contains(&"keep.txt"));
         assert!(paths.contains(&"also_keep.rs"));
         assert!(!paths.contains(&"ignore.log"));
+    }
+
+    /// On Unix, a filename with an invalid UTF-8 byte must be rejected (skipped
+    /// and the scan marked incomplete) rather than lossily aliased with a real
+    /// replacement-character file. The real U+FFFD name must survive
+    /// unmodified, the invalid file must never be uploaded with the wrong
+    /// content, the skipped file must never become a deletion candidate, and
+    /// ordinary Unicode must still round-trip exactly.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_full_scan_rejects_non_utf8_without_aliasing_replacement_char() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        // A real file whose name is the U+FFFD replacement character (valid UTF-8).
+        let ff_name = "\u{FFFD}.txt";
+        std::fs::write(temp_dir.path().join(ff_name), b"REAL-REPLACEMENT").unwrap();
+        // A distinct file whose name contains an invalid UTF-8 byte (0xFF).
+        let invalid_name = OsString::from_vec(b"a\xFF.txt".to_vec());
+        let invalid_path = temp_dir.path().join(&invalid_name);
+        std::fs::write(&invalid_path, b"INVALID-BYTES").unwrap();
+        // Ordinary Unicode must still round-trip exactly.
+        std::fs::write(temp_dir.path().join("héllo.txt"), b"unicode").unwrap();
+
+        let scanner = Scanner::new(
+            SyncDirPath::new(temp_dir.path()).unwrap(),
+            IgnoreMatcher::empty(),
+        );
+        let outcome = scanner.full_scan().await.unwrap();
+
+        // The invalid-UTF-8 file must not be present, so it must not be aliased
+        // to the replacement-character path (which would upload wrong bytes).
+        assert!(
+            !outcome.states.iter().any(|s| s.path == "a\u{FFFD}.txt"),
+            "invalid-UTF-8 file must not be aliased to the replacement-character path"
+        );
+
+        // Exactly one state carries the real replacement-character name, and it
+        // points at the real file's content, never the invalid file's bytes.
+        let ff_states: Vec<&FileState> = outcome
+            .states
+            .iter()
+            .filter(|s| s.path == ff_name)
+            .collect();
+        assert_eq!(
+            ff_states.len(),
+            1,
+            "replacement-character name must not be merged with another file"
+        );
+        assert_eq!(ff_states[0].hash, compute_bytes_hash(b"REAL-REPLACEMENT"));
+
+        // Ordinary Unicode still round-trips exactly.
+        let unicode_states: Vec<&FileState> = outcome
+            .states
+            .iter()
+            .filter(|s| s.path == "héllo.txt")
+            .collect();
+        assert_eq!(unicode_states.len(), 1);
+        assert_eq!(unicode_states[0].hash, compute_bytes_hash(b"unicode"));
+
+        // The scan is incomplete, so callers never infer a deletion for the
+        // skipped invalid-UTF-8 file.
+        assert!(
+            !outcome.complete,
+            "a non-UTF-8 file must mark the scan incomplete"
+        );
+
+        // Direct single-file scan also rejects the invalid-UTF-8 path.
+        assert!(
+            scanner.scan_file(&invalid_path).is_err(),
+            "direct scan of a non-UTF-8 path must error"
+        );
     }
 
     #[tokio::test]
