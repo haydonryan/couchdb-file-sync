@@ -27,6 +27,12 @@ rustPlatform.buildRustPackage {
   # dependencies from the network; everything comes from the Nix store.
   cargoLock = {
     lockFile = ./../Cargo.lock;
+    # Fixed-output hash for the git-pinned `argy` dependency (argy/argy_derive/
+    # argy_shared all resolve from the same git revision). This must be updated
+    # whenever the Cargo.lock git revision for argy changes (see README).
+    outputHashes = {
+      "argy-0.1.19" = "sha256-lxJ7QlTKzCzdM8EMcWcVZVS/woGcOEA5+WTUrZe1HJA=";
+    };
   };
 
   # rusqlite bundles its own sqlite3 and reqwest is built with rustls (no
