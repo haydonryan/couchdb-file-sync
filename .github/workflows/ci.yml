@@ -54,11 +54,16 @@ jobs:
       - name: No-default features
         run: cargo test --workspace --no-default-features
 
-  # Live-CouchDB integration tests (tests/dry_run.rs, tests/remote_move.rs).
-  # These are #[ignore]d by default because they need a running CouchDB, so
-  # they run in their own Ubuntu-only job that provisions one as a service
-  # container. Service containers are not supported on GitHub-hosted macOS
-  # runners, so this cannot live inside the matrix `test` job.
+  # Live-CouchDB integration tests. These are #[ignore]d by default because
+  # they need a running CouchDB, so they run in their own Ubuntu-only job that
+  # provisions one as a service container. Service containers are not
+  # supported on GitHub-hosted macOS runners, so this cannot live inside the
+  # matrix `test` job.
+  # Inclusion policy: every #[ignore]d test in this workspace is a live CouchDB
+  # regression (verified: none exist outside tests/). Running the full
+  # `--include-ignored` suite therefore auto-discovers any newly added CouchDB
+  # regression without naming each test binary. If an unrelated #[ignore]d test
+  # is ever introduced, scope this job back to the specific --test binaries.
   integration-test:
     name: Integration tests (CouchDB)
     runs-on: ubuntu-latest
@@ -82,9 +87,11 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Run ignored CouchDB integration tests
-        # The two integration tests default to http://localhost:5984 with
-        # admin/password, matching the service container (and docker-compose.yml).
-        run: cargo test --workspace --test dry_run --test remote_move -- --include-ignored
+        # Tests default to http://localhost:5984 with admin/password, matching
+        # the service container (and docker-compose.yml). Runs every ignored
+        # CouchDB regression (dry_run, remote_move, conflict_mtime,
+        # directory_moves) via the full --include-ignored suite.
+        run: cargo test --workspace -- --include-ignored
 
   coverage:
     name: Coverage (Tarpaulin)
@@ -172,7 +179,7 @@ jobs:
   detect-release-tag:
     name: Detect Release Tag
     runs-on: ubuntu-latest
-    needs: [check, test, Lint, Security]
+    needs: [check, test, Lint, Security, integration-test]
     if: github.event_name == 'push'
     outputs:
       tag: ${{ steps.detect.outputs.tag }}
