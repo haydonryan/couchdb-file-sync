@@ -801,6 +801,17 @@ mod tests {
         );
         stored.change_fingerprint = ChangeFingerprint::from_metadata(&meta);
 
+        // Some CI/container filesystems expose only 1-second (or coarser)
+        // change-time granularity. The stored fingerprint was just captured
+        // within the current second, so a rewrite performed immediately would
+        // often land in the SAME second and the ctime would not observably
+        // advance — the scan would (wrongly) reuse the stored hash and this
+        // test would flake. Sleeping across a second boundary guarantees the
+        // rewrite's ctime is strictly later than the captured fingerprint on
+        // any filesystem with second-or-finer granularity, so the re-hash is
+        // deterministic while still exercising the real ctime-bump mechanism.
+        std::thread::sleep(Duration::from_millis(1100));
+
         // Overwrite with different content but the SAME size, then restore the
         // exact same past mtime, as a mtime-preserving tool would.
         std::fs::write(&file_path, b"BBBB").unwrap();
