@@ -8,6 +8,7 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/haydonryan/couchdb-file-sync"
 license=('MIT')
 depends=('gcc-libs' 'glibc')
+conflicts=('couchdb-file-sync-bin')
 makedepends=('cargo' 'rust')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/haydonryan/couchdb-file-sync/archive/refs/tags/v$pkgver.tar.gz" "LICENSE")
 sha256sums=('e8b1dde95f1eded3f363a3986463552c7375419bcdb6c3bef694b1235b3e341f' '042988a94400f2d3a33ad2b063d5c74ef8be60f128d019a70902c5d61085a1e5')
