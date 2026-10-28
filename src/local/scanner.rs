@@ -1025,7 +1025,7 @@ mod tests {
     /// unmodified, the invalid file must never be uploaded with the wrong
     /// content, the skipped file must never become a deletion candidate, and
     /// ordinary Unicode must still round-trip exactly.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_full_scan_rejects_non_utf8_without_aliasing_replacement_char() {
         use std::ffi::OsString;
