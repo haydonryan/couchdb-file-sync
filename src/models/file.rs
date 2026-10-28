@@ -387,6 +387,45 @@ impl TypedCouchDocument for ChunkDoc {
     }
 }
 
+/// A kernel-managed, per-inode change fingerprint.
+///
+/// On Unix this is the `st_ctime` change time: it advances whenever the
+/// inode changes, including any content write, and userspace tools cannot set
+/// it (only the kernel bumps it). It is therefore reliable change evidence
+/// that a stored hash is still valid even when a tool (`cp -p`, `rsync -t`,
+/// `git checkout`, `touch -t`) preserved the file's mtime and size. Platforms
+/// without an equivalent (e.g. Windows) yield `None` and fall back to the
+/// conservative last-sync guard in the scanner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeFingerprint {
+    /// Whole seconds since the Unix epoch of the change time.
+    pub secs: i64,
+    /// Sub-second nanosecond component of the change time.
+    pub nanos: i64,
+}
+
+impl ChangeFingerprint {
+    /// Read the change fingerprint from a file's metadata, or `None` on
+    /// platforms without reliable change evidence (no `ctime` equivalent).
+    #[cfg(unix)]
+    #[must_use]
+    pub fn from_metadata(metadata: &std::fs::Metadata) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            secs: metadata.ctime(),
+            nanos: metadata.ctime_nsec(),
+        })
+    }
+
+    /// Read the change fingerprint from a file's metadata. No reliable change
+    /// evidence exists on this platform, so this always yields `None`.
+    #[cfg(not(unix))]
+    #[must_use]
+    pub fn from_metadata(_metadata: &std::fs::Metadata) -> Option<Self> {
+        None
+    }
+}
+
 /// Local file state for tracking
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileState {
@@ -396,6 +435,12 @@ pub struct FileState {
     pub modified_at: DateTime<Utc>,
     pub couch_rev: Option<CouchRev>,
     pub last_sync_at: DateTime<Utc>,
+    /// Reliable platform change evidence captured at scan time (the on-disk
+    /// `ctime` on Unix). `None` on platforms without such evidence. Used by
+    /// the scanner to decide whether the stored hash can be reused without a
+    /// content re-read.
+    #[serde(default)]
+    pub change_fingerprint: Option<ChangeFingerprint>,
 }
 
 impl FileState {
@@ -408,6 +453,7 @@ impl FileState {
             couch_rev: None,
             last_sync_at: Utc::now(),
             modified_at,
+            change_fingerprint: None,
         }
     }
 }

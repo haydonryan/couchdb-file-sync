@@ -2412,6 +2412,11 @@ async fn handle_remote_change(
                             modified_at: local_mtime.unwrap_or_else(Utc::now),
                             couch_rev: None,
                             last_sync_at: Utc::now(),
+                            change_fingerprint: file_path
+                                .metadata()
+                                .ok()
+                                .as_ref()
+                                .and_then(crate::models::ChangeFingerprint::from_metadata),
                         },
                     };
                     let remote_state = RemoteState {

@@ -598,6 +598,7 @@ mod tests {
             modified_at: last_sync_at,
             couch_rev: Some(CouchRev::new("1-abc").unwrap()),
             last_sync_at,
+            change_fingerprint: None,
         }
     }
 

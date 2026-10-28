@@ -1,4 +1,4 @@
-use crate::models::{Change, FileState, IgnoreMatcher, SyncDirPath};
+use crate::models::{Change, ChangeFingerprint, FileState, IgnoreMatcher, SyncDirPath};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
@@ -89,13 +89,16 @@ impl Scanner {
     }
 
     /// Perform a full scan, reusing the stored hash for files whose stored
-    /// state has the same mtime AND size as the on-disk file, whose mtime is
-    /// not older than the stored last sync (see [`is_racily_clean`] and the
-    /// `last_sync_at` guard in [`Self::scan_file_with_stored`]). Unchanged
-    /// trees therefore skip the full disk read + SHA-256 for every file. New
-    /// files, files with a differing mtime or size, racily-clean files, and
-    /// files whose mtime predates the stored last sync are hashed as usual, so
-    /// created/modified/deleted detection semantics are unchanged.
+    /// state has the same mtime AND size as the on-disk file, is not racily
+    /// clean, and whose reliable change fingerprint matches (Unix `ctime`; see
+    /// [`Self::scan_file_with_stored`]). On supported platforms an unchanged
+    /// tree — including one whose files were just synced and therefore have an
+    /// mtime older than their `last_sync_at` — skips the full disk read +
+    /// SHA-256 for every file. Platforms without change evidence fall back to
+    /// the conservative `last_sync_at` guard. New files, files with a differing
+    /// mtime, size, or fingerprint, racily-clean files, and files an mtime
+    /// older than the stored last sync (no fingerprint platforms) are hashed
+    /// as usual, so created/modified/deleted detection semantics are unchanged.
     ///
     /// `stored_states` is shared with the blocking task through an [`Arc`] so
     /// the (potentially large) state table is never copied.
@@ -207,18 +210,27 @@ impl Scanner {
 
     /// Scan a single file, reusing the stored hash when the stored state's
     /// mtime AND size match the on-disk file, the file is not racily clean,
-    /// and the on-disk mtime is not older than the stored `last_sync_at`.
+    /// and reliable change evidence confirms the content is unchanged.
     ///
-    /// The `last_sync_at` guard closes the mtime-preserving edit hole: tools
-    /// that preserve mtime (`cp -p`, `rsync -t`, `git checkout`, `touch -t`)
-    /// can rewrite a file's content while leaving an old mtime and identical
-    /// size. When the on-disk mtime is older than the stored last sync, the
-    /// mtime+size shortcut cannot prove the content is unchanged, so the file
-    /// is re-hashed rather than trusted.
+    /// On platforms with a change fingerprint (Unix `ctime`), the stored
+    /// fingerprint is compared against the on-disk fingerprint: a match proves
+    /// no content write happened since the last scan (the kernel bumps `ctime`
+    /// on any write, and userspace cannot set it), so the stored hash is
+    /// reused. This closes the mtime-preserving edit hole (`cp -p`, `rsync -t`,
+    /// `git checkout`, `touch -t` can rewrite content while leaving an old
+    /// mtime and identical size) while still letting genuinely-unchanged
+    /// synced files reuse their hash even though their mtime predates
+    /// `last_sync_at`.
+    ///
+    /// On platforms without such evidence (no `ctime` equivalent), the stored
+    /// hash is reused only when the on-disk mtime is at least as new as the
+    /// stored `last_sync_at`; an mtime older than the last sync cannot prove
+    /// the content is unchanged, so the file is re-hashed (conservative
+    /// fallback that always preserves correctness).
     ///
     /// `stored` is the previously recorded state for this file, if any. When it
-    /// is `None` (or the mtime/size shortcut does not apply) the SHA-256 hash is
-    /// computed from the file content, preserving existing detection behavior.
+    /// is `None` (or the shortcut does not apply) the SHA-256 hash is computed
+    /// from the file content, preserving existing detection behavior.
     ///
     /// # Errors
     ///
@@ -278,28 +290,42 @@ impl Scanner {
             }
         };
 
-        // Get modification time and size from the same metadata the hash
-        // shortcut decision uses.
+        // Get modification time, size, and change fingerprint from the same
+        // metadata the hash shortcut decision uses.
         let modified_at = metadata.modified()?.into();
         let size = metadata.len();
+        let fingerprint = ChangeFingerprint::from_metadata(&metadata);
 
         // Conservative mtime+size shortcut (git-style): reuse the stored hash
         // when the stored state has the same mtime AND size as the on-disk file
-        // and the file is not racily clean. An additional guard requires the
-        // on-disk mtime to be at least as new as the stored last sync: a file
-        // whose mtime is older than its stored last_sync_at may have had its
-        // content rewritten by a mtime-preserving tool (cp -p, rsync -t, git
-        // checkout, touch -t), so it is re-hashed rather than trusted.
+        // and the file is not racily clean. Unchanged-content proof then comes
+        // from reliable change evidence: when a change fingerprint is available
+        // (Unix ctime), a stored-vs-on-disk fingerprint match proves no content
+        // write happened since the last scan — even for a synced file whose
+        // mtime predates `last_sync_at` (the previous guard that defeated the
+        // cache on real synced files). When no fingerprint is available, fall
+        // back to the conservative `last_sync_at` guard, which re-hashes any
+        // file whose mtime is older than its stored last sync (the
+        // mtime-preserving edit hole) at the cost of re-hashing every unchanged
+        // synced file. A one-sided fingerprint (stored but unavailable now, or
+        // vice versa) cannot prove the content is unchanged, so it re-hashes.
         // Otherwise (new file, size or mtime drift, a recently-touched
-        // racily-clean file, or an mtime older than the stored last sync)
-        // compute the SHA-256 hash as before, so change detection stays
-        // correct.
+        // racily-clean file, an mtime older than the stored last sync, or no
+        // matching change evidence) compute the SHA-256 hash as before, so
+        // change detection stays correct.
         let reuse_hash = match stored {
             Some(s)
                 if s.size == size
                     && s.modified_at == modified_at
                     && !is_racily_clean(modified_at)
-                    && modified_at >= s.last_sync_at =>
+                    && match (s.change_fingerprint, fingerprint) {
+                        (Some(stored_fp), Some(disk_fp)) => stored_fp == disk_fp,
+                        // No reliable change evidence on this platform: use the
+                        // conservative last-sync guard as the fallback.
+                        (None, None) => modified_at >= s.last_sync_at,
+                        // One-sided evidence cannot prove the content unchanged.
+                        _ => false,
+                    } =>
             {
                 Some(s.hash.clone())
             }
@@ -325,6 +351,7 @@ impl Scanner {
             modified_at,
             couch_rev: None,
             last_sync_at: Utc::now(),
+            change_fingerprint: fingerprint,
         })
     }
 
@@ -577,9 +604,12 @@ mod tests {
             meta.len(),
             meta.modified().unwrap().into(),
         );
-        // The file mtime is an hour in the past; give the stored state a
-        // last_sync_at that predates it (i.e. the file was last modified after
-        // it was last synced) so the mtime+size shortcut stays eligible.
+        // Capture the change fingerprint (Unix ctime) from the current on-disk
+        // metadata, so the unchanged file's fingerprint matches on the next
+        // scan. The file mtime is an hour in the past; give the stored state a
+        // last_sync_at that predates it so the conservative non-fingerprint
+        // fallback (used on platforms without a ctime) stays eligible too.
+        stored.change_fingerprint = ChangeFingerprint::from_metadata(&meta);
         stored.last_sync_at = Utc::now() - Duration::from_hours(2);
 
         let state = scanner
@@ -757,15 +787,19 @@ mod tests {
         );
 
         let meta = std::fs::metadata(&file_path).unwrap();
-        // Stored state records a RECENT last_sync_at (now) while the file mtime
-        // is in the past, so the on-disk mtime is older than the stored
-        // last_sync_at.
-        let stored = FileState::new(
+        // Record the file's change fingerprint (Unix ctime) as of the original
+        // content, so the mtime-preserving rewrite below is detected by the
+        // ctime bump. `FileState::new` also records a RECENT last_sync_at (now)
+        // while the file mtime is in the past, so on platforms without a
+        // fingerprint the conservative fallback (mtime older than last_sync)
+        // detects the rewrite the same way.
+        let mut stored = FileState::new(
             "preserved.txt".to_string(),
             "a".repeat(64), // marker hash: only present if reused
             meta.len(),
             meta.modified().unwrap().into(),
         );
+        stored.change_fingerprint = ChangeFingerprint::from_metadata(&meta);
 
         // Overwrite with different content but the SAME size, then restore the
         // exact same past mtime, as a mtime-preserving tool would.
@@ -779,8 +813,10 @@ mod tests {
         // mtime and size still match the stored state...
         assert_eq!(state.modified_at, stored.modified_at);
         assert_eq!(state.size, stored.size);
-        // ...but the mtime is older than the stored last_sync_at, so the hash
-        // must be recomputed and the content change detected.
+        // ...but the rewrite bumped the change fingerprint (Unix ctime), so the
+        // hash must be recomputed and the content change detected. (On
+        // platforms without a fingerprint, the mtime being older than the
+        // stored last_sync_at triggers the conservative fallback instead.)
         assert_ne!(
             state.hash, stored.hash,
             "preserved past mtime + same size must still be re-hashed"
@@ -808,19 +844,19 @@ mod tests {
 
         let scanner = Scanner::new(root.clone(), IgnoreMatcher::empty());
 
-        // Establish the stored states (this first scan hashes everything).
-        let mut stored_vec = scanner.full_scan().await.unwrap().states;
+        // Establish the stored states (this first scan hashes everything and
+        // records each file's change fingerprint + last_sync_at = scan time).
+        let stored_vec = scanner.full_scan().await.unwrap().states;
         let hashes_after_first = scanner.hash_computations();
         assert_eq!(hashes_after_first, 3, "first scan must hash all 3 files");
 
-        // The first scan stamps each stored state's last_sync_at with the scan
-        // time, which is newer than the files' mtimes. The hash-reuse shortcut
-        // requires the file mtime to be at least as new as the stored
-        // last_sync_at, so shift each stored last_sync_at into the past to
-        // model files last modified after they were synced.
-        for state in &mut stored_vec {
-            state.last_sync_at = Utc::now() - Duration::from_hours(2);
-        }
+        // A real post-sync scan faces exactly this state: each file's mtime is
+        // in the past, older than its last_sync_at (which the scan stamped at
+        // the sync time). No artificial timestamp shift is applied. On Unix the
+        // unchanged ctime fingerprint is reliable change evidence, so the
+        // second scan reuses every stored hash. On platforms without a
+        // fingerprint the conservative fallback re-hashes every file (mtime
+        // older than last_sync_at), preserving correctness without a cache hit.
         let stored_states = Arc::new(stored_vec);
 
         // A second scan against the stored states must reuse all hashes.
@@ -829,9 +865,16 @@ mod tests {
             .await
             .unwrap();
         let hashes_after_second = scanner.hash_computations();
+        #[cfg(unix)]
         assert_eq!(
             hashes_after_second, hashes_after_first,
-            "unchanged scan must not re-hash any file"
+            "unchanged scan must not re-hash any file on Unix (ctime fingerprint)"
+        );
+        #[cfg(not(unix))]
+        assert_eq!(
+            hashes_after_second,
+            hashes_after_first + 3,
+            "no change evidence: conservative fallback re-hashes files whose mtime predates last_sync_at"
         );
         assert_eq!(current.states.len(), 3);
         assert!(current.complete, "unchanged scan must be complete");
@@ -847,6 +890,98 @@ mod tests {
         // And change detection sees no changes.
         let changes = scanner.detect_changes(&current.states, &stored_states, current.complete);
         assert!(changes.is_empty());
+    }
+
+    /// A real synced file has an mtime older than its `last_sync_at` (the sync
+    /// records `last_sync_at = now`, later than the file's preserved mtime).
+    /// On Unix the unchanged ctime fingerprint proves the content is unchanged,
+    /// so the stored hash is reused without re-reading the file — the cache is
+    /// effective on real synced files, not just on artificially backdated
+    /// timestamps.
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_file_reuses_stored_hash_on_real_synced_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("synced.txt");
+        std::fs::write(&file_path, b"stable content").unwrap();
+        let old_mtime = SystemTime::now() - Duration::from_hours(1);
+        set_mtime(&file_path, old_mtime);
+
+        let scanner = Scanner::new(
+            SyncDirPath::new(temp_dir.path()).unwrap(),
+            IgnoreMatcher::empty(),
+        );
+
+        let meta = std::fs::metadata(&file_path).unwrap();
+        // Stored state exactly as a real sync records it: mtime in the past,
+        // but `last_sync_at` left at its default (now — NEWER than the mtime),
+        // plus the change fingerprint captured at sync time.
+        let mut stored = FileState::new(
+            "synced.txt".to_string(),
+            "a".repeat(64), // marker hash: only present if reused
+            meta.len(),
+            meta.modified().unwrap().into(),
+        );
+        stored.change_fingerprint = ChangeFingerprint::from_metadata(&meta);
+
+        let state = scanner
+            .scan_file_with_stored(&file_path, Some(&stored))
+            .unwrap();
+
+        // The marker hash proves the stored hash was reused even though the
+        // mtime is older than last_sync_at (the ctime fingerprint matched).
+        assert_eq!(state.hash, stored.hash, "synced file hash must be reused");
+        let changes = scanner.detect_changes(&[state], &[stored], true);
+        assert!(
+            changes.is_empty(),
+            "unchanged synced file must produce no changes"
+        );
+    }
+
+    /// A file whose mtime is in the future (clock skew) or inside the current
+    /// timestamp tick cannot be proven unchanged by mtime alone: it is treated
+    /// as racily clean and re-hashed, even when its size and stored change
+    /// fingerprint would otherwise match. This mirrors git's racily-clean
+    /// handling for coarse-granularity filesystems and future-mtime skew.
+    #[test]
+    fn test_scan_file_rehashes_future_or_coarse_mtime() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("future.txt");
+        std::fs::write(&file_path, b"AAAA").unwrap();
+
+        let scanner = Scanner::new(
+            SyncDirPath::new(temp_dir.path()).unwrap(),
+            IgnoreMatcher::empty(),
+        );
+
+        let meta = std::fs::metadata(&file_path).unwrap();
+        let mut stored = FileState::new(
+            "future.txt".to_string(),
+            "a".repeat(64),
+            meta.len(),
+            meta.modified().unwrap().into(),
+        );
+        stored.change_fingerprint = ChangeFingerprint::from_metadata(&meta);
+        // Place last_sync_at before the (future) mtime so the non-fingerprint
+        // fallback would not itself force a re-hash; the future mtime must
+        // still trigger one via the racily-clean check.
+        stored.last_sync_at = Utc::now() - Duration::from_hours(1);
+
+        // Move the file mtime into the future (clock skew / coarse tick).
+        set_mtime(&file_path, SystemTime::now() + Duration::from_secs(10));
+
+        let state = scanner
+            .scan_file_with_stored(&file_path, Some(&stored))
+            .unwrap();
+
+        // mtime and size match the stored state, but the future mtime is
+        // racily clean, so the hash must be recomputed.
+        assert_eq!(state.size, stored.size);
+        assert_ne!(
+            state.hash, stored.hash,
+            "future/coarse mtime must still be re-hashed"
+        );
+        assert_eq!(state.hash, compute_file_hash(&file_path).unwrap());
     }
 
     // ---- scan_file tests ----

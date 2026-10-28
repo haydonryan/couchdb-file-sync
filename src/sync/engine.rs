@@ -1,8 +1,9 @@
 use crate::couchdb::CouchDb;
 use crate::local::{LocalDb, RemoteRebuildJournal, Scanner, compute_bytes_hash, compute_file_hash};
 use crate::models::{
-    Change, ChangeType, Checkpoint, Conflict, CouchRev, DownloadCount, ExpectedRemote, FileDoc,
-    FileState, IgnoreMatcher, RemoteState, ResolutionStrategy, SyncDirPath, UploadCount,
+    Change, ChangeFingerprint, ChangeType, Checkpoint, Conflict, CouchRev, DownloadCount,
+    ExpectedRemote, FileDoc, FileState, IgnoreMatcher, RemoteState, ResolutionStrategy,
+    SyncDirPath, UploadCount,
 };
 use crate::sync::triage;
 use anyhow::Result;
@@ -443,6 +444,7 @@ impl ApplyWorker {
             modified_at: metadata.modified()?.into(),
             couch_rev: doc.rev.as_deref().and_then(CouchRev::new),
             last_sync_at: Utc::now(),
+            change_fingerprint: ChangeFingerprint::from_metadata(&metadata),
         };
         self.local_db.save_file_state(&state).await?;
         debug!("[UPLOAD] Updated local state with rev: {:?}", doc.rev);
@@ -608,6 +610,7 @@ impl ApplyWorker {
             modified_at: metadata.modified()?.into(),
             couch_rev: doc.rev.as_deref().and_then(CouchRev::new),
             last_sync_at: Utc::now(),
+            change_fingerprint: ChangeFingerprint::from_metadata(&metadata),
         };
         self.local_db.save_file_state(&state).await?;
 
@@ -1828,6 +1831,7 @@ impl SyncEngine {
             modified_at: metadata.modified()?.into(),
             couch_rev: entry.couch_rev.as_deref().and_then(CouchRev::new),
             last_sync_at: Utc::now(),
+            change_fingerprint: ChangeFingerprint::from_metadata(&metadata),
         })
     }
 
@@ -1985,6 +1989,10 @@ impl SyncEngine {
                     let stored = stored_map.get(&state.path);
                     let couch_rev = stored.and_then(|s| s.couch_rev.clone());
                     let last_sync_at = stored.map_or(state.last_sync_at, |s| s.last_sync_at);
+                    // The fingerprint is freshly read from the on-disk file by
+                    // the scanner, so it already reflects the current ctime
+                    // (unlike couch_rev/last_sync_at, which the scanner does
+                    // not know and must be preserved from the stored row).
                     let preserved_state = FileState {
                         path: state.path.clone(),
                         hash: state.hash.clone(),
@@ -1992,6 +2000,7 @@ impl SyncEngine {
                         modified_at: state.modified_at,
                         couch_rev,
                         last_sync_at,
+                        change_fingerprint: state.change_fingerprint,
                     };
                     // Skip the redundant SQLite write entirely when the
                     // preserved state (path, hash, size, modified_at,
@@ -2415,6 +2424,7 @@ impl SyncEngine {
                     modified_at: local_state.modified_at,
                     couch_rev: remote_doc.rev.as_deref().and_then(CouchRev::new),
                     last_sync_at: Utc::now(),
+                    change_fingerprint: local_state.change_fingerprint,
                 };
                 self.local_db.save_file_state(&updated_state).await?;
             }
@@ -2508,6 +2518,11 @@ impl SyncEngine {
                         modified_at: local_mtime.unwrap_or_else(Utc::now),
                         couch_rev: stored_state.and_then(|s| s.couch_rev.clone()),
                         last_sync_at: stored_state.map_or_else(Utc::now, |s| s.last_sync_at),
+                        change_fingerprint: file_path
+                            .metadata()
+                            .ok()
+                            .as_ref()
+                            .and_then(ChangeFingerprint::from_metadata),
                     };
                     let remote_state = RemoteState {
                         hash: String::new(),
@@ -3178,7 +3193,8 @@ mod tests {
     use crate::couchdb::db::{CannedCouch, ConcurrencyProbe};
     use crate::local::{LocalDb, compute_bytes_hash, compute_file_hash};
     use crate::models::{
-        Change, ChunkCodec, ChunkDoc, CouchRev, DocType, FileDoc, IgnoreMatcher, TimestampMillis,
+        Change, ChangeFingerprint, ChunkCodec, ChunkDoc, CouchRev, DocType, FileDoc, IgnoreMatcher,
+        TimestampMillis,
     };
     use chrono::{Duration, Utc};
     use std::path::PathBuf;
@@ -4440,7 +4456,10 @@ mod tests {
         filetime::set_file_mtime(&file_path, filetime::FileTime::from_system_time(old)).unwrap();
 
         // Seed a fully-tracked, unchanged file whose stored mtime/size/hash all
-        // match the on-disk scan.
+        // match the on-disk scan, exactly as a real sync records it: the change
+        // fingerprint (Unix ctime) is captured from the on-disk metadata and
+        // `last_sync_at` stays at the sync time (NEWER than the file's past
+        // mtime). No artificial `last_sync_at` backdating is applied.
         let local = test_local_db();
         let hash = compute_file_hash(&file_path).unwrap();
         let meta = std::fs::metadata(&file_path).unwrap();
@@ -4451,7 +4470,7 @@ mod tests {
             meta.modified().unwrap().into(),
         );
         stored.couch_rev = Some(CouchRev::new("1-abc").unwrap());
-        stored.last_sync_at = Utc::now() - Duration::days(1);
+        stored.change_fingerprint = ChangeFingerprint::from_metadata(&meta);
         local.save_file_state(&stored).unwrap();
         local.save_checkpoint("100-before").unwrap();
 
@@ -4472,23 +4491,40 @@ mod tests {
         assert_eq!(report.downloaded.0, 0);
         assert_eq!(report.conflicts, 0);
 
-        // Because the stored mtime AND size match and the file is not racily
-        // clean, the full scan reuses the stored hash: zero file re-reads.
+        // Because the stored mtime/size/fingerprint all match and the file is
+        // not racily clean, the full scan reuses the stored hash on Unix: zero
+        // file re-reads. On platforms without a change fingerprint the
+        // conservative fallback re-hashes (mtime older than last_sync_at).
+        #[cfg(unix)]
         assert_eq!(
             engine.scanner.hash_computations(),
             0,
-            "unchanged tree sync must not re-read/re-hash any file"
+            "unchanged tree sync must not re-read/re-hash any file (Unix ctime fingerprint)"
+        );
+        #[cfg(not(unix))]
+        assert_eq!(
+            engine.scanner.hash_computations(),
+            1,
+            "no change evidence: unchanged tree re-hashed once"
         );
 
-        // A second sync over the exact same tree still does not re-hash.
+        // A second sync over the exact same tree still does not re-hash on
+        // Unix (and re-hashes once more on platforms without change evidence).
         let report2 = engine.sync().await.expect("second sync unchanged tree");
         assert_eq!(report2.uploaded.0, 0);
         assert_eq!(report2.downloaded.0, 0);
         assert_eq!(report2.conflicts, 0);
+        #[cfg(unix)]
         assert_eq!(
             engine.scanner.hash_computations(),
             0,
-            "repeated sync of an unchanged tree must never re-hash"
+            "repeated sync of an unchanged tree must never re-hash (Unix)"
+        );
+        #[cfg(not(unix))]
+        assert_eq!(
+            engine.scanner.hash_computations(),
+            2,
+            "no change evidence: unchanged tree re-hashed once per sync"
         );
 
         // Observables unchanged: couch_rev, last_sync_at, and hash preserved.

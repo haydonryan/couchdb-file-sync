@@ -85,7 +85,8 @@ impl LocalDb {
                 size INTEGER NOT NULL,
                 modified_at TEXT NOT NULL,
                 couch_rev TEXT,
-                last_sync_at TEXT NOT NULL
+                last_sync_at TEXT NOT NULL,
+                change_fingerprint TEXT
             );
 
             -- Conflicts table
@@ -163,6 +164,16 @@ impl LocalDb {
             self.conn
                 .execute_batch("ALTER TABLE conflicts ADD COLUMN local_last_sync_at TEXT")?;
         }
+
+        // Backfill the file-state change fingerprint for databases created
+        // before it existed. Backwards-compatible: existing rows are left
+        // intact and simply carry a NULL fingerprint, which the scanner treats
+        // as "no reliable change evidence" and conservatively re-hashes.
+        let file_cols = self.column_names("file_states")?;
+        if !file_cols.iter().any(|c| c == "change_fingerprint") {
+            self.conn
+                .execute_batch("ALTER TABLE file_states ADD COLUMN change_fingerprint TEXT")?;
+        }
         Ok(())
     }
 
@@ -177,6 +188,22 @@ impl LocalDb {
 
     // === File State Operations ===
 
+    /// Serialize a change fingerprint for storage in the `change_fingerprint`
+    /// TEXT column.
+    fn fingerprint_to_string(fp: &crate::models::ChangeFingerprint) -> String {
+        format!("{}:{}", fp.secs, fp.nanos)
+    }
+
+    /// Parse a change fingerprint from its stored TEXT form, returning `None`
+    /// for a `NULL`/absent value or an unparseable string.
+    fn string_to_fingerprint(s: &str) -> Option<crate::models::ChangeFingerprint> {
+        let (secs, nanos) = s.split_once(':')?;
+        Some(crate::models::ChangeFingerprint {
+            secs: secs.parse().ok()?,
+            nanos: nanos.parse().ok()?,
+        })
+    }
+
     /// Get file state by path
     ///
     /// # Errors
@@ -184,7 +211,7 @@ impl LocalDb {
     /// Returns an error if the query against the local database fails.
     pub fn get_file_state(&self, path: &str) -> Result<Option<FileState>> {
         let mut stmt = self.conn.prepare(
-            "SELECT path, hash, size, modified_at, couch_rev, last_sync_at 
+            "SELECT path, hash, size, modified_at, couch_rev, last_sync_at, change_fingerprint 
              FROM file_states WHERE path = ?",
         )?;
 
@@ -198,6 +225,10 @@ impl LocalDb {
                     modified_at: row.get(3)?,
                     couch_rev: row.get(4)?,
                     last_sync_at: row.get(5)?,
+                    change_fingerprint: row
+                        .get::<_, Option<String>>(6)?
+                        .as_deref()
+                        .and_then(Self::string_to_fingerprint),
                 })
             })
             .optional()?;
@@ -230,7 +261,7 @@ impl LocalDb {
         for chunk in paths.chunks(MAX_PARAMS_PER_QUERY) {
             let placeholders = vec!["?"; chunk.len()].join(", ");
             let sql = format!(
-                "SELECT path, hash, size, modified_at, couch_rev, last_sync_at \
+                "SELECT path, hash, size, modified_at, couch_rev, last_sync_at, change_fingerprint \
                  FROM file_states WHERE path IN ({placeholders})"
             );
             let mut stmt = self.conn.prepare(&sql)?;
@@ -243,6 +274,10 @@ impl LocalDb {
                     modified_at: row.get(3)?,
                     couch_rev: row.get(4)?,
                     last_sync_at: row.get(5)?,
+                    change_fingerprint: row
+                        .get::<_, Option<String>>(6)?
+                        .as_deref()
+                        .and_then(Self::string_to_fingerprint),
                 })
             })?;
             for state in rows {
@@ -270,8 +305,8 @@ impl LocalDb {
 
         self.conn.execute(
             "INSERT OR REPLACE INTO file_states
-             (path, hash, size, modified_at, couch_rev, last_sync_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
+             (path, hash, size, modified_at, couch_rev, last_sync_at, change_fingerprint)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
             params![
                 &state.path,
                 &state.hash,
@@ -279,6 +314,10 @@ impl LocalDb {
                 &state.modified_at,
                 &state.couch_rev,
                 &state.last_sync_at,
+                state
+                    .change_fingerprint
+                    .as_ref()
+                    .map(Self::fingerprint_to_string),
             ],
         )?;
 
@@ -320,7 +359,7 @@ impl LocalDb {
     /// Returns an error if the query against the local database fails.
     pub fn get_all_file_states(&self) -> Result<Vec<FileState>> {
         let mut stmt = self.conn.prepare(
-            "SELECT path, hash, size, modified_at, couch_rev, last_sync_at 
+            "SELECT path, hash, size, modified_at, couch_rev, last_sync_at, change_fingerprint 
              FROM file_states",
         )?;
 
@@ -334,6 +373,10 @@ impl LocalDb {
                     modified_at: row.get(3)?,
                     couch_rev: row.get(4)?,
                     last_sync_at: row.get(5)?,
+                    change_fingerprint: row
+                        .get::<_, Option<String>>(6)?
+                        .as_deref()
+                        .and_then(Self::string_to_fingerprint),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -846,6 +889,9 @@ fn row_to_conflict(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conflict> {
         last_sync_at: row
             .get::<_, Option<DateTime<Utc>>>(12)?
             .unwrap_or(detected_at),
+        // A conflict record is a historical snapshot of a resolved conflict,
+        // not a live scan fingerprint; it carries no change evidence.
+        change_fingerprint: None,
     };
 
     let remote_state = RemoteState {
@@ -975,6 +1021,36 @@ mod tests {
             .expect("state present");
         assert_eq!(loaded.modified_at, modified_at);
         assert_eq!(loaded.last_sync_at, last_sync_at);
+    }
+
+    #[test]
+    fn test_file_state_change_fingerprint_round_trip() {
+        let db = test_db();
+        let mut state = make_file_state("/fp.txt");
+        // A change fingerprint must survive the SQLite TEXT round-trip exactly,
+        // including nanosecond resolution and NULL (no-evidence) values.
+        state.change_fingerprint = Some(crate::models::ChangeFingerprint {
+            secs: 1_700_000_000,
+            nanos: 123_456_789,
+        });
+        db.save_file_state(&state)
+            .expect("save with fingerprint failed");
+
+        let loaded = db
+            .get_file_state("/fp.txt")
+            .expect("get_file_state failed")
+            .expect("state present");
+        assert_eq!(loaded.change_fingerprint, state.change_fingerprint);
+
+        // NULL (None) fingerprints round-trip back to None, not an error.
+        state.change_fingerprint = None;
+        db.save_file_state(&state)
+            .expect("save without fingerprint failed");
+        let loaded = db
+            .get_file_state("/fp.txt")
+            .expect("get_file_state failed")
+            .expect("state present");
+        assert_eq!(loaded.change_fingerprint, None);
     }
 
     #[test]

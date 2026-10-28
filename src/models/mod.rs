@@ -8,8 +8,8 @@ pub mod primitives;
 pub use change::{Change, ChangeBatch, ChangeSource, ChangeType, ExpectedRemote};
 pub use conflict::{Conflict, ConflictStats, NotificationMode, ResolutionStrategy};
 pub use file::{
-    ChunkCodec, ChunkDoc, CouchRev, DocType, FileDoc, FileState, LegacyChunkData, RemoteState,
-    TimestampMillis,
+    ChangeFingerprint, ChunkCodec, ChunkDoc, CouchRev, DocType, FileDoc, FileState,
+    LegacyChunkData, RemoteState, TimestampMillis,
 };
 pub use ignore::IgnoreMatcher;
 pub use path::SyncDirPath;
