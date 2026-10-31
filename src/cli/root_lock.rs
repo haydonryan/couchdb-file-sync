@@ -14,7 +14,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use fs4::fs_std::FileExt;
+use fs4::{FileExt, TryLockError};
 
 /// How long a mutating command waits for another process to release the root
 /// lock before failing with a clear error (the "bounded" behavior).
@@ -57,15 +57,15 @@ impl RootLock {
 
         let deadline = Instant::now() + timeout;
         loop {
-            match file.try_lock_exclusive() {
-                Ok(true) => {
+            match FileExt::try_lock(&file) {
+                Ok(()) => {
                     // Best-effort owner marker for diagnostics; never fatal.
                     let _ = file.set_len(0);
                     let _ = writeln!(file, "{}", owner.display());
                     let _ = file.sync_data();
                     return Ok(Self { file });
                 }
-                Ok(false) => {
+                Err(TryLockError::WouldBlock) => {
                     if Instant::now() >= deadline {
                         bail!(
                             "another sync process holds the root lock for {} (lock file {}); \
@@ -76,7 +76,7 @@ impl RootLock {
                     }
                     std::thread::sleep(LOCK_POLL_INTERVAL);
                 }
-                Err(err) => {
+                Err(TryLockError::Error(err)) => {
                     return Err(err).with_context(|| format!("cannot lock {}", path.display()));
                 }
             }

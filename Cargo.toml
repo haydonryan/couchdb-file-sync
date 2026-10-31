@@ -68,7 +68,7 @@ tracing-appender = "0.2"
 walkdir = "2.5"
 
 # OS-backed file locking (root/state ownership guard)
-fs4 = "0.13"
+fs4 = "1.1"
 
 # Random generation
 rand = "0.10.3"
