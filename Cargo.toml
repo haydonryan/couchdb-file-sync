@@ -28,7 +28,7 @@ base64 = "0.23"
 percent-encoding = "2"
 
 # CLI
-argy = { version = "0.1.19", git = "https://github.com/argy-rs/argy.git", rev = "c87ece1118d601f5f54f460e99b668e1fd3e0b9d" }
+argy = "0.1.21"
 dialoguer = "0.12"
 
 # Diff

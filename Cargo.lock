@@ -34,8 +34,9 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "argy"
-version = "0.1.19"
-source = "git+https://github.com/argy-rs/argy.git?rev=c87ece1118d601f5f54f460e99b668e1fd3e0b9d#c87ece1118d601f5f54f460e99b668e1fd3e0b9d"
+version = "0.1.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ade7487f83cf1a74c3c793ba153381ebda2fdcaea018ad966fc65519492ee7f"
 dependencies = [
  "argy_derive",
  "argy_shared",
@@ -43,8 +44,9 @@ dependencies = [
 
 [[package]]
 name = "argy_derive"
-version = "0.1.19"
-source = "git+https://github.com/argy-rs/argy.git?rev=c87ece1118d601f5f54f460e99b668e1fd3e0b9d#c87ece1118d601f5f54f460e99b668e1fd3e0b9d"
+version = "0.1.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b922d51e278d6fcd36c5cd6962b2bd1d91749f75fb8bc43428714117ddb96e71"
 dependencies = [
  "argy_shared",
  "proc-macro2",
@@ -54,8 +56,9 @@ dependencies = [
 
 [[package]]
 name = "argy_shared"
-version = "0.1.19"
-source = "git+https://github.com/argy-rs/argy.git?rev=c87ece1118d601f5f54f460e99b668e1fd3e0b9d#c87ece1118d601f5f54f460e99b668e1fd3e0b9d"
+version = "0.1.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0da2932ee10ada9f631cc0ca30b68210d5f1468996949f907a8e6f1f0169d704"
 dependencies = [
  "serde",
 ]
