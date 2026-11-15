@@ -41,7 +41,7 @@ config = { version = "0.15", default-features = false, features = ["yaml"] }
 notify-debouncer-full = "0.7"
 
 # SQLite
-rusqlite = { version = "0.41", features = ["bundled", "chrono", "serde_json"] }
+rusqlite = { version = "0.42", features = ["bundled", "chrono", "serde_json"] }
 
 # Hashing
 sha2 = "0.11"
