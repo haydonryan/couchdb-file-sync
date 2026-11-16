@@ -1559,14 +1559,10 @@ async fn apply_live_remote_entry(
     // Acknowledge the durable cursor back to the producer after every entry
     // (success or failure) so the feed resumes from the highest
     // contiguously-applied sequence.
-    if ack_tx
+    Ok(ack_tx
         .send(remote_cursor.checkpoint().to_string())
         .await
-        .is_err()
-    {
-        return Ok(true);
-    }
-    Ok(false)
+        .is_err())
 }
 
 /// Recover from an invalid remote resume cursor by running a full
