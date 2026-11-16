@@ -2670,7 +2670,7 @@ mod tests {
             hyper::Method::PUT | hyper::Method::POST | hyper::Method::DELETE
         ) {
             let collected = http_body_util::BodyExt::collect(body).await;
-            let body_bytes = collected.map(|b| b.to_bytes().to_vec()).unwrap_or_default();
+            let body_bytes = collected.map_or(Vec::new(), |b| b.to_bytes().to_vec());
             if let Ok(mut w) = writes.lock() {
                 w.insert(
                     format!("{:?} {}", parts.method, parts.uri),

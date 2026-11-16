@@ -227,8 +227,7 @@ fn apply_cli_overrides(config: &mut AppConfig, cli: &Cli) {
             .couchdb
             .auth
             .as_ref()
-            .map(|a| a.password.clone())
-            .unwrap_or_default();
+            .map_or(String::new(), |a| a.password.clone());
         config.couchdb.auth = Some(couchdb_file_sync::config::CouchDbAuth {
             username: user.clone(),
             password,
@@ -239,8 +238,7 @@ fn apply_cli_overrides(config: &mut AppConfig, cli: &Cli) {
             .couchdb
             .auth
             .as_ref()
-            .map(|a| a.username.clone())
-            .unwrap_or_default();
+            .map_or(String::new(), |a| a.username.clone());
         config.couchdb.auth = Some(couchdb_file_sync::config::CouchDbAuth {
             username,
             password: pass.clone(),

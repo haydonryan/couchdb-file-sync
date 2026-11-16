@@ -1584,10 +1584,7 @@ async fn reconcile_live_remote_cursor(
         .flatten()
         .map_or_else(|| remote_cursor.checkpoint().to_string(), |cp| cp.last_seq);
     *remote_cursor = RemoteFeedCursor::new(seq.clone());
-    if ack_tx.send(seq).await.is_err() {
-        return Ok(true);
-    }
-    Ok(false)
+    Ok(ack_tx.send(seq).await.is_err())
 }
 
 /// Apply one local watcher change; a transient apply failure is coalesced into

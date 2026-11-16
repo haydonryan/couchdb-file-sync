@@ -571,8 +571,7 @@ impl ApplyWorker {
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default(),
+                .map_or(0, |d| d.as_nanos()),
         ));
         {
             let mut f = tokio::fs::File::create(&staging).await?;
@@ -3020,8 +3019,7 @@ impl SyncEngine {
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default(),
+                .map_or(0, |d| d.as_nanos()),
         ));
         {
             let mut f = tokio::fs::File::create(&staging).await?;
@@ -6180,19 +6178,17 @@ mod tests {
 
     /// Helper: list any leftover `.download` staging residue in `dir`.
     fn staging_residue(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-        std::fs::read_dir(dir)
-            .map(|entries| {
-                entries
-                    .filter_map(Result::ok)
-                    .map(|e| e.path())
-                    .filter(|p| {
-                        p.file_name()
-                            .and_then(|n| n.to_str())
-                            .is_some_and(|n| n.ends_with(".download"))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        std::fs::read_dir(dir).map_or(Vec::new(), |entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.ends_with(".download"))
+                })
+                .collect()
+        })
     }
 
     #[tokio::test]
@@ -6622,7 +6618,7 @@ mod tests {
             doc.rev = Some(format!("1-{name}"));
             doc.path = remote.clone();
             metadata.insert(remote.clone(), doc);
-            contents.insert(remote.clone(), content);
+            contents.insert(remote, content);
         }
 
         let canned = CannedCouch {
