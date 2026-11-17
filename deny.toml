@@ -1,3 +1,10 @@
+[advisories]
+# chrono 0.4.45 is flagged unmaintained (RUSTSEC-2026-0543); no patched version
+# exists and no safe upgrade is available. chrono is used only for timestamps
+# and log formatting (direct dependency plus rusqlite's "chrono" feature).
+# Revisit when chrono ships a maintained release or is replaced by jiff/time.
+ignore = ["RUSTSEC-2026-0543"]
+
 [licenses]
 allow = [
   "Apache-2.0",
