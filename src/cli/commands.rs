@@ -3671,6 +3671,40 @@ mod tests {
     // ── Live remote checkpoint discipline + restart replay ───────────────
 
     #[tokio::test]
+    async fn reconcile_live_remote_cursor_acks_open_producer_and_stops_closed_producer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let mut engine = SyncEngine::new(
+            CouchDb::for_test_with_canned("prefix/", CannedCouch::default()),
+            LocalDb::open_in_memory().expect("in-memory LocalDb"),
+            root.clone(),
+        );
+
+        // An open producer receives the reconciled checkpoint and the live loop
+        // keeps running.
+        let mut cursor = RemoteFeedCursor::new("0-before".to_string());
+        let (ack_tx, mut ack_rx) = mpsc::channel::<String>(1);
+        let stop = reconcile_live_remote_cursor(&mut engine, &ack_tx, &mut cursor)
+            .await
+            .expect("reconcile must succeed");
+        assert!(!stop, "an open producer must not stop the live loop");
+        assert_eq!(
+            ack_rx.recv().await.expect("ack must be delivered"),
+            cursor.checkpoint(),
+            "ack must report the reconciled checkpoint"
+        );
+
+        // A producer that has gone away must stop the live loop.
+        let mut cursor = RemoteFeedCursor::new("0-before".to_string());
+        let (ack_tx, ack_rx) = mpsc::channel::<String>(1);
+        drop(ack_rx);
+        let stop = reconcile_live_remote_cursor(&mut engine, &ack_tx, &mut cursor)
+            .await
+            .expect("reconcile must succeed");
+        assert!(stop, "a closed producer must stop the live loop");
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn live_remote_checkpoint_never_passes_a_failed_entry_and_restart_replays() {
         let dir = tempfile::tempdir().unwrap();
