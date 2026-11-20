@@ -3705,6 +3705,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_live_remote_entry_acks_checkpoint_and_stops_on_closed_producer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SyncDirPath::new(dir.path()).unwrap();
+        let remote_prefix = "prefix/";
+        let first_path = format!("{remote_prefix}first.txt");
+        let second_path = format!("{remote_prefix}second.txt");
+        let canned = CannedCouch {
+            metadata: std::collections::HashMap::from([
+                (
+                    first_path.clone(),
+                    FileDoc::new(first_path.clone(), String::new(), 5),
+                ),
+                (
+                    second_path.clone(),
+                    FileDoc::new(second_path.clone(), String::new(), 6),
+                ),
+            ]),
+            contents: std::collections::HashMap::from([
+                (first_path.clone(), b"first".to_vec()),
+                (second_path.clone(), b"second".to_vec()),
+            ]),
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::with_ignore(
+            CouchDb::for_test_with_canned(remote_prefix, canned),
+            LocalDb::open_in_memory().expect("in-memory LocalDb"),
+            root.clone(),
+            IgnoreMatcher::empty(),
+        );
+        let mut touched = TouchTracker::new();
+        let config = AppConfig::default();
+
+        // An open producer receives the durable cursor after the entry applies
+        // and the live loop keeps running.
+        let mut cursor = RemoteFeedCursor::new("0-before".to_string());
+        let first_entry = ChangeFeedEntry {
+            change: Change::remote_created(
+                first_path.clone(),
+                "hash".to_string(),
+                5,
+                Utc::now(),
+                "1-first".to_string(),
+            ),
+            seq: "1-first".to_string(),
+        };
+        let (ack_tx, mut ack_rx) = mpsc::channel::<String>(1);
+        let stop = apply_live_remote_entry(
+            &mut engine,
+            &mut touched,
+            &IgnoreMatcher::empty(),
+            first_entry,
+            &mut cursor,
+            &ack_tx,
+            &config,
+            dir.path(),
+        )
+        .await
+        .expect("entry apply must succeed");
+        assert!(!stop, "an open producer must not stop the live loop");
+        assert_eq!(
+            ack_rx.recv().await.expect("ack must be delivered"),
+            cursor.checkpoint(),
+            "ack must report the durable cursor"
+        );
+        assert_eq!(cursor.checkpoint(), "1-first");
+        assert!(root.as_path().join("first.txt").exists());
+
+        // A producer that has gone away must stop the live loop.
+        let mut cursor = RemoteFeedCursor::new("0-before".to_string());
+        let (ack_tx, ack_rx) = mpsc::channel::<String>(1);
+        drop(ack_rx);
+        let second_entry = ChangeFeedEntry {
+            change: Change::remote_created(
+                second_path.clone(),
+                "hash".to_string(),
+                6,
+                Utc::now(),
+                "2-second".to_string(),
+            ),
+            seq: "2-second".to_string(),
+        };
+        let stop = apply_live_remote_entry(
+            &mut engine,
+            &mut touched,
+            &IgnoreMatcher::empty(),
+            second_entry,
+            &mut cursor,
+            &ack_tx,
+            &config,
+            dir.path(),
+        )
+        .await
+        .expect("entry apply must succeed");
+        assert!(stop, "a closed producer must stop the live loop");
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn live_remote_checkpoint_never_passes_a_failed_entry_and_restart_replays() {
         let dir = tempfile::tempdir().unwrap();
