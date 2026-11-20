@@ -4451,7 +4451,10 @@ mod tests {
 
         // Make the file not racily clean so the mtime+size shortcut applies.
         let old = std::time::SystemTime::now() - std::time::Duration::from_hours(1);
-        filetime::set_file_mtime(&file_path, filetime::FileTime::from_system_time(old)).unwrap();
+        std::fs::File::open(&file_path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
 
         // Seed a fully-tracked, unchanged file whose stored mtime/size/hash all
         // match the on-disk scan, exactly as a real sync records it: the change

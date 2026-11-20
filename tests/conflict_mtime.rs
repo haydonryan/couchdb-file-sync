@@ -16,9 +16,9 @@
 use anyhow::Result;
 use couchdb_file_sync::models::{IgnoreMatcher, SyncDirPath};
 use couchdb_file_sync::{CouchDb, LocalDb, SyncEngine, SyncReport};
-use filetime::{FileTime, set_file_mtime};
 use std::env;
 use std::fs;
+use std::fs::FileTimes;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -142,7 +142,7 @@ async fn stale_remote_mtime_does_not_mask_conflict() -> Result<()> {
         // A's upload stores that stale mtime on the remote doc (rev -> R2).
         fs::write(dir_a.join("f.txt"), "hello-A-v2")?;
         let stale = SystemTime::now() - Duration::from_hours(48);
-        set_file_mtime(dir_a.join("f.txt"), FileTime::from_system_time(stale))?;
+        fs::File::open(dir_a.join("f.txt"))?.set_times(FileTimes::new().set_modified(stale))?;
         let rep = run_sync(
             &dir_a,
             &url,

@@ -538,7 +538,9 @@ mod tests {
     /// Set a file's mtime deterministically so tests can place files inside or
     /// outside the racily-clean timestamp-granularity window.
     fn set_mtime(path: &Path, time: SystemTime) {
-        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(time))
+        std::fs::File::open(path)
+            .expect("open file")
+            .set_times(std::fs::FileTimes::new().set_modified(time))
             .expect("set file mtime");
     }
 
