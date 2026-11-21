@@ -635,7 +635,7 @@ cargo build --release
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
 
 ## Author
 
