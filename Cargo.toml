@@ -76,7 +76,7 @@ rand = "0.10.4"
 [dev-dependencies]
 tempfile = "3.27"
 tokio-test = "0.4"
-hyper = { version = "1.12", features = ["server", "http1"] }
+hyper = { version = "1.13", features = ["server", "http1"] }
 http-body-util = "0.1.5"
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 parking_lot = "0.13"
