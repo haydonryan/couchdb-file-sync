@@ -61,3 +61,11 @@ benchmark:
 
 dep-bump:
     ./scripts/update-dependencies.sh
+
+# Sweep stale Cargo target artifacts while keeping artifacts resolved by build/test.
+gc-target:
+    cargo mark-sweep --cmd "build --workspace" --cmd "test --no-run --workspace"
+
+# Preview the same sweep without deleting anything.
+gc-target-dry:
+    cargo mark-sweep --dry-run --cmd "build --workspace" --cmd "test --no-run --workspace"
